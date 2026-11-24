@@ -14,7 +14,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from minilab.records import Family, RunId, check_run_id
 from minilab.scheduler import Pair, canonical_pair
@@ -39,28 +39,31 @@ class RunManifest(BaseModel):
     """What a run is allowed to do, fixed when it starts.
 
     Pairs are stored in sorted order, so a pair has one form, and each pair may
-    appear once. Times must carry a time zone.
+    appear once. Times and dates must be given as such (or as ISO strings in
+    JSON) and times must carry a time zone. `memory_before` needs the `pair`
+    or `all` policy: a `blind` run reads nothing, so a date cap there would be
+    a mistake. The model and its collections cannot be changed after creation.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     run_id: RunId
     mode: Literal["plain", "structured"]
-    pairs: Annotated[list[Pair], Field(min_length=1)]
+    pairs: Annotated[tuple[Pair, ...], Field(min_length=1)]
     memory_policy: MemoryPolicy
-    memory_before: AwareDatetime | None
+    memory_before: Annotated[AwareDatetime, Field(strict=True)] | None
     """Read only memories created before this time (MuninnDB's `before` filter)."""
-    literature_before: date | None
+    literature_before: Annotated[date, Field(strict=True)] | None
     """Literature search ignores anything first posted after this date."""
-    budget_tokens_per_pair: Annotated[int, Field(gt=0)]
+    budget_tokens_per_pair: Annotated[int, Field(strict=True, gt=0)]
     """Tokens in plus tokens out, over every model call for one pair."""
-    families: Annotated[list[Family], Field(min_length=1)]
-    started: AwareDatetime
+    families: Annotated[tuple[Family, ...], Field(min_length=1)]
+    started: Annotated[AwareDatetime, Field(strict=True)]
 
     @field_validator("pairs")
     @classmethod
-    def _canonical_unique_pairs(cls, value: list[Pair]) -> list[Pair]:
-        pairs = [canonical_pair(pair) for pair in value]
+    def _canonical_unique_pairs(cls, value: tuple[Pair, ...]) -> tuple[Pair, ...]:
+        pairs = tuple(canonical_pair(pair) for pair in value)
         seen: set[Pair] = set()
         for pair in pairs:
             if pair in seen:
@@ -70,10 +73,16 @@ class RunManifest(BaseModel):
 
     @field_validator("families")
     @classmethod
-    def _unique_families(cls, value: list[Family]) -> list[Family]:
+    def _unique_families(cls, value: tuple[Family, ...]) -> tuple[Family, ...]:
         if len(set(value)) != len(value):
             raise ValueError(f"a family appears more than once: {value}")
         return value
+
+    @model_validator(mode="after")
+    def _no_cap_on_blind(self) -> "RunManifest":
+        if self.memory_policy is MemoryPolicy.blind and self.memory_before is not None:
+            raise ValueError("memory_before needs the pair or all policy; blind reads nothing")
+        return self
 
 
 def manifest_path(root: Path, run_id: str) -> Path:
@@ -117,5 +126,13 @@ def save_manifest(root: Path, manifest: RunManifest) -> Path:
 
 
 def load_manifest(root: Path, run_id: str) -> RunManifest:
-    """Read a run's manifest. Raise `FileNotFoundError` if it has none."""
-    return RunManifest.model_validate_json(manifest_path(root, run_id).read_bytes())
+    """Read a run's manifest.
+
+    Raise `FileNotFoundError` if the run has none, and `ValueError` if the file
+    holds another run's manifest.
+    """
+    path = manifest_path(root, run_id)
+    manifest = RunManifest.model_validate_json(path.read_bytes())
+    if manifest.run_id != run_id:
+        raise ValueError(f"{path}: holds the manifest of run {manifest.run_id}")
+    return manifest

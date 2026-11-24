@@ -1,15 +1,24 @@
 """Tests for the run manifest and the cost ledger (build plan Task 3)."""
 
 import math
+import shutil
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 from pydantic import ValidationError
 
 from minilab.ledger import CorruptLedger, Ledger, cost_report
 from minilab.records import Family, Provenance, Record, RecordStore, Stage, Status, TokenCount
-from minilab.run import ManifestExists, MemoryPolicy, RunManifest, load_manifest, save_manifest
+from minilab.run import (
+    ManifestExists,
+    MemoryPolicy,
+    RunManifest,
+    load_manifest,
+    manifest_path,
+    save_manifest,
+)
 
 RUN = "run-1"
 PAIR = ("information-theory", "optimisation")
@@ -45,6 +54,16 @@ def store(tmp_path: Path) -> RecordStore:
     return RecordStore(tmp_path)
 
 
+def _ledger(store: RecordStore, run_id: str = RUN) -> Ledger:
+    """Open a run's ledger, first saving a manifest for the run if it has none."""
+    if not manifest_path(store.root, run_id).exists():
+        save_manifest(
+            store.root,
+            _manifest(run_id=run_id, families=list(Family), pairs=[PAIR, OTHER_PAIR]),
+        )
+    return Ledger(store, run_id)
+
+
 def _charge(
     ledger: Ledger,
     *,
@@ -75,7 +94,7 @@ def _charge(
 def test_cost_report_per_reviewed_survivor(store: RecordStore) -> None:
     for local in ("a", "b", "c"):
         store.create(_record(local))
-    ledger = Ledger(store, RUN)
+    ledger = _ledger(store)
     _charge(ledger, record_id=None, tokens_in=1000, tokens_out=500, seconds=1800.0)
     _charge(ledger, record_id="run-1.a", stage=Stage.encoding, tokens_in=300, tokens_out=200,
             seconds=900.0, family=Family.codex)
@@ -91,6 +110,7 @@ def test_cost_report_per_reviewed_survivor(store: RecordStore) -> None:
     # 5000 tokens; 7200 s of model time = 2 h; 60 review minutes = 1 h; 2 reviewed.
     assert report.reviewed_survivors == 2
     assert report.total_tokens == 5000
+    assert report.unattributed_tokens == 1500
     assert report.tokens_per_reviewed_survivor == 2500.0
     assert report.machine_hours_per_reviewed_survivor == 1.0
     assert report.review_hours_per_reviewed_survivor == 0.5
@@ -100,7 +120,7 @@ def test_cost_report_per_reviewed_survivor(store: RecordStore) -> None:
 
 def test_estimated_costs_are_flagged(store: RecordStore) -> None:
     store.create(_record("a"))
-    ledger = Ledger(store, RUN)
+    ledger = _ledger(store)
     _charge(ledger, record_id="run-1.a", tokens_in=10, tokens_out=10)
     assert cost_report(store, ledger, RUN).has_estimates is False
 
@@ -115,7 +135,7 @@ def test_estimated_costs_are_flagged(store: RecordStore) -> None:
 def test_pair_spend_sums_all_stages(store: RecordStore) -> None:
     store.create(_record("a"))
     store.create(_record("z", pair=OTHER_PAIR))
-    ledger = Ledger(store, RUN)
+    ledger = _ledger(store)
     # A generation call made before any record exists.
     _charge(ledger, record_id=None, stage=Stage.generator, tokens_in=100, tokens_out=1)
     _charge(ledger, record_id="run-1.a", stage=Stage.encoding, tokens_in=20, tokens_out=2,
@@ -137,7 +157,7 @@ def test_pair_spend_sums_all_stages(store: RecordStore) -> None:
 def test_costs_for_record_by_family_and_stage(store: RecordStore) -> None:
     store.create(_record("a"))
     store.create(_record("b"))
-    ledger = Ledger(store, RUN)
+    ledger = _ledger(store)
     _charge(ledger, record_id="run-1.a", stage=Stage.encoding, tokens_in=10, tokens_out=1,
             seconds=2.5)
     _charge(ledger, record_id="run-1.a", stage=Stage.encoding, tokens_in=5, tokens_out=4,
@@ -160,10 +180,10 @@ def test_costs_for_record_by_family_and_stage(store: RecordStore) -> None:
 
 def test_ledger_persists_across_instances(store: RecordStore, tmp_path: Path) -> None:
     store.create(_record("a"))
-    _charge(Ledger(store, RUN), record_id="run-1.a", tokens_in=40, tokens_out=2)
-    Ledger(store, RUN).log_review("run-1.a", 1.5)
+    _charge(_ledger(store), record_id="run-1.a", tokens_in=40, tokens_out=2)
+    _ledger(store).log_review("run-1.a", 1.5)
 
-    reopened = Ledger(store, RUN)
+    reopened = _ledger(store)
     assert reopened.pair_spend(PAIR) == 42
     assert reopened.costs("run-1.a").review_minutes == 1.5
     assert (tmp_path / "runs" / RUN / "ledger.jsonl").is_file()
@@ -171,7 +191,7 @@ def test_ledger_persists_across_instances(store: RecordStore, tmp_path: Path) ->
 
 def test_charge_refuses_record_of_other_pair(store: RecordStore) -> None:
     store.create(_record("a"))
-    ledger = Ledger(store, RUN)
+    ledger = _ledger(store)
     with pytest.raises(ValueError, match="pair"):
         _charge(ledger, record_id="run-1.a", pair=OTHER_PAIR, tokens_in=1)
     assert ledger.pair_spend(OTHER_PAIR) == 0
@@ -180,7 +200,7 @@ def test_charge_refuses_record_of_other_pair(store: RecordStore) -> None:
 
 def test_charge_and_review_refuse_records_of_other_runs(store: RecordStore) -> None:
     store.create(_record("a", run_id="run-2"))
-    ledger = Ledger(store, RUN)
+    ledger = _ledger(store)
     with pytest.raises(ValueError, match="run-2"):
         _charge(ledger, record_id="run-2.a", tokens_in=1)
     with pytest.raises(ValueError, match="run-2"):
@@ -189,7 +209,7 @@ def test_charge_and_review_refuse_records_of_other_runs(store: RecordStore) -> N
 
 
 def test_charge_and_review_refuse_unknown_records(store: RecordStore) -> None:
-    ledger = Ledger(store, RUN)
+    ledger = _ledger(store)
     with pytest.raises(KeyError):
         _charge(ledger, record_id="run-1.missing", tokens_in=1)
     with pytest.raises(KeyError):
@@ -203,7 +223,7 @@ def test_charge_and_review_refuse_unknown_records(store: RecordStore) -> None:
      ("seconds", math.inf)],
 )
 def test_charge_refuses_bad_amounts(store: RecordStore, field: str, value: float) -> None:
-    ledger = Ledger(store, RUN)
+    ledger = _ledger(store)
     amounts: dict[str, float] = {"tokens_in": 1, "tokens_out": 1, "seconds": 1.0}
     amounts[field] = value
     with pytest.raises(ValidationError):
@@ -216,21 +236,21 @@ def test_charge_refuses_bad_amounts(store: RecordStore, field: str, value: float
 @pytest.mark.parametrize("minutes", [-1.0, math.nan, math.inf])
 def test_review_refuses_bad_minutes(store: RecordStore, minutes: float) -> None:
     store.create(_record("a"))
-    ledger = Ledger(store, RUN)
+    ledger = _ledger(store)
     with pytest.raises(ValidationError):
         ledger.log_review("run-1.a", minutes)
     assert ledger.costs("run-1.a").review_minutes == 0.0
 
 
 def test_charge_refuses_unknown_pair(store: RecordStore) -> None:
-    ledger = Ledger(store, RUN)
+    ledger = _ledger(store)
     with pytest.raises(ValueError, match="domain"):
         _charge(ledger, record_id=None, pair=("kernels", "astrology"), tokens_in=1)
 
 
 def test_corrupt_ledger_line_is_reported(store: RecordStore, tmp_path: Path) -> None:
     store.create(_record("a"))
-    ledger = Ledger(store, RUN)
+    ledger = _ledger(store)
     _charge(ledger, record_id="run-1.a", tokens_in=1)
     path = tmp_path / "runs" / RUN / "ledger.jsonl"
     with path.open("a") as handle:
@@ -241,7 +261,7 @@ def test_corrupt_ledger_line_is_reported(store: RecordStore, tmp_path: Path) -> 
 
 def test_truncated_last_line_is_reported(store: RecordStore, tmp_path: Path) -> None:
     store.create(_record("a"))
-    ledger = Ledger(store, RUN)
+    ledger = _ledger(store)
     _charge(ledger, record_id="run-1.a", tokens_in=1)
     path = tmp_path / "runs" / RUN / "ledger.jsonl"
     data = path.read_bytes()
@@ -258,7 +278,7 @@ def test_cost_report_family_shares(store: RecordStore) -> None:
     store.create(_record("b", family=Family.claude))
     store.create(_record("c", family=Family.claude))
     store.create(_record("d", family=Family.gemini))
-    ledger = Ledger(store, RUN)
+    ledger = _ledger(store)
     _charge(ledger, record_id=None, family=Family.gemini, tokens_in=600, tokens_out=0)
     _charge(ledger, record_id="run-1.b", family=Family.claude, tokens_in=200, tokens_out=0)
     _charge(ledger, record_id="run-1.c", family=Family.codex, tokens_in=100, tokens_out=100)
@@ -277,7 +297,7 @@ def test_cost_report_family_shares(store: RecordStore) -> None:
 
 def test_cost_report_with_nothing_reviewed(store: RecordStore) -> None:
     store.create(_record("a"))
-    ledger = Ledger(store, RUN)
+    ledger = _ledger(store)
     _charge(ledger, record_id="run-1.a", tokens_in=10, seconds=60.0)
 
     report = cost_report(store, ledger, RUN)
@@ -290,7 +310,7 @@ def test_cost_report_with_nothing_reviewed(store: RecordStore) -> None:
 
 def test_cost_report_refuses_ledger_of_other_run(store: RecordStore) -> None:
     with pytest.raises(ValueError, match="run-2"):
-        cost_report(store, Ledger(store, "run-2"), RUN)
+        cost_report(store, _ledger(store, "run-2"), RUN)
 
 
 # --- The run manifest -----------------------------------------------------------------------
@@ -313,7 +333,9 @@ def _manifest(**changes: object) -> RunManifest:
 
 
 def test_manifest_round_trip(tmp_path: Path) -> None:
-    manifest = _manifest(memory_before=datetime(2026, 6, 30, tzinfo=UTC))
+    manifest = _manifest(
+        memory_policy=MemoryPolicy.pair, memory_before=datetime(2026, 6, 30, tzinfo=UTC)
+    )
     path = save_manifest(tmp_path, manifest)
     assert path == tmp_path / "runs" / RUN / "manifest.json"
     assert load_manifest(tmp_path, RUN) == manifest
@@ -329,7 +351,7 @@ def test_manifest_is_written_once(tmp_path: Path) -> None:
 
 def test_manifest_pairs_are_canonical_and_unique() -> None:
     manifest = _manifest(pairs=[(PAIR[1], PAIR[0])])
-    assert manifest.pairs == [PAIR]
+    assert manifest.pairs == (PAIR,)
     with pytest.raises(ValidationError, match="more than once"):
         _manifest(pairs=[PAIR, (PAIR[1], PAIR[0])])
     with pytest.raises(ValidationError):
@@ -349,6 +371,10 @@ def test_manifest_pairs_are_canonical_and_unique() -> None:
         {"run_id": "Run 1"},
         {"mode": "fancy"},
         {"memory_policy": "some"},
+        {"memory_before": datetime(2026, 6, 30, tzinfo=UTC)},
+        {"budget_tokens_per_pair": True},
+        {"budget_tokens_per_pair": 5.0},
+        {"started": 0},
     ],
 )
 def test_manifest_refuses_bad_fields(changes: dict[str, object]) -> None:
@@ -358,4 +384,152 @@ def test_manifest_refuses_bad_fields(changes: dict[str, object]) -> None:
 
 def test_load_manifest_missing_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
+        load_manifest(tmp_path, RUN)
+
+
+# --- Hardening found in review ------------------------------------------------------------
+
+
+def test_ledger_needs_a_manifest(store: RecordStore) -> None:
+    with pytest.raises(FileNotFoundError):
+        Ledger(store, "run-9")
+
+
+def test_charge_refuses_pair_or_family_outside_manifest(store: RecordStore) -> None:
+    save_manifest(store.root, _manifest(pairs=[PAIR], families=[Family.claude]))
+    ledger = Ledger(store, RUN)
+    with pytest.raises(ValueError, match="manifest"):
+        _charge(ledger, record_id=None, pair=OTHER_PAIR, tokens_in=1)
+    with pytest.raises(ValueError, match="manifest"):
+        _charge(ledger, record_id=None, family=Family.gemini, tokens_in=1)
+    assert ledger.entries() == []
+
+
+@pytest.mark.parametrize(
+    "status",
+    [Status.proposed, Status.ambiguous, Status.abandoned, Status.known, Status.trivial,
+     Status.untestable],
+)
+def test_review_refuses_records_that_are_never_queued(store: RecordStore, status: Status) -> None:
+    store.create(_record("a", status=status))
+    ledger = _ledger(store)
+    with pytest.raises(ValueError, match="queue"):
+        ledger.log_review("run-1.a", 1.0)
+    assert ledger.entries() == []
+
+
+@pytest.mark.parametrize("status", [Status.survived, Status.proved, Status.killed])
+def test_review_accepts_queueable_records(store: RecordStore, status: Status) -> None:
+    store.create(_record("a", status=status))
+    ledger = _ledger(store)
+    ledger.log_review("run-1.a", 1.0)
+    assert ledger.costs("run-1.a").review_minutes == 1.0
+
+
+def test_append_refuses_after_an_incomplete_line(store: RecordStore, tmp_path: Path) -> None:
+    store.create(_record("a"))
+    ledger = _ledger(store)
+    _charge(ledger, record_id="run-1.a", tokens_in=1)
+    path = tmp_path / "runs" / RUN / "ledger.jsonl"
+    path.write_bytes(path.read_bytes().rstrip(b"\n"))
+    broken = path.read_bytes()
+    with pytest.raises(CorruptLedger, match="incomplete"):
+        ledger.pair_spend(PAIR)
+    with pytest.raises(CorruptLedger, match="incomplete"):
+        _charge(ledger, record_id="run-1.a", tokens_in=1)
+    assert path.read_bytes() == broken
+
+
+def test_ledger_line_for_another_run_is_corrupt(store: RecordStore, tmp_path: Path) -> None:
+    store.create(_record("a"))
+    ledger = _ledger(store)
+    _charge(ledger, record_id="run-1.a", tokens_in=1)
+    path = tmp_path / "runs" / RUN / "ledger.jsonl"
+    line = path.read_text().replace("run-1.a", "run-2.a")
+    with path.open("a") as handle:
+        handle.write(line)
+    with pytest.raises(CorruptLedger, match="line 2"):
+        ledger.entries()
+
+
+def test_report_refuses_review_of_missing_record(store: RecordStore, tmp_path: Path) -> None:
+    store.create(_record("a"))
+    ledger = _ledger(store)
+    ledger.log_review("run-1.a", 1.0)
+    path = tmp_path / "runs" / RUN / "ledger.jsonl"
+    path.write_text(path.read_text().replace("run-1.a", "run-1.ghost"))
+    with pytest.raises(ValueError, match="ghost"):
+        cost_report(store, ledger, RUN)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"tokens_in": True},
+        {"tokens_in": 1.0},
+        {"tokens_in": 10**13},
+        {"estimated": 1},
+        {"seconds": True},
+        {"seconds": "2.5"},
+        {"seconds": 1e308},
+    ],
+)
+def test_charge_refuses_loose_or_huge_values(
+    store: RecordStore, changes: dict[str, object]
+) -> None:
+    ledger = _ledger(store)
+    fields: dict[str, object] = {"tokens_in": 1, "tokens_out": 1, "seconds": 1.0,
+                                 "estimated": False}
+    fields.update(changes)
+    with pytest.raises(ValidationError):
+        ledger.charge(
+            pair=PAIR,
+            stage=Stage.generator,
+            family=Family.claude,
+            tokens_in=cast(int, fields["tokens_in"]),
+            tokens_out=cast(int, fields["tokens_out"]),
+            seconds=cast(float, fields["seconds"]),
+            estimated=cast(bool, fields["estimated"]),
+        )
+    assert ledger.entries() == []
+
+
+@pytest.mark.parametrize("minutes", [True, "3", 1e9])
+def test_review_refuses_loose_or_huge_minutes(store: RecordStore, minutes: object) -> None:
+    store.create(_record("a"))
+    ledger = _ledger(store)
+    with pytest.raises(ValidationError):
+        ledger.log_review("run-1.a", cast(float, minutes))
+    assert ledger.entries() == []
+
+
+def test_estimated_flag_survives_a_later_exact_charge(store: RecordStore) -> None:
+    store.create(_record("a"))
+    ledger = _ledger(store)
+    _charge(ledger, record_id="run-1.a", tokens_in=5, estimated=True)
+    _charge(ledger, record_id="run-1.a", stage=Stage.encoding, tokens_in=5, estimated=False)
+    assert ledger.costs("run-1.a").tokens[Family.claude].estimated is True
+
+
+def test_save_manifest_validates_again(tmp_path: Path) -> None:
+    good = _manifest()
+    # model_copy does not validate, so this builds a manifest with a bad budget.
+    bad = good.model_copy(update={"budget_tokens_per_pair": 0})
+    with pytest.raises(ValidationError):
+        save_manifest(tmp_path, bad)
+    assert not manifest_path(tmp_path, RUN).exists()
+
+
+def test_manifest_collections_cannot_change() -> None:
+    manifest = _manifest()
+    assert isinstance(manifest.pairs, tuple)
+    assert isinstance(manifest.families, tuple)
+
+
+def test_load_manifest_refuses_a_manifest_of_another_run(tmp_path: Path) -> None:
+    source = save_manifest(tmp_path, _manifest(run_id="run-2"))
+    target = manifest_path(tmp_path, RUN)
+    target.parent.mkdir(parents=True)
+    shutil.copy(source, target)
+    with pytest.raises(ValueError, match="run-2"):
         load_manifest(tmp_path, RUN)

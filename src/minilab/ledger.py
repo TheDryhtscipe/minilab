@@ -8,7 +8,13 @@ record's costs; `Record.costs` is not filled in.
 
 A charge names its domain pair and stage, and may name a record. A model call
 made before any record exists, such as a generation call, or one that failed,
-is still charged to its pair, so the per-pair budget covers every call.
+is still charged to its pair, so the per-pair budget covers every call. A
+ledger opens only for a run with a manifest, and refuses a pair or a family
+that the manifest does not list.
+
+`pair_spend` only reads. A caller that checks the budget and then makes a call
+must not let another process charge the same pair in between, or the pair can
+overrun its budget.
 """
 
 import builtins
@@ -35,12 +41,24 @@ from minilab.records import (
     RecordId,
     RecordStore,
     Stage,
+    Status,
     TokenCount,
     check_record_id,
     check_run_id,
     run_of,
 )
+from minilab.run import RunManifest, load_manifest
 from minilab.scheduler import Pair, canonical_pair
+
+MAX_TOKENS = 10**12
+"""Largest token count one charge may log."""
+MAX_SECONDS = 10.0**7
+"""Largest duration one charge may log (about 116 days)."""
+MAX_MINUTES = 10.0**5
+"""Largest review time one review may log (about 69 days)."""
+
+QUEUEABLE: frozenset[Status] = frozenset({Status.survived, Status.proved, Status.killed})
+"""Statuses a record in the review queue can have (doc-gmj, "Human queue")."""
 
 
 class CorruptLedger(Exception):
@@ -65,9 +83,9 @@ class Charge(_Entry):
     stage: Stage
     family: Family
     record_id: RecordId | None
-    tokens_in: Annotated[StrictInt, Field(ge=0)]
-    tokens_out: Annotated[StrictInt, Field(ge=0)]
-    seconds: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+    tokens_in: Annotated[StrictInt, Field(ge=0, le=MAX_TOKENS)]
+    tokens_out: Annotated[StrictInt, Field(ge=0, le=MAX_TOKENS)]
+    seconds: Annotated[float, Field(strict=True, ge=0, le=MAX_SECONDS, allow_inf_nan=False)]
     estimated: StrictBool
 
     @field_validator("pair")
@@ -85,7 +103,7 @@ class Review(_Entry):
 
     kind: Literal["review"] = "review"
     record_id: RecordId
-    minutes: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+    minutes: Annotated[float, Field(strict=True, ge=0, le=MAX_MINUTES, allow_inf_nan=False)]
 
 
 Entry = Annotated[Charge | Review, Field(discriminator="kind")]
@@ -97,14 +115,19 @@ class Ledger:
 
     Each entry is appended with a single write to a file opened for appending,
     so processes on one local file system can log to the same ledger at once.
-    Reads parse the whole file. A line that does not parse, or a last line cut
-    short by a crash, raises `CorruptLedger` naming the line; nothing is
-    skipped, because a skipped line would hide spend.
+    Reads parse the whole file. A line that does not parse, names a record of
+    another run, or is cut short by a crash raises `CorruptLedger` naming the
+    line; nothing is skipped, because a skipped line would hide spend. An
+    append after a cut-short line is refused too, so that a new entry is never
+    joined onto a broken one.
+
+    Raise `FileNotFoundError` if the run has no manifest.
     """
 
     def __init__(self, store: RecordStore, run_id: str) -> None:
         self.store = store
         self.run_id = check_run_id(run_id)
+        self.manifest: RunManifest = load_manifest(store.root, self.run_id)
         self.path = store.root / "runs" / self.run_id / "ledger.jsonl"
 
     def _own_record(self, record_id: str) -> str:
@@ -119,8 +142,11 @@ class Ledger:
     def _append(self, entry: Charge | Review) -> None:
         line = entry.model_dump_json().encode() + b"\n"
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        fd = os.open(self.path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
         try:
+            size = os.fstat(fd).st_size
+            if size and os.pread(fd, 1, size - 1) != b"\n":
+                raise CorruptLedger(f"{self.path}: the last line is incomplete; refused to append")
             written = os.write(fd, line)
             if written != len(line):
                 raise OSError(f"{self.path}: short write ({written} of {len(line)} bytes)")
@@ -140,12 +166,13 @@ class Ledger:
         estimated: bool,
         record_id: str | None = None,
     ) -> None:
-        """Log one model call's tokens and wall-clock seconds.
+        """Log one model call's tokens and its duration in seconds.
 
-        Raise `ValidationError` for a negative or non-finite amount, and
-        `ValueError` for an unknown pair or a record of another run or another
-        pair. Raise `KeyError` if `record_id` names no stored record. Nothing is
-        logged on any error.
+        Raise `ValidationError` for an amount that is negative, non-finite,
+        too large, or of the wrong type. Raise `ValueError` for an unknown pair,
+        a pair or family the manifest does not list, or a record of another run
+        or another pair. Raise `KeyError` if `record_id` names no stored record.
+        Nothing is logged on any error.
         """
         entry = Charge(
             at=datetime.now(UTC),
@@ -158,6 +185,10 @@ class Ledger:
             seconds=seconds,
             estimated=estimated,
         )
+        if entry.pair not in self.manifest.pairs:
+            raise ValueError(f"pair {entry.pair} is not in run {self.run_id}'s manifest")
+        if entry.family not in self.manifest.families:
+            raise ValueError(f"family {entry.family} is not in run {self.run_id}'s manifest")
         if entry.record_id is not None:
             record = self.store.load(self._own_record(entry.record_id))
             if canonical_pair(record.pair) != entry.pair:
@@ -169,11 +200,17 @@ class Ledger:
     def log_review(self, record_id: str, minutes: float) -> None:
         """Log the user's review minutes for a record.
 
-        Raise `ValidationError` for negative or non-finite minutes, `ValueError`
-        for a record of another run, and `KeyError` if no such record is stored.
+        Raise `ValidationError` for minutes that are negative, non-finite, too
+        large, or of the wrong type. Raise `ValueError` for a record of another
+        run or one whose status can never be queued, and `KeyError` if no such
+        record is stored.
         """
         entry = Review(at=datetime.now(UTC), record_id=record_id, minutes=minutes)
-        self.store.load(self._own_record(entry.record_id))
+        record = self.store.load(self._own_record(entry.record_id))
+        if record.status not in QUEUEABLE:
+            raise ValueError(
+                f"record {record.id} is {record.status}; only queue items are reviewed"
+            )
         self._append(entry)
 
     def entries(self) -> builtins.list[Charge | Review]:
@@ -188,9 +225,14 @@ class Ledger:
         entries: builtins.list[Charge | Review] = []
         for number, line in enumerate(data.splitlines(), start=1):
             try:
-                entries.append(_ENTRY.validate_json(line))
+                entry = _ENTRY.validate_json(line)
             except ValidationError as exc:
                 raise CorruptLedger(f"{self.path}: line {number}: {exc}") from exc
+            if entry.record_id is not None and run_of(entry.record_id) != self.run_id:
+                raise CorruptLedger(
+                    f"{self.path}: line {number}: record {entry.record_id} is not in this run"
+                )
+            entries.append(entry)
         return entries
 
     def charges(self) -> builtins.list[Charge]:
@@ -244,11 +286,18 @@ class CostReport(BaseModel):
 
     A reviewed survivor is a record the user has reviewed at least once. The
     cost of a run is everything charged to it, including calls for records
-    that were later killed and calls with no record. Hours are model
-    wall-clock hours plus the user's review hours; both parts are also given
-    on their own. Per-survivor figures are `None` when nothing was reviewed.
+    that were later killed and calls with no record. Hours are the summed
+    durations of the model calls plus the user's review hours; both parts are
+    also given on their own. Calls that ran in parallel each count in full, so
+    machine hours can exceed the run's elapsed time. Per-survivor figures are
+    `None` when nothing was reviewed.
 
-    `family_cost_share` is each charged family's share of the run's tokens.
+    Only queue items are reviewed (`Ledger.log_review` refuses other
+    statuses), so the reviewed survivors are the reviewed queue items:
+    survivors, proved results, and certified kills.
+
+    `family_cost_share` is each charged family's share of the run's tokens; it
+    is empty when the run has charged no tokens.
     `family_survivor_share` is each family's share of the reviewed survivors,
     credited to the family that wrote the record (`Provenance.family`).
     """
