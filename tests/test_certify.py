@@ -11,6 +11,7 @@ import signal
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from fractions import Fraction
+from functools import partial
 from pathlib import Path
 from typing import cast
 
@@ -54,7 +55,7 @@ def test_rejects_warm_start_artefact() -> None:
     # The solver's own rates make R look concave: a falsifier trusting them
     # would report this as a violation.
     assert to_fraction(cert.violation) < -18
-    result = check_certificate(S7Encoding(), cert)
+    result = check_certificate(S7Encoding, cert)
     assert not result.accepted
     assert "upper bound on the margin" in result.reason
 
@@ -66,14 +67,14 @@ def test_rejects_grid_gap() -> None:
     assert rho_float(c, a1, b) > 0.25  # the float grid shows a violation
     with mpmath.mp.workdps(100):
         assert Y2Encoding().margin(cert.point) > 0  # at 100 digits there is none
-    result = check_certificate(Y2Encoding(), cert)
+    result = check_certificate(Y2Encoding, cert)
     assert not result.accepted
     assert "below zero" in result.reason
 
 
 def test_rejects_out_of_domain() -> None:
     cert = load("out_of_domain")
-    result = check_certificate(S7Encoding(), cert)
+    result = check_certificate(S7Encoding, cert)
     assert not result.accepted
     assert "outside the domain" in result.reason
 
@@ -82,20 +83,20 @@ def test_rejects_out_of_domain() -> None:
             return True
 
     # Only the domain check stops it: the bounds alone certify a violation.
-    assert check_certificate(AnyDomain(), cert).accepted
+    assert check_certificate(AnyDomain, cert).accepted
 
 
 def test_accepts_s7_counterexample() -> None:
     cert = load("s7_counterexample")
     assert isinstance(cert, DualityCertificate) and cert.digits == 40
-    result = check_certificate(S7Encoding(), cert)
+    result = check_certificate(S7Encoding, cert)
     assert result.accepted, result.reason
 
 
 def test_accepts_s7prime_counterexample() -> None:
     cert = load("s7prime_counterexample")
     assert isinstance(cert, DualityCertificate) and cert.digits == 60
-    result = check_certificate(S7Encoding(), cert)
+    result = check_certificate(S7Encoding, cert)
     assert result.accepted, result.reason
     # The pilot's certified bound on 2 R[D1, D2, D3] was 0.18565 < 4.
     assert abs(to_fraction(cert.violation) + 4 - Fraction("0.18565335128737")) < Fraction(1, 10**12)
@@ -104,7 +105,7 @@ def test_accepts_s7prime_counterexample() -> None:
 def test_accepts_s1_side_interval_certificate() -> None:
     cert = load("s1_side_counterexample")
     assert isinstance(cert, IntervalCertificate)
-    result = check_certificate(TsallisPinskerSide(), cert)
+    result = check_certificate(TsallisPinskerSide, cert)
     assert result.accepted, result.reason
 
 
@@ -112,7 +113,7 @@ def test_interval_claim_must_meet_the_enclosure() -> None:
     cert = load("s1_side_counterexample")
     assert isinstance(cert, IntervalCertificate)
     moved = cert.model_copy(update={"enclosure": ("-0.5", "-0.4")})
-    result = check_certificate(TsallisPinskerSide(), moved)
+    result = check_certificate(TsallisPinskerSide, moved)
     assert not result.accepted
     assert "does not meet the claimed" in result.reason
 
@@ -121,7 +122,7 @@ def test_duality_claim_must_match_recomputation() -> None:
     cert = load("s7_counterexample")
     assert isinstance(cert, DualityCertificate)
     tampered = cert.model_copy(update={"primal": "-5", "violation": "-5"})
-    result = check_certificate(S7Encoding(), tampered)
+    result = check_certificate(S7Encoding, tampered)
     assert not result.accepted
     assert "do not match" in result.reason
 
@@ -129,7 +130,7 @@ def test_duality_claim_must_match_recomputation() -> None:
 def test_duality_needs_high_precision() -> None:
     cert = load("s7_counterexample")
     assert isinstance(cert, DualityCertificate)
-    result = check_certificate(S7Encoding(), cert.model_copy(update={"digits": 15}))
+    result = check_certificate(S7Encoding, cert.model_copy(update={"digits": 15}))
     assert not result.accepted
     assert "at least 30 digits" in result.reason
 
@@ -140,7 +141,7 @@ def test_failed_assumption_rejected() -> None:
     values = dict(cert.point.values)
     values["p"] = ["0.40", "0.61"]  # no longer sums to 1
     bad = cert.model_copy(update={"point": Instance(values=values, precision_digits=40)})
-    result = check_certificate(S7Encoding(), bad)
+    result = check_certificate(S7Encoding, bad)
     assert not result.accepted
     assert "fails assumption(s) [0]" in result.reason
 
@@ -172,35 +173,33 @@ class Quadratic:
 def test_exact_certificate() -> None:
     half = Instance(values={"x": Fraction(1, 2)}, precision_digits=30)
     assert check_certificate(
-        Quadratic(), ExactCertificate(point=half, margin=Fraction(-1, 20))
+        Quadratic, ExactCertificate(point=half, margin=Fraction(-1, 20))
     ).accepted
-    wrong = check_certificate(Quadratic(), ExactCertificate(point=half, margin=Fraction(-1, 10)))
+    wrong = check_certificate(Quadratic, ExactCertificate(point=half, margin=Fraction(-1, 10)))
     assert not wrong.accepted and "exact margin is -1/20" in wrong.reason
     tenth = Instance(values={"x": "0.1"}, precision_digits=30)
-    positive = check_certificate(
-        Quadratic(), ExactCertificate(point=tenth, margin=Fraction(11, 100))
-    )
+    positive = check_certificate(Quadratic, ExactCertificate(point=tenth, margin=Fraction(11, 100)))
     assert not positive.accepted and "not negative" in positive.reason
     irrational = Instance(values={"x": "nan"}, precision_digits=30)
     assert not check_certificate(
-        Quadratic(), ExactCertificate(point=irrational, margin=Fraction(-1, 20))
+        Quadratic, ExactCertificate(point=irrational, margin=Fraction(-1, 20))
     ).accepted
 
 
 def test_missing_capability_rejected() -> None:
     s7 = load("s7_counterexample")
     cert = IntervalCertificate(point=s7.point, digits=40, enclosure=("-5", "-3"))
-    result = check_certificate(S7Encoding(), cert)  # S7 has no ball margin
+    result = check_certificate(S7Encoding, cert)  # S7 has no ball margin
     assert not result.accepted
     assert "no ball margin" in result.reason
 
 
 def test_encoding_error_rejected() -> None:
     class Broken(S7Encoding):
-        def primal_dual(self, x: Instance) -> tuple[mpmath.mpf, mpmath.mpf]:
+        def primal_dual(self, x: Instance) -> tuple[flint.arb, flint.arb]:
             raise ZeroDivisionError("boom")
 
-    result = check_certificate(Broken(), load("s7_counterexample"))
+    result = check_certificate(Broken, load("s7_counterexample"))
     assert not result.accepted
     assert "raised ZeroDivisionError" in result.reason
 
@@ -213,7 +212,7 @@ def test_certificate_json_round_trip() -> None:
 
 def test_check_restores_precision() -> None:
     before_mp, before_flint = mpmath.mp.dps, flint.ctx.prec
-    check_certificate(S7Encoding(), load("s7prime_counterexample"))
+    check_certificate(S7Encoding, load("s7prime_counterexample"))
     assert (mpmath.mp.dps, flint.ctx.prec) == (before_mp, before_flint)
 
 
@@ -227,16 +226,18 @@ def test_fixture_encodings_sample_valid_points(
 
 
 # Configurable encodings for the checker's own guards. Each records the
-# precisions it ran at.
+# precisions it ran at in `seen`, which the instances of one factory share.
 
 POINT = Instance(values={}, precision_digits=16)
 
 
 class Toy:
-    def __init__(self, *, holds: object = None, degenerate: object = False) -> None:
+    def __init__(
+        self, *, holds: object = None, degenerate: object = False, seen: list[int] | None = None
+    ) -> None:
         self.holds: object = [True] if holds is None else holds
         self.degenerate = degenerate
-        self.seen: list[int] = []
+        self.seen: list[int] = [] if seen is None else seen
 
     def margin(self, x: Instance) -> mpmath.mpf:
         return mpmath.mpf(-1)
@@ -258,11 +259,13 @@ class Toy:
 class DualToy(Toy):
     """Primal and dual bounds given by a function of the working precision."""
 
-    def __init__(self, bounds: Callable[[], tuple[mpmath.mpf, mpmath.mpf]]) -> None:
-        super().__init__()
+    def __init__(
+        self, bounds: Callable[[], tuple[flint.arb, flint.arb]], *, seen: list[int] | None = None
+    ) -> None:
+        super().__init__(seen=seen)
         self.bounds = bounds
 
-    def primal_dual(self, x: Instance) -> tuple[mpmath.mpf, mpmath.mpf]:
+    def primal_dual(self, x: Instance) -> tuple[flint.arb, flint.arb]:
         return self.bounds()
 
 
@@ -270,13 +273,24 @@ class BallToy(Toy):
     """A ball margin given by a function of the working precision."""
 
     def __init__(
-        self, ball: Callable[[], flint.arb], *, holds: object = None, degenerate: object = False
+        self,
+        ball: Callable[[], flint.arb],
+        *,
+        holds: object = None,
+        degenerate: object = False,
+        seen: list[int] | None = None,
     ) -> None:
-        super().__init__(holds=holds, degenerate=degenerate)
+        super().__init__(holds=holds, degenerate=degenerate, seen=seen)
         self.ball = ball
 
     def margin_ball(self, x: Instance) -> flint.arb:
         return self.ball()
+
+
+def exact(value: str) -> tuple[flint.arb, flint.arb]:
+    """Primal and dual bounds that are both the exact arb `value`."""
+    ball = flint.arb(value)
+    return ball, ball
 
 
 def dual_cert(primal: str, dual: str, violation: str, digits: int = 30) -> DualityCertificate:
@@ -292,102 +306,172 @@ def ball_cert(low: str, high: str, digits: int = 16) -> IntervalCertificate:
 
 
 def test_exactly_zero_margin_rejected() -> None:
-    # sqrt(30)^2 - 30 is 0, but reads as a tiny negative number at any precision.
-    def zero() -> tuple[mpmath.mpf, mpmath.mpf]:
-        m = mpmath.sqrt(30) ** 2 - 30
+    # sqrt(30)^2 - 30 is 0. As mpf values it read as a tiny negative number at
+    # any precision; as arb balls it contains 0.
+    def zero() -> tuple[flint.arb, flint.arb]:
+        m = flint.arb(30).sqrt() ** 2 - 30
         return m, m
 
     with mpmath.mp.workdps(30):
-        claim = mpmath.nstr(zero()[0], 30)
+        claim = mpmath.nstr(mpmath.sqrt(30) ** 2 - 30, 30)
     assert to_fraction(claim) < 0
-    result = check_certificate(DualToy(zero), dual_cert(claim, claim, claim))
+    result = check_certificate(partial(DualToy, zero), dual_cert(claim, claim, claim))
     assert not result.accepted
-    assert "not distinguishable from zero" in result.reason
+    assert "not below zero" in result.reason
 
 
-def test_cancellation_away_from_zero_rechecked() -> None:
-    # (10^40 + 1) - 10^40 - 1/2 reads as -1/2 at 30 digits; it is +1/2.
-    def cancel() -> tuple[mpmath.mpf, mpmath.mpf]:
-        big = mpmath.mpf(10) ** 40
-        m = (big + 1) - big - mpmath.mpf("0.5")
+@pytest.mark.parametrize("power", [40, 100])
+def test_cancellation_in_large_terms_rejected(power: int) -> None:
+    # (10^n + 1) - 10^n - 1/2 reads as -1/2 in mpf at 30 and 60 digits when n
+    # is 100; it is +1/2. The arb ball is wide enough to show it.
+    def cancel() -> tuple[flint.arb, flint.arb]:
+        big = flint.arb(10) ** power
+        m = (big + 1) - big - flint.arb("0.5")
         return m, m
 
-    enc = DualToy(cancel)
-    result = check_certificate(enc, dual_cert("-0.5", "-0.5", "-0.5"))
+    result = check_certificate(partial(DualToy, cancel), dual_cert("-0.5", "-0.5", "-0.5"))
     assert not result.accepted
-    assert "repeat check" in result.reason
-    assert max(enc.seen) >= 60
+    assert "not below zero" in result.reason
+
+
+def test_repeat_check_must_pass() -> None:
+    # A ball below zero at 16 digits and above it at 32.
+    def flips() -> flint.arb:
+        return flint.arb(-1) if mpmath.mp.dps <= 16 else flint.arb(1)
+
+    result = check_certificate(partial(BallToy, flips), ball_cert("-1", "-1"))
+    assert not result.accepted
+    assert "repeat check failed" in result.reason
 
 
 def test_recheck_precision() -> None:
     # Away from zero and not degenerate: repeated at twice the digits.
-    enc = BallToy(lambda: flint.arb(-1))
-    assert check_certificate(enc, ball_cert("-1", "-1")).accepted
-    assert enc.seen == [16, 32]
+    seen: list[int] = []
+    make = partial(BallToy, lambda: flint.arb(-1), seen=seen)
+    assert check_certificate(make, ball_cert("-1", "-1")).accepted
+    assert seen == [16, 32]
     # Near zero: repeated at 100 digits or more.
-    enc = BallToy(lambda: flint.arb(-1) / 10**8)
-    result = check_certificate(enc, ball_cert("-1e-8", "-1e-8"))
+    seen = []
+    make = partial(BallToy, lambda: flint.arb(-1) / 10**8, seen=seen)
+    result = check_certificate(make, ball_cert("-1e-8", "-1e-8"))
     assert result.accepted, result.reason
-    assert max(enc.seen) >= 100
+    assert max(seen) >= 100
     # Flagged near-degenerate: repeated at 100 digits or more.
-    enc = BallToy(lambda: flint.arb(-1), degenerate=True)
-    assert check_certificate(enc, ball_cert("-1", "-1")).accepted
-    assert max(enc.seen) >= 100
+    seen = []
+    make = partial(BallToy, lambda: flint.arb(-1), degenerate=True, seen=seen)
+    assert check_certificate(make, ball_cert("-1", "-1")).accepted
+    assert max(seen) >= 100
+
+
+def drift() -> flint.arb:
+    return flint.arb(-1) if mpmath.mp.dps <= 16 else flint.arb(-2)
 
 
 def test_repeat_must_agree() -> None:
-    # Both balls lie below zero and meet the claim, but they disagree: the
-    # value is not stable. (Duality bounds must also match the claim, which
-    # catches drift on its own.)
-    def drift() -> flint.arb:
-        return flint.arb(-1) if mpmath.mp.dps <= 16 else flint.arb(-2)
-
-    result = check_certificate(BallToy(drift), ball_cert("-2", "-1"))
+    # Both balls lie below zero and meet the claim, but they do not overlap:
+    # the value is not stable.
+    result = check_certificate(partial(BallToy, drift), ball_cert("-2", "-1"))
     assert not result.accepted
     assert "do not agree" in result.reason
 
 
+class Memo(BallToy):
+    """Caches its ball by point, so a second run on the same object repeats the first."""
+
+    def __init__(self, ball: Callable[[], flint.arb]) -> None:
+        super().__init__(ball)
+        self.cache: dict[str, flint.arb] = {}
+
+    def margin_ball(self, x: Instance) -> flint.arb:
+        key = x.model_dump_json(exclude={"precision_digits"})
+        if key not in self.cache:
+            self.cache[key] = self.ball()
+        return self.cache[key]
+
+
+def test_each_run_gets_a_fresh_encoding() -> None:
+    cert = ball_cert("-2", "-1")
+    result = check_certificate(partial(Memo, drift), cert)
+    assert not result.accepted
+    assert "do not agree" in result.reason
+    # A factory that hands back one object would let the cache hide the drift.
+    shared = Memo(drift)
+    result = check_certificate(lambda: shared, cert)
+    assert not result.accepted
+    assert "same encoding object" in result.reason
+
+
 def test_non_bool_degenerate_flag_rejected() -> None:
-    enc = BallToy(lambda: flint.arb(-1), degenerate=np.True_)
-    result = check_certificate(enc, ball_cert("-1", "-1"))
+    make = partial(BallToy, lambda: flint.arb(-1), degenerate=np.True_)
+    result = check_certificate(make, ball_cert("-1", "-1"))
     assert not result.accepted
     assert "near-degeneracy flag" in result.reason
 
 
 def test_non_bool_assumptions_rejected() -> None:
-    enc = BallToy(lambda: flint.arb(-1), holds=[1])
-    result = check_certificate(enc, ball_cert("-1", "-1"))
+    make = partial(BallToy, lambda: flint.arb(-1), holds=[1])
+    result = check_certificate(make, ball_cert("-1", "-1"))
     assert not result.accepted
     assert "did not give booleans" in result.reason
 
 
 def test_duality_gap_rule() -> None:
-    def wide() -> tuple[mpmath.mpf, mpmath.mpf]:
-        return mpmath.mpf(-1), mpmath.mpf("-1.01")
+    def wide() -> tuple[flint.arb, flint.arb]:
+        return flint.arb(-1), flint.arb("-1.01")
 
-    result = check_certificate(DualToy(wide), dual_cert("-1", "-1.01", "-1"))
+    result = check_certificate(partial(DualToy, wide), dual_cert("-1", "-1.01", "-1"))
     assert not result.accepted
     assert "duality gap" in result.reason
 
 
 def test_violation_must_lie_between_bounds() -> None:
-    def tight() -> tuple[mpmath.mpf, mpmath.mpf]:
-        return mpmath.mpf(-1), mpmath.mpf(-1)
-
-    result = check_certificate(DualToy(tight), dual_cert("-1", "-1", "-2"))
+    result = check_certificate(partial(DualToy, lambda: exact("-1")), dual_cert("-1", "-1", "-2"))
     assert not result.accepted
     assert "outside the bounds" in result.reason
 
 
-def test_non_finite_bounds_rejected() -> None:
-    def nan() -> tuple[mpmath.mpf, mpmath.mpf]:
-        return mpmath.mpf("nan"), mpmath.mpf("nan")
+def test_claimed_violation_must_be_negative() -> None:
+    # The bounds lie below zero; a positive claim within the tolerance of the
+    # upper bound would otherwise pass.
+    make = partial(DualToy, lambda: exact("-1e-28"))
+    result = check_certificate(make, dual_cert("-1e-28", "-1e-28", "1e-27"))
+    assert not result.accepted
+    assert "claimed violation" in result.reason and "not negative" in result.reason
+    assert check_certificate(make, dual_cert("-1e-28", "-1e-28", "-1e-28")).accepted
 
-    result = check_certificate(DualToy(nan), dual_cert("-1", "-1", "-1"))
+
+def test_duality_bounds_must_be_arb_balls() -> None:
+    def floats() -> tuple[flint.arb, flint.arb]:
+        return cast(flint.arb, mpmath.mpf(-1)), cast(flint.arb, mpmath.mpf(-1))
+
+    result = check_certificate(partial(DualToy, floats), dual_cert("-1", "-1", "-1"))
+    assert not result.accepted
+    assert "not two arb balls" in result.reason
+
+
+def test_wide_ball_around_the_claim_is_not_a_mismatch() -> None:
+    # The claim lies inside the ball, though further from its midpoint than the
+    # tolerance: the claim is not certainly wrong.
+    def wide() -> tuple[flint.arb, flint.arb]:
+        ball = flint.arb("-1", "1e-20")
+        return ball, ball
+
+    result = check_certificate(
+        partial(DualToy, wide), dual_cert("-1.000000000000000000001", "-1", "-1")
+    )
+    assert result.accepted, result.reason
+
+
+def test_non_finite_bounds_rejected() -> None:
+    def nan() -> tuple[flint.arb, flint.arb]:
+        return flint.arb("nan"), flint.arb("nan")
+
+    result = check_certificate(partial(DualToy, nan), dual_cert("-1", "-1", "-1"))
     assert not result.accepted
     assert "not finite" in result.reason
 
-    result = check_certificate(BallToy(lambda: flint.arb("nan")), ball_cert("-1", "-1"))
+    make = partial(BallToy, lambda: flint.arb("nan"))
+    result = check_certificate(make, ball_cert("-1", "-1"))
     assert not result.accepted
     assert "not finite" in result.reason
 
@@ -399,7 +483,7 @@ class HugeExact(Toy):
 
 def test_exact_margin_of_huge_magnitude() -> None:
     cert = ExactCertificate(point=POINT, margin=Fraction(-(10**400)))
-    result = check_certificate(HugeExact(), cert)
+    result = check_certificate(HugeExact, cert)
     assert result.accepted, result.reason
 
 
@@ -407,7 +491,7 @@ def test_exact_certificate_needs_a_rational_point() -> None:
     # HugeExact's assumptions do not read the point, so only the rationality check stops it.
     irrational = Instance(values={"x": "nan"}, precision_digits=30)
     cert = ExactCertificate(point=irrational, margin=Fraction(-(10**400)))
-    result = check_certificate(HugeExact(), cert)
+    result = check_certificate(HugeExact, cert)
     assert not result.accepted
     assert "needs a rational point" in result.reason
 
@@ -480,7 +564,7 @@ def test_check_never_raises() -> None:
     cert = IntervalCertificate.model_construct(
         kind="interval", point=POINT, digits=10**30, enclosure=("-1", "-1")
     )
-    result = check_certificate(BallToy(lambda: flint.arb(-1)), cert)
+    result = check_certificate(partial(BallToy, lambda: flint.arb(-1)), cert)
     assert not result.accepted
 
 
@@ -502,39 +586,36 @@ class FloatBall(Y2Encoding):
 def test_kill_needs_both_encodings() -> None:
     cert = load("grid_gap")
     # On its own the dishonest encoding certifies the false violation.
-    assert check_certificate(FloatBall(), cert).accepted
-    result = check_kill(FloatBall(), Y2Encoding(), cert)
+    assert check_certificate(FloatBall, cert).accepted
+    result = check_kill(FloatBall, Y2Encoding, cert)
     assert not result.accepted
     assert "second encoding" in result.reason
-    result = check_kill(Y2Encoding(), FloatBall(), cert)
+    result = check_kill(Y2Encoding, FloatBall, cert)
     assert not result.accepted
     assert "first encoding" in result.reason
 
     side = load("s1_side_counterexample")
-    result = check_kill(TsallisPinskerSide(), TsallisPinskerSide(), side)
+    # Two distinct factories. Task 7's encode_twice gives one per model family.
+    result = check_kill(TsallisPinskerSide, lambda: TsallisPinskerSide(), side)
     assert result.accepted, result.reason
 
 
 def test_kill_refuses_one_encoding_twice() -> None:
-    enc = TsallisPinskerSide()
-    result = check_kill(enc, enc, load("s1_side_counterexample"))
+    result = check_kill(TsallisPinskerSide, TsallisPinskerSide, load("s1_side_counterexample"))
     assert not result.accepted
     assert "same encoding" in result.reason
 
 
 def test_encoding_must_not_change_the_precision() -> None:
     # An encoding that pins its own precision would make both runs the same.
-    def cancel() -> tuple[mpmath.mpf, mpmath.mpf]:
-        big = mpmath.mpf(10) ** 40
-        m = (big + 1) - big - mpmath.mpf("0.5")
-        return m, m
-
     class Pinned(DualToy):
-        def primal_dual(self, x: Instance) -> tuple[mpmath.mpf, mpmath.mpf]:
+        def primal_dual(self, x: Instance) -> tuple[flint.arb, flint.arb]:
             mpmath.mp.dps = 30
             return self.bounds()
 
-    result = check_certificate(Pinned(cancel), dual_cert("-0.5", "-0.5", "-0.5"))
+    result = check_certificate(
+        partial(Pinned, lambda: exact("-0.5")), dual_cert("-0.5", "-0.5", "-0.5")
+    )
     assert not result.accepted
     assert "changed the working precision" in result.reason
 
@@ -543,7 +624,7 @@ def test_encoding_must_not_change_the_precision() -> None:
             flint.ctx.dps = 16
             return self.ball()
 
-    result = check_certificate(PinnedBall(lambda: flint.arb(-1)), ball_cert("-1", "-1"))
+    result = check_certificate(partial(PinnedBall, lambda: flint.arb(-1)), ball_cert("-1", "-1"))
     assert not result.accepted
     assert "changed the working precision" in result.reason
 
@@ -554,19 +635,19 @@ def test_honest_ball_that_narrows_is_accepted() -> None:
         rad = "0.4999" if mpmath.mp.dps <= 16 else "1e-10"
         return flint.arb("-0.5", rad)
 
-    result = check_certificate(BallToy(narrowing), ball_cert("-0.5", "-0.5"))
+    result = check_certificate(partial(BallToy, narrowing), ball_cert("-0.5", "-0.5"))
     assert result.accepted, result.reason
 
 
 def test_ball_margin_must_be_an_arb() -> None:
-    enc = BallToy(lambda: cast(flint.arb, mpmath.mpf(-1)))
-    result = check_certificate(enc, ball_cert("-1", "-1"))
+    make = partial(BallToy, lambda: cast(flint.arb, mpmath.mpf(-1)))
+    result = check_certificate(make, ball_cert("-1", "-1"))
     assert not result.accepted
     assert "not an arb" in result.reason
 
 
 def test_empty_enclosure_rejected() -> None:
-    result = check_certificate(BallToy(lambda: flint.arb(-1)), ball_cert("-1", "-2"))
+    result = check_certificate(partial(BallToy, lambda: flint.arb(-1)), ball_cert("-1", "-2"))
     assert not result.accepted
     assert "enclosure is empty" in result.reason
 
@@ -578,7 +659,7 @@ class FloatExact(Toy):
 
 def test_exact_margin_must_be_a_fraction() -> None:
     cert = ExactCertificate(point=POINT, margin=Fraction(-1, 2))
-    result = check_certificate(FloatExact(), cert)
+    result = check_certificate(FloatExact, cert)
     assert not result.accepted
     assert "not a Fraction" in result.reason
 
@@ -589,6 +670,20 @@ class NumpyDomain(BallToy):
 
 
 def test_domain_predicate_must_give_a_bool() -> None:
-    result = check_certificate(NumpyDomain(lambda: flint.arb(-1)), ball_cert("-1", "-1"))
+    result = check_certificate(partial(NumpyDomain, lambda: flint.arb(-1)), ball_cert("-1", "-1"))
     assert not result.accepted
     assert "domain predicate did not give a bool" in result.reason
+
+
+def test_s7_refuses_distortions_it_cannot_order() -> None:
+    # Three identical witnesses give three equal distortions: no weight has a sign.
+    cert = load("s7_counterexample")
+    values = dict(cert.point.values)
+    s = values["s"]
+    q = values["q"]
+    assert isinstance(s, list) and isinstance(q, list)
+    values["s"] = [s[0]] * 3
+    values["q"] = q[:3] * 3
+    same = Instance(values=values, precision_digits=40)
+    with working_digits(40), pytest.raises(ValueError, match="too close"):
+        S7Encoding().primal_dual(same)

@@ -5,12 +5,14 @@ from minilab.certify.duality import DualityCertificate
 from minilab.certify.exact import ExactCertificate
 from minilab.certify.interval import IntervalCertificate
 from minilab.certify.result import CheckResult
+from minilab.encoding.api import EncodingFactory
 
 __all__ = [
     "CERTIFICATE",
     "Certificate",
     "CheckResult",
     "DualityCertificate",
+    "EncodingFactory",
     "ExactCertificate",
     "IntervalCertificate",
     "check_certificate",

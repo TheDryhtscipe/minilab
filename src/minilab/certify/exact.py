@@ -3,11 +3,10 @@
 from fractions import Fraction
 from typing import Literal
 
-import mpmath
 from pydantic import BaseModel, ConfigDict
 
 from minilab.certify.result import CheckResult, MarginCheck, reject
-from minilab.encoding.api import Encoding, ExactMargin, Instance
+from minilab.encoding.api import Encoding, ExactMargin, Instance, to_arb
 
 
 class ExactCertificate(BaseModel):
@@ -39,9 +38,7 @@ def check_exact_margin(enc: Encoding, cert: ExactCertificate, point: Instance) -
         )
     if margin >= 0:
         return MarginCheck.failed(reject(f"the exact margin {margin} is not negative"))
-    value = mpmath.mpf(margin.numerator) / margin.denominator
     return MarginCheck(
         result=CheckResult(accepted=True, reason=f"exact margin {margin} < 0"),
-        lower=value,
-        upper=value,
+        enclosure=to_arb(margin),
     )

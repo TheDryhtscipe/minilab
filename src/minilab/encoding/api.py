@@ -12,12 +12,16 @@ the checker recomputes the margin itself and never trusts a number it is given:
 - `ExactMargin`: the margin as an exact rational, for exact certificates;
 - `BallMargin`: the margin as an arb ball (python-flint), for interval
   certificates;
-- `DualBounds`: a primal and a dual bound on the margin, for quantities defined
-  by an optimisation, for duality certificates.
+- `DualBounds`: a primal and a dual bound on the margin, each an arb ball, for
+  quantities defined by an optimisation, for duality certificates.
+
+The checker takes an `EncodingFactory`, not an encoding, and builds a fresh
+encoding for each run, so that state kept by one run cannot carry into the next.
 """
 
 import random
 import re
+from collections.abc import Callable
 from fractions import Fraction
 from typing import Protocol, runtime_checkable
 
@@ -156,9 +160,15 @@ class BallMargin(Protocol):
 class DualBounds(Protocol):
     """An encoding whose margin is defined by an optimisation.
 
-    `primal_dual` returns two values, computed at mpmath's current precision:
-    one from a primal-feasible point and one from a dual-feasible point. The true
-    margin lies between them, whichever is larger.
+    `primal_dual` returns two arb balls, computed at python-flint's current
+    precision: one bounds the margin from above (from a primal-feasible point)
+    and one from below (from a dual-feasible point). The true margin lies
+    between the lowest point of the two balls and the highest, whichever ball
+    is which.
     """
 
-    def primal_dual(self, x: Instance) -> tuple[mpmath.mpf, mpmath.mpf]: ...
+    def primal_dual(self, x: Instance) -> tuple[flint.arb, flint.arb]: ...
+
+
+# Builds a fresh encoding. The checker calls it once for each run.
+EncodingFactory = Callable[[], Encoding]

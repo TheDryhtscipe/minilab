@@ -28,22 +28,25 @@ def reject(reason: str) -> CheckResult:
 
 @dataclass(frozen=True)
 class MarginCheck:
-    """The margin part of a check, with an upper bound on the margin.
+    """The margin part of a check, with an arb ball that contains the margin.
 
-    `lower` and `upper` bound the margin. They decide whether the margin is
-    close enough to zero that the repeat check needs at least 100 digits, and
-    whether the two checks agree. Both are None when the check failed. An mpf
-    keeps the full range of an exact or ball margin, which a float would
-    overflow.
+    The ball decides whether the margin is close enough to zero that the repeat
+    check needs at least 100 digits, and whether the two checks agree. It is
+    None when the check failed. A ball keeps the full range and exactness of an
+    exact margin, which a float would overflow and an mpf would round.
     """
 
     result: CheckResult
-    lower: mpmath.mpf | None
-    upper: mpmath.mpf | None
+    enclosure: flint.arb | None
 
     @classmethod
     def failed(cls, result: CheckResult) -> "MarginCheck":
-        return cls(result=result, lower=None, upper=None)
+        return cls(result=result, enclosure=None)
+
+
+def show(exact: flint.arb) -> str:
+    """Write an exact arb (radius 0, such as `ball.upper()`) to 15 digits."""
+    return exact.str(15, radius=False)
 
 
 @contextmanager

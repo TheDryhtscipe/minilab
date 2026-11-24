@@ -1,6 +1,6 @@
 """Rebuild the pilot certificate fixtures (build plan doc-5wh, Task 6).
 
-Run from the repo root: `uv run python tests/fixtures/pilot/rebuild.py`.
+Run from the repo root: `PYTHONPATH=tests uv run python tests/fixtures/pilot/rebuild.py`.
 It writes one JSON certificate per case next to this file. Each certificate is
 what a falsifier would submit; the tests check that the library accepts or
 rejects it. Sources, all in ~/dev/sci/experiments/crossconj-ml (read only):
@@ -31,6 +31,7 @@ import mpmath
 from fixtures.pilot.s1_side import TsallisPinskerSide
 from fixtures.pilot.s7 import S7Encoding
 from fixtures.pilot.s7_y2 import rho_float
+from minilab.certify.result import working_digits
 from minilab.encoding.api import Instance
 
 HERE = Path(__file__).parent
@@ -47,8 +48,12 @@ def _duality(name: str, x: Instance, digits: int, naive: bool = False) -> None:
     With `naive`, the claimed violation is what a falsifier that trusts its
     solver would report: the divided difference of the primal rates alone.
     """
-    with mpmath.mp.workdps(digits):
-        primal, dual = S7Encoding().primal_dual(x)
+    with working_digits(digits):
+        primal_ball, dual_ball = S7Encoding().primal_dual(x)
+        primal, dual = (
+            mpmath.mpf(ball.mid().str(digits + 5, radius=False))
+            for ball in (primal_ball, dual_ball)
+        )
         violation = primal
         if naive:
             a, b, c = S7Encoding().points(x)
