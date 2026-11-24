@@ -13,9 +13,12 @@
 - Every call runs isolated: a fresh empty temporary working directory, removed
   afterwards, and an environment reduced to an allowlist, so no
   `ANTHROPIC_*` or other credential or tool-routing variable reaches the tool.
-- Every call is charged to its pair, including a failed one. A failed call is
-  charged its estimated prompt tokens, marked as an estimate, because the tool
-  may have spent tokens before it failed. Then `ModelUnavailable` is raised.
+- Every call that started is charged to its pair, including a failed one.
+  A call that failed after the tool started (any exception from the backend)
+  is charged as an estimate: input is the larger of the tokens the tool
+  reported and the prompt's estimate, output is what the tool reported or
+  zero. Then the exception is raised again. A call that failed before the
+  tool started (`ModelNotStarted`) used nothing and is not charged.
   The adapter never writes to a record, so a failure leaves the record as it
   was and the run can resume.
 
@@ -24,9 +27,11 @@
 
 import os
 import shutil
+import stat
 import tempfile
 import time
-from collections.abc import Mapping
+import warnings
+from collections.abc import Callable, Iterable, Mapping
 from enum import Enum
 from pathlib import Path
 
@@ -40,6 +45,7 @@ from minilab.models.backends import (
     CodexBackend,
     GeminiBackend,
     LocalBackend,
+    ModelNotStarted,
     ModelReply,
     ModelUnavailable,
     estimate_tokens,
@@ -53,6 +59,7 @@ __all__ = [
     "ROLE_STAGE",
     "Budget",
     "BudgetExceeded",
+    "ModelNotStarted",
     "ModelReply",
     "ModelUnavailable",
     "NoChecker",
@@ -67,8 +74,12 @@ __all__ = [
 
 
 class Role(Enum):
-    """A model call's job. A plain `Enum`, not a `StrEnum`: the member `encode`
-    would shadow `str.encode` on every member."""
+    """A model call's job.
+
+    A plain `Enum`, not a `StrEnum`: pyright in strict mode treats a member
+    named `encode` as an incompatible override of `str.encode`. (At run time a
+    `StrEnum` would work.)
+    """
 
     generate = "generate"
     encode = "encode"
@@ -97,7 +108,8 @@ ROLE_STAGE: dict[Role, Stage] = {
     Role.grade: Stage.queue,
 }
 """The stage each role's cost is charged to. Curating and grading the benchmark
-have no pipeline stage of their own; they are charged to the queue."""
+have no pipeline stage of their own; they are charged to the queue. They are
+meant to run under their own run id and manifest, not a benchmark run's ledger."""
 
 ENV_ALLOWLIST: frozenset[str] = frozenset(
     {
@@ -119,15 +131,15 @@ ENV_ALLOWLIST: frozenset[str] = frozenset(
         "XDG_CACHE_HOME",
         "XDG_STATE_HOME",
         "DBUS_SESSION_BUS_ADDRESS",
-        "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
-        "CODEX_HOME",
-        "CLAUDE_CONFIG_DIR",
     }
 )
-"""Variables a tool may see: what it needs to find its binary, its login, and
-the OS keyring. Everything else, including every `ANTHROPIC_*` variable and
-any API key, is dropped."""
+"""The only variables a tool sees. They locate its binary, the user's home
+directory and XDG directories (where each tool keeps its default login), the
+OS keyring over D-Bus, and the locale, time zone, and temporary directory.
+Every other variable is dropped: every `ANTHROPIC_*` variable, any API key,
+and variables that pick another account or another TLS trust store
+(`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `SSL_CERT_FILE`, `SSL_CERT_DIR`). A tool
+can still read its default login and settings under `HOME`."""
 
 
 class BudgetExceeded(Exception):
@@ -143,7 +155,10 @@ class NoChecker(Exception):
 
 
 class Budget(BaseModel):
-    """The token budget for one domain pair: every model call for the pair counts."""
+    """The token budget for one domain pair: every model call for the pair counts.
+
+    It may be smaller than the run manifest's budget, never larger.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -168,20 +183,49 @@ def default_backends() -> dict[Family, Backend]:
     }
 
 
+def _remove_dir(path: Path) -> None:
+    """Remove `path`, making read-only parts writable as needed. Warn if it stays."""
+
+    def make_writable_and_retry(
+        func: Callable[[str], object], failed: str, exc: BaseException
+    ) -> None:
+        for target in (os.path.dirname(failed), failed):
+            try:
+                if not stat.S_ISLNK(os.lstat(target).st_mode):
+                    os.chmod(target, 0o700)
+            except OSError:
+                pass
+        try:
+            func(failed)
+        except OSError:
+            pass
+
+    shutil.rmtree(path, onexc=make_writable_and_retry)
+    if path.exists():
+        # A second pass reaches directories the first pass made readable.
+        shutil.rmtree(path, onexc=make_writable_and_retry)
+    if path.exists():
+        warnings.warn(f"could not remove the call's working directory {path}", stacklevel=3)
+
+
 def isolated_run(backend: Backend, prompt: str, *, timeout_s: float) -> ModelReply:
     """Run one prompt through `backend` in a fresh empty directory with a scrubbed environment.
 
-    The directory is removed afterwards, whether or not the call succeeds.
+    The directory is removed afterwards, whether or not the call succeeds; if
+    it cannot be removed, a warning names it and the call's result stands.
     """
-    cwd = Path(tempfile.mkdtemp(prefix="minilab-call-"))
+    try:
+        cwd = Path(tempfile.mkdtemp(prefix="minilab-call-"))
+    except OSError as exc:
+        raise ModelNotStarted(f"cannot make the call's working directory: {exc}") from exc
     try:
         return backend.run(prompt, cwd=cwd, env=scrubbed_env(), timeout_s=timeout_s)
     finally:
-        shutil.rmtree(cwd, ignore_errors=True)
+        _remove_dir(cwd)
 
 
 def call(
-    family: Family,
+    family: Family | str,
     role: Role,
     prompt: str,
     *,
@@ -197,10 +241,15 @@ def call(
     `record_id` is None for a call made before any record exists, such as
     generation. Raise `RoleNotAllowed` for Gemini in any role but generate;
     `ValueError` for a family or pair the run's manifest does not list, or a
-    record of another run or pair; `BudgetExceeded` if the pair's spend is at
-    or over the budget; and `ModelUnavailable` if the tool fails. Each of these
-    is raised before the call except `ModelUnavailable`. No record is written.
+    record of another run or pair, a backend of another family, or a budget
+    larger than the manifest's; `KeyError` for a record id that names no
+    stored record; `BudgetExceeded` if the pair's spend is at or over the
+    budget; and `ModelUnavailable` if the tool fails (`ModelNotStarted` if it
+    failed before it started). Each of these is raised before the call except
+    `ModelUnavailable`. Any exception the backend raises after the tool
+    started is charged and raised again. No record is written.
     """
+    family = Family(family)
     if family is Family.gemini and role is not Role.generate:
         raise RoleNotAllowed(f"gemini generates only; refused role {role.value}")
     pair = canonical_pair(pair)
@@ -215,9 +264,16 @@ def call(
         record = ledger.store.load(record_id)
         if canonical_pair(record.pair) != pair:
             raise ValueError(f"record {record_id} is for pair {record.pair}, not {pair}")
+    if budget.tokens_per_pair > ledger.manifest.budget_tokens_per_pair:
+        raise ValueError(
+            f"budget {budget.tokens_per_pair} is larger than run {ledger.run_id}'s "
+            f"{ledger.manifest.budget_tokens_per_pair} tokens per pair"
+        )
     backend = (backends if backends is not None else default_backends()).get(family)
     if backend is None:
-        raise ModelUnavailable(f"no backend for family {family}")
+        raise ModelNotStarted(f"no backend for family {family}")
+    if backend.family != family:
+        raise ValueError(f"the backend for {family} is a {backend.family} backend")
     stage = ROLE_STAGE[role]
     with ledger.pair_lock(pair):
         spend = ledger.pair_spend(pair)
@@ -228,17 +284,24 @@ def call(
         started = time.monotonic()
         try:
             reply = isolated_run(backend, prompt, timeout_s=timeout_s)
-        except ModelUnavailable:
-            ledger.charge(
-                pair=pair,
-                stage=stage,
-                family=family,
-                tokens_in=estimate_tokens(prompt),
-                tokens_out=0,
-                seconds=time.monotonic() - started,
-                estimated=True,
-                record_id=record_id,
-            )
+        except ModelNotStarted:
+            raise
+        except BaseException as exc:
+            reported_in = exc.tokens_in if isinstance(exc, ModelUnavailable) else None
+            reported_out = exc.tokens_out if isinstance(exc, ModelUnavailable) else None
+            try:
+                ledger.charge(
+                    pair=pair,
+                    stage=stage,
+                    family=family,
+                    tokens_in=max(reported_in or 0, estimate_tokens(prompt)),
+                    tokens_out=reported_out or 0,
+                    seconds=time.monotonic() - started,
+                    estimated=True,
+                    record_id=record_id,
+                )
+            except Exception as charge_exc:
+                exc.add_note(f"charging this failed call also failed: {charge_exc!r}")
             raise
         ledger.charge(
             pair=pair,
@@ -254,8 +317,8 @@ def call(
 
 
 def pick_checker(
-    author: Family,
-    available: list[Family],
+    author: Family | str,
+    available: Iterable[Family | str],
     *,
     short: bool = False,
     codex_budget_left: bool = False,
@@ -268,6 +331,8 @@ def pick_checker(
     (design doc-gmj: Codex budget goes to checking calls first). Raise
     `NoChecker` if neither Claude nor Codex is available apart from the author.
     """
+    author = Family(author)
+    available = [Family(f) for f in available]
     candidates = [f for f in (Family.claude, Family.codex) if f in available and f is not author]
     if not candidates:
         raise NoChecker(f"no checker for work by {author} among {available}")

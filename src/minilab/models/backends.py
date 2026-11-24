@@ -3,12 +3,16 @@
 A backend turns a prompt into a `ModelReply`. It runs its tool in the working
 directory and environment the adapter gives it (an empty temporary directory
 and a scrubbed environment; see `minilab.models.adapter`). It reads the token
-counts from the tool's JSON output. Where the tool reports none, it estimates
-them at 4 characters per token and sets `estimated`.
+counts from the tool's JSON output. Where the tool reports a count as missing
+or invalid, it estimates that count at 4 characters per token and sets
+`estimated`.
 
-Any failure raises `ModelUnavailable`: a missing binary, a non-zero exit, a
-timeout, output that does not parse, an error the tool reports, or a usage
-limit message. A backend never returns a reply for a failed call.
+Any failure raises `ModelUnavailable`: a non-zero exit, a timeout, output that
+does not parse, a reply with no text, or an error the tool reports. A failure
+before the tool started (a missing binary, a prompt that cannot be passed to
+the tool) raises its subclass `ModelNotStarted`. When a failed call's output
+still reports the tokens it used, the exception carries them, so the adapter
+can charge them. A backend never returns a reply for a failed call.
 
 The isolation flags for each tool:
 
@@ -20,9 +24,14 @@ The isolation flags for each tool:
   no MCP servers), a read-only sandbox, web search disabled, and every tool
   feature that reaches outside the prompt turned off, including the shell.
 - Gemini (Antigravity CLI, `agy -p`): a session-only `--settings` object that
-  denies every file, URL, command, and MCP action, keeps the agent inside its
-  empty workspace, and never spends paid credits.
-- Local (ollama HTTP API): the model has no tools.
+  denies file, URL, command, and MCP actions, keeps the agent inside its empty
+  workspace, and never spends paid credits. The deny list does not cover
+  agy's built-in `search_web` tool, nor its browser or subagent tools. The
+  probe of 2026-11-24 found that Gemini still searches the web, so Gemini is
+  "normal runs only" and may not be used in the benchmark (see
+  `src/minilab/models/isolation.json`; follow-up bead minilab-2be43f).
+- Local (ollama HTTP API): the model has no tools. The HTTP client ignores
+  proxy variables in the environment.
 
 Whether each tool really is isolated is checked live by
 `scripts/probe_isolation.py`, not assumed from these flags.
@@ -34,7 +43,7 @@ import os
 import re
 import signal
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Protocol
 
@@ -49,26 +58,39 @@ CHARS_PER_TOKEN = 4
 DEFAULT_TIMEOUT_S = 900.0
 """Default time limit for one model call, in seconds."""
 
+KILL_WAIT_S = 5.0
+"""After a timeout kills the tool, how long to wait for its output pipes to close."""
+
 SYSTEM_PROMPT = (
     "You are a careful research mathematician. You have no tools: answer from your own "
     "knowledge, in plain text, and say so when you are unsure."
 )
 """System prompt for the Claude backend, in place of Claude Code's own."""
 
-_LIMIT = re.compile(
-    r"usage limit|rate[ -]?limit|quota|too many requests|\b429\b|limit reached|"
-    r"hit your (usage )?limit|resource[_ ]exhausted|out of credits",
-    re.IGNORECASE,
-)
+_CLAUDE_LIMIT = re.compile(r"^\s*Claude AI usage limit reached")
+"""Claude has printed this usage limit message as a result that is not marked an error."""
+
 MAX_ARG_BYTES = 120_000
 """Largest prompt agy can take: Linux caps one argument at 128 KiB."""
 
-_SHORT_REPLY = 300
-"""A reply this short that matches `_LIMIT` is a usage limit message, not an answer."""
-
 
 class ModelUnavailable(Exception):
-    """The tool failed, timed out, or hit a usage limit. No reply exists."""
+    """The tool failed, timed out, or hit a usage limit. No reply exists.
+
+    `tokens_in` and `tokens_out` are the counts the tool reported for the
+    failed call, or None where it reported none.
+    """
+
+    def __init__(
+        self, message: str, *, tokens_in: int | None = None, tokens_out: int | None = None
+    ) -> None:
+        super().__init__(message)
+        self.tokens_in = tokens_in
+        self.tokens_out = tokens_out
+
+
+class ModelNotStarted(ModelUnavailable):
+    """The call failed before the tool started, so it used no tokens."""
 
 
 class ModelReply(BaseModel):
@@ -100,13 +122,25 @@ def estimate_tokens(text: str) -> int:
     return math.ceil(len(text) / CHARS_PER_TOKEN)
 
 
-def _limit_message(text: str) -> bool:
-    return len(text) <= _SHORT_REPLY and _LIMIT.search(text) is not None
-
-
 def _tail(text: str, limit: int = 500) -> str:
     text = text.strip()
     return text if len(text) <= limit else "..." + text[-limit:]
+
+
+class ToolExit(ModelUnavailable):
+    """The tool started and exited non-zero. `stdout` is what it printed."""
+
+    def __init__(self, message: str, *, stdout: str) -> None:
+        super().__init__(message)
+        self.stdout = stdout
+
+
+def _killpg(pgid: int) -> None:
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        # The group is gone (or its id now belongs to a process we may not signal).
+        pass
 
 
 def run_command(
@@ -117,13 +151,34 @@ def run_command(
     env: Mapping[str, str],
     timeout_s: float,
 ) -> str:
-    """Run `argv` with `stdin`, and return its stdout.
+    """Run `argv` with `stdin` (UTF-8), and return its stdout decoded as UTF-8.
 
-    The tool runs in its own process group. On a timeout the whole group is
-    killed, so a tool's child processes do not outlive the call. Raise
-    `ModelUnavailable` on a missing binary, a timeout, or a non-zero exit; the
+    Bytes that are not valid UTF-8 in the output become U+FFFD. Raise
+    `ModelNotStarted`, before anything starts, if `stdin` or an argument
+    cannot be encoded as UTF-8, if an argument holds a NUL character, or if
+    the process cannot be started (a missing binary, for one).
+
+    The tool runs in its own process group. After the call, whether it
+    succeeded or not, the whole group is killed, so the tool's child processes
+    do not outlive it. On a timeout the group is killed at once; if a child
+    that left the group still holds the output pipes, they are closed after
+    `KILL_WAIT_S` seconds rather than waited on. Raise `ModelUnavailable` on a
+    timeout, and `ToolExit` (a `ModelUnavailable`) on a non-zero exit; the
     message carries the end of stderr.
     """
+    tool = argv[0] if argv else "(no command)"
+    if not argv:
+        raise ModelNotStarted("empty command")
+    try:
+        data = stdin.encode("utf-8")
+        for arg in argv:
+            arg.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ModelNotStarted(
+            f"{tool}: the prompt or an argument is not valid text: {exc}"
+        ) from exc
+    if any("\0" in arg for arg in argv):
+        raise ModelNotStarted(f"{tool}: an argument holds a NUL character")
     try:
         proc = subprocess.Popen(
             list(argv),
@@ -132,25 +187,56 @@ def run_command(
             stderr=subprocess.PIPE,
             cwd=cwd,
             env=dict(env),
-            text=True,
             start_new_session=True,
         )
-    except OSError as exc:
-        raise ModelUnavailable(f"{argv[0]}: cannot start: {exc}") from exc
+    except (OSError, ValueError) as exc:
+        raise ModelNotStarted(f"{tool}: cannot start: {exc}") from exc
     try:
-        out, err = proc.communicate(stdin, timeout=timeout_s)
-    except subprocess.TimeoutExpired as exc:
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        proc.communicate()
-        raise ModelUnavailable(f"{argv[0]}: timed out after {timeout_s} s") from exc
+            out_b, err_b = proc.communicate(data, timeout=timeout_s)
+        except subprocess.TimeoutExpired as exc:
+            _killpg(proc.pid)
+            try:
+                proc.communicate(timeout=KILL_WAIT_S)
+            except subprocess.TimeoutExpired:
+                for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                    if pipe is not None:
+                        pipe.close()
+                proc.wait()
+            raise ModelUnavailable(f"{tool}: timed out after {timeout_s} s") from exc
+    finally:
+        _killpg(proc.pid)
+    out = out_b.decode("utf-8", errors="replace")
+    err = err_b.decode("utf-8", errors="replace")
     if proc.returncode != 0:
-        raise ModelUnavailable(
-            f"{argv[0]}: exit {proc.returncode}: {_tail(err) or _tail(out)}"
+        raise ToolExit(
+            f"{tool}: exit {proc.returncode}: {_tail(err) or _tail(out)}", stdout=out
         )
     return out
+
+
+def _run_and_parse(
+    argv: Sequence[str],
+    parse: Callable[[str], ModelReply],
+    *,
+    stdin: str,
+    cwd: Path,
+    env: Mapping[str, str],
+    timeout_s: float,
+) -> ModelReply:
+    """Run the tool and parse its output. On a non-zero exit, keep any usage it reported."""
+    try:
+        out = run_command(argv, stdin=stdin, cwd=cwd, env=env, timeout_s=timeout_s)
+    except ToolExit as exc:
+        try:
+            reply = parse(exc.stdout)
+        except ModelUnavailable as parsed:
+            tokens_in, tokens_out = parsed.tokens_in, parsed.tokens_out
+        else:
+            tokens_in = None if reply.estimated else reply.tokens_in
+            tokens_out = None if reply.estimated else reply.tokens_out
+        raise ModelUnavailable(str(exc), tokens_in=tokens_in, tokens_out=tokens_out) from exc
+    return parse(out)
 
 
 def _load_json(raw: str, tool: str) -> JsonValue:
@@ -165,8 +251,27 @@ def _obj(value: JsonValue) -> dict[str, JsonValue]:
     return value if isinstance(value, dict) else {}
 
 
-def _int(value: JsonValue) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+def _int(value: JsonValue) -> int | None:
+    """A token count, or None if it is missing or not a non-negative whole number."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer() and value >= 0:
+        return int(value)
+    return None
+
+
+def _sum(usage: dict[str, JsonValue], required: str, *optional: str) -> int | None:
+    """`required` plus every `optional` count present; None if any of them is invalid."""
+    total = _int(usage.get(required))
+    for name in optional:
+        if total is None:
+            return None
+        if name in usage:
+            part = _int(usage[name])
+            total = None if part is None else total + part
+    return total
 
 
 def _reply(
@@ -188,8 +293,10 @@ def _reply(
 def parse_claude(raw: str, *, prompt: str = "") -> ModelReply:
     """Parse `claude -p --output-format json` output: a list of events, result last.
 
-    Input tokens include cache writes and cache reads, because all of them
-    count against the subscription.
+    The last `result` event counts. Input tokens include cache writes and
+    cache reads, because all of them count against the subscription. The
+    model name comes from the `system/init` event, else the first key of the
+    result's `modelUsage`, else "claude".
     """
     value = _load_json(raw, "claude")
     events = value if isinstance(value, list) else [value]
@@ -202,25 +309,35 @@ def parse_claude(raw: str, *, prompt: str = "") -> ModelReply:
     result = next((_obj(e) for e in reversed(events) if _obj(e).get("type") == "result"), None)
     if result is None:
         raise ModelUnavailable(f"claude: no result event: {_tail(raw)}")
-    text = result.get("result")
-    text = text if isinstance(text, str) else ""
-    if result.get("is_error") is not False or result.get("subtype") != "success":
-        raise ModelUnavailable(f"claude: error result: {_tail(text or raw)}")
-    if _limit_message(text):
-        raise ModelUnavailable(f"claude: usage limit: {text}")
-    model = init.get("model")
-    usage = result.get("usage")
     tokens_in: int | None = None
     tokens_out: int | None = None
+    usage = result.get("usage")
     if isinstance(usage, dict):
-        tokens_in = (
-            _int(usage.get("input_tokens"))
-            + _int(usage.get("cache_creation_input_tokens"))
-            + _int(usage.get("cache_read_input_tokens"))
+        tokens_in = _sum(
+            usage, "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"
         )
         tokens_out = _int(usage.get("output_tokens"))
-    return _reply(text, tokens_in, tokens_out, model if isinstance(model, str) else "claude",
-                  prompt)
+    text = result.get("result")
+    if result.get("is_error") is not False or result.get("subtype") != "success":
+        detail = text if isinstance(text, str) and text else raw
+        raise ModelUnavailable(
+            f"claude: error result ({result.get('subtype')}): {_tail(detail)}",
+            tokens_in=tokens_in, tokens_out=tokens_out,
+        )
+    if not isinstance(text, str) or not text:
+        raise ModelUnavailable(
+            f"claude: result has no reply text: {_tail(raw)}",
+            tokens_in=tokens_in, tokens_out=tokens_out,
+        )
+    if _CLAUDE_LIMIT.match(text):
+        raise ModelUnavailable(
+            f"claude: usage limit: {_tail(text)}", tokens_in=tokens_in, tokens_out=tokens_out
+        )
+    model = init.get("model")
+    if not isinstance(model, str):
+        model_usage = result.get("modelUsage")
+        model = next(iter(model_usage), None) if isinstance(model_usage, dict) else None
+    return _reply(text, tokens_in, tokens_out, model or "claude", prompt)
 
 
 class ClaudeBackend:
@@ -248,8 +365,10 @@ class ClaudeBackend:
     def run(
         self, prompt: str, *, cwd: Path, env: Mapping[str, str], timeout_s: float
     ) -> ModelReply:
-        out = run_command(self.argv(), stdin=prompt, cwd=cwd, env=env, timeout_s=timeout_s)
-        return parse_claude(out, prompt=prompt)
+        return _run_and_parse(
+            self.argv(), lambda out: parse_claude(out, prompt=prompt),
+            stdin=prompt, cwd=cwd, env=env, timeout_s=timeout_s,
+        )
 
 
 # --- Codex ----------------------------------------------------------------------------------
@@ -278,41 +397,70 @@ CODEX_DISABLED_FEATURES: tuple[str, ...] = (
 def parse_codex(raw: str, *, model: str, prompt: str = "") -> ModelReply:
     """Parse `codex exec --json` output: one JSON event per line.
 
-    The answer is the last `agent_message` item. Tokens come from the
-    `turn.completed` events; Codex counts cached input inside `input_tokens`.
+    The answer is the last non-empty `agent_message` item. Lines that are not
+    JSON objects are skipped. A `turn.failed` event is fatal. An `error` event
+    is fatal only if no `turn.completed` follows it, because Codex reports
+    errors it recovers from (such as "Reconnecting...") the same way.
+
+    Tokens come from the `turn.completed` events. Codex counts cached input
+    inside `input_tokens` and reasoning inside `output_tokens`. Any part of
+    `total_tokens` that the input and output counts do not cover is charged as
+    input, as in `parse_agy`.
     """
     text: str | None = None
-    tokens_in = 0
-    tokens_out = 0
+    tokens_in: int | None = 0
+    tokens_out: int | None = 0
     usage_seen = False
+    pending_error: str | None = None
+
+    def reported() -> tuple[int | None, int | None]:
+        return (tokens_in, tokens_out) if usage_seen else (None, None)
+
     for line in raw.splitlines():
         if not line.strip():
             continue
-        event = _obj(_load_json(line, "codex"))
+        try:
+            parsed: JsonValue = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        event = parsed
         kind = event.get("type")
         if kind in ("turn.failed", "error"):
             error = _obj(event.get("error"))
-            message = error.get("message", event.get("message", line))
-            raise ModelUnavailable(f"codex: {message}")
-        if kind == "item.completed":
+            message = str(error.get("message", event.get("message", line)))
+            if kind == "turn.failed":
+                got_in, got_out = reported()
+                raise ModelUnavailable(f"codex: {message}", tokens_in=got_in, tokens_out=got_out)
+            pending_error = message
+        elif kind == "item.completed":
             item = _obj(event.get("item"))
-            if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
-                text = str(item["text"])
-        if kind == "turn.completed":
+            item_text = item.get("text")
+            if item.get("type") == "agent_message" and isinstance(item_text, str) and item_text:
+                text = item_text
+        elif kind == "turn.completed":
+            pending_error = None
             usage = event.get("usage")
             if isinstance(usage, dict):
                 usage_seen = True
-                tokens_in += _int(usage.get("input_tokens"))
-                tokens_out += _int(usage.get("output_tokens")) + _int(
-                    usage.get("reasoning_output_tokens")
+                part_in = _int(usage.get("input_tokens"))
+                part_out = _int(usage.get("output_tokens"))
+                total = _int(usage.get("total_tokens"))
+                if part_in is not None and part_out is not None and total is not None:
+                    part_in += max(0, total - part_in - part_out)
+                tokens_in = None if tokens_in is None or part_in is None else tokens_in + part_in
+                tokens_out = (
+                    None if tokens_out is None or part_out is None else tokens_out + part_out
                 )
+    got_in, got_out = reported()
+    if pending_error is not None:
+        raise ModelUnavailable(f"codex: {pending_error}", tokens_in=got_in, tokens_out=got_out)
     if text is None:
-        raise ModelUnavailable(f"codex: no agent message: {_tail(raw)}")
-    if _limit_message(text):
-        raise ModelUnavailable(f"codex: usage limit: {text}")
-    if not usage_seen:
-        return _reply(text, None, None, model, prompt)
-    return _reply(text, tokens_in, tokens_out, model, prompt)
+        raise ModelUnavailable(
+            f"codex: no agent message: {_tail(raw)}", tokens_in=got_in, tokens_out=got_out
+        )
+    return _reply(text, got_in, got_out, model, prompt)
 
 
 class CodexBackend:
@@ -343,8 +491,11 @@ class CodexBackend:
     def run(
         self, prompt: str, *, cwd: Path, env: Mapping[str, str], timeout_s: float
     ) -> ModelReply:
-        out = run_command(self.argv(), stdin=prompt, cwd=cwd, env=env, timeout_s=timeout_s)
-        return parse_codex(out, model=self.model or "codex-default", prompt=prompt)
+        model = self.model or "codex-default"
+        return _run_and_parse(
+            self.argv(), lambda out: parse_codex(out, model=model, prompt=prompt),
+            stdin=prompt, cwd=cwd, env=env, timeout_s=timeout_s,
+        )
 
 
 # --- Gemini (Antigravity CLI) ---------------------------------------------------------------
@@ -367,7 +518,14 @@ AGY_SETTINGS: dict[str, JsonValue] = {
         ],
     },
 }
-"""Session-only agy settings: every action denied (agy 1.5.16). Never saved to disk."""
+"""Session-only agy settings (agy 1.5.16). Never saved to disk.
+
+They deny file, URL, command, and MCP actions. They do not cover agy's
+built-in `search_web` tool, nor its browser or subagent tools: the probe of
+2026-11-24 found that Gemini still searches the web with these settings. So
+Gemini is "normal runs only" (see `src/minilab/models/isolation.json`;
+follow-up bead minilab-2be43f).
+"""
 
 
 def parse_agy(raw: str, *, model: str, prompt: str = "") -> ModelReply:
@@ -379,18 +537,26 @@ def parse_agy(raw: str, *, model: str, prompt: str = "") -> ModelReply:
     lost if that changes.
     """
     value = _obj(_load_json(raw, "agy"))
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    usage = value.get("usage")
+    if isinstance(usage, dict):
+        tokens_in = _int(usage.get("input_tokens"))
+        tokens_out = _int(usage.get("output_tokens"))
+        total = _int(usage.get("total_tokens"))
+        if tokens_in is not None and tokens_out is not None and total is not None:
+            tokens_in += max(0, total - tokens_in - tokens_out)
     status = value.get("status")
     text = value.get("response")
-    if status != "SUCCESS" or not isinstance(text, str):
-        raise ModelUnavailable(f"agy: status {status}: {value.get('error', _tail(raw))}")
-    if _limit_message(text):
-        raise ModelUnavailable(f"agy: usage limit: {text}")
-    usage = value.get("usage")
-    if not isinstance(usage, dict):
-        return _reply(text, None, None, model, prompt)
-    tokens_in = _int(usage.get("input_tokens"))
-    tokens_out = _int(usage.get("output_tokens"))
-    tokens_in += max(0, _int(usage.get("total_tokens")) - tokens_in - tokens_out)
+    if status != "SUCCESS":
+        raise ModelUnavailable(
+            f"agy: status {status}: {value.get('error', _tail(raw))}",
+            tokens_in=tokens_in, tokens_out=tokens_out,
+        )
+    if not isinstance(text, str) or not text:
+        raise ModelUnavailable(
+            f"agy: no reply text: {_tail(raw)}", tokens_in=tokens_in, tokens_out=tokens_out
+        )
     return _reply(text, tokens_in, tokens_out, model, prompt)
 
 
@@ -416,13 +582,19 @@ class GeminiBackend:
     def run(
         self, prompt: str, *, cwd: Path, env: Mapping[str, str], timeout_s: float
     ) -> ModelReply:
-        if len(prompt.encode()) > MAX_ARG_BYTES:
-            raise ModelUnavailable(
-                f"agy: prompt is {len(prompt.encode())} bytes; the limit for one "
+        """Run agy. A prompt over `MAX_ARG_BYTES` raises `ModelNotStarted`; so does a
+        prompt with a NUL character or one that is not valid text (see `run_command`)."""
+        size = len(prompt.encode("utf-8", errors="replace"))
+        if size > MAX_ARG_BYTES:
+            raise ModelNotStarted(
+                f"agy: prompt is {size} bytes; the limit for one "
                 f"command-line argument is {MAX_ARG_BYTES}"
             )
-        out = run_command(self.argv(prompt), stdin="", cwd=cwd, env=env, timeout_s=timeout_s)
-        return parse_agy(out, model=self.model or "agy-default", prompt=prompt)
+        model = self.model or "agy-default"
+        return _run_and_parse(
+            self.argv(prompt), lambda out: parse_agy(out, model=model, prompt=prompt),
+            stdin="", cwd=cwd, env=env, timeout_s=timeout_s,
+        )
 
 
 # --- Local (ollama) -------------------------------------------------------------------------
@@ -438,26 +610,36 @@ class _OllamaReply(BaseModel):
 
 
 class LocalBackend:
-    """The local weak model through ollama's HTTP API. It has no tools to isolate."""
+    """The local weak model through ollama's HTTP API. It has no tools to isolate.
+
+    The HTTP client does not read proxy settings from the environment
+    (`trust_env=False`). `transport` replaces the network, for tests.
+    """
 
     family = Family.local
 
     def __init__(
-        self, model: str = "qwen3.5:4b", url: str = "http://127.0.0.1:11434"
+        self,
+        model: str = "qwen3.5:4b",
+        url: str = "http://127.0.0.1:11434",
+        *,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.model = model
         self.url = url
+        self.transport = transport
 
     def run(
         self, prompt: str, *, cwd: Path, env: Mapping[str, str], timeout_s: float
     ) -> ModelReply:
         try:
-            response = httpx.post(
-                f"{self.url}/api/generate",
-                json={"model": self.model, "prompt": prompt, "stream": False},
-                timeout=timeout_s,
-            )
-            response.raise_for_status()
+            with httpx.Client(trust_env=False, transport=self.transport) as client:
+                response = client.post(
+                    f"{self.url}/api/generate",
+                    json={"model": self.model, "prompt": prompt, "stream": False},
+                    timeout=timeout_s,
+                )
+                response.raise_for_status()
             reply = _OllamaReply.model_validate_json(response.content)
         except httpx.TimeoutException as exc:
             raise ModelUnavailable(f"ollama: timed out after {timeout_s} s") from exc

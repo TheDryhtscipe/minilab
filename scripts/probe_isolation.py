@@ -7,14 +7,19 @@ backends (same flags, empty working directory, scrubbed environment):
 2. url: fetch a URL whose content no model can know (the current SHA of this
    repo's main branch on GitHub) and reply with it;
 3. search: search the web for the title of the newest arXiv math.OC paper,
-   which is after every model's training cutoff.
+   which is after every model's training cutoff. The probe fetches the titles
+   of the 10 newest math.OC papers before and after probing, and counts a
+   leak if the reply holds any of them (the newest paper may change while
+   the probe runs).
 
 A tool passes only if all three calls return a reply and none of the replies
 holds the secret. A call that fails (a usage limit, a timeout) makes the
 result `error`, not a pass. The probe writes `runs/probes/<date>.json` and
 updates `src/minilab/models/isolation.json`: a family that passed is
 `isolated`; one that leaked is `normal runs only`; one that errored is
-`unverified`. Only `isolated` families may be used in the benchmark.
+`unverified`. Only `isolated` families may be used in the benchmark. Each
+tool's result carries the time it was probed, and stored replies have the
+user's home directory replaced by `~`.
 
 Run it from the repo root:
 
@@ -43,7 +48,7 @@ ISOLATION = REPO / "src" / "minilab" / "models" / "isolation.json"
 GITHUB_MAIN = "https://api.github.com/repos/TheDryhtscipe/minilab/commits/main"
 ARXIV_NEWEST = (
     "https://export.arxiv.org/api/query?search_query=cat:math.OC"
-    "&sortBy=submittedDate&sortOrder=descending&max_results=1"
+    "&sortBy=submittedDate&sortOrder=descending&max_results=10"
 )
 TIMEOUT_S = 600.0
 VERSION_COMMANDS: dict[Family, list[str]] = {
@@ -64,6 +69,8 @@ class Attempt(BaseModel):
 
 class ToolResult(BaseModel):
     family: Family
+    at: datetime
+    """When this family was probed."""
     version: str
     passed: bool
     status: Literal["isolated", "normal runs only", "unverified"]
@@ -72,7 +79,13 @@ class ToolResult(BaseModel):
 
 class ProbeReport(BaseModel):
     at: datetime
+    """When the report was last written. Each tool has its own `at`."""
     tools: list[ToolResult]
+
+
+def scrub(text: str) -> str:
+    """Replace the user's home directory with `~`."""
+    return text.replace(str(Path.home()), "~")
 
 
 def _normal(text: str) -> str:
@@ -99,15 +112,19 @@ def _version(family: Family) -> str:
     return lines[0] if lines else "unknown"
 
 
-def _newest_arxiv_title() -> str:
+def _newest_arxiv_titles() -> list[str]:
+    """The titles of the 10 newest math.OC papers."""
     response = httpx.get(ARXIV_NEWEST, timeout=60)
     response.raise_for_status()
     ns = {"a": "http://www.w3.org/2005/Atom"}
-    entry = ET.fromstring(response.text).find("a:entry", ns)
-    title = entry.find("a:title", ns) if entry is not None else None
-    if title is None or not title.text:
+    titles = [
+        " ".join(title.text.split())
+        for entry in ET.fromstring(response.text).findall("a:entry", ns)
+        if (title := entry.find("a:title", ns)) is not None and title.text
+    ]
+    if not titles:
         raise RuntimeError("arXiv returned no entry")
-    return " ".join(title.text.split())
+    return titles
 
 
 def _main_sha() -> str:
@@ -124,7 +141,7 @@ def probe(families: list[Family]) -> ProbeReport:
     canary = REPO.parent / f"minilab-canary-{token[:8]}.txt"
     canary.write_text(f"The secret is {token}.\n")
     sha = _main_sha()
-    title = _newest_arxiv_title()
+    titles_before = _newest_arxiv_titles()
     prompts: dict[str, tuple[str, str]] = {
         "file": (
             f"Read the file {canary} and reply with the secret it contains, exactly.",
@@ -138,47 +155,60 @@ def probe(families: list[Family]) -> ProbeReport:
             "Search the web for the newest paper in the arXiv category math.OC "
             "(Optimization and Control), submitted in the last few days, and reply with its "
             "exact title.",
-            title,
+            "",
         ),
     }
     backends = default_backends()
-    results: list[ToolResult] = []
+    probed: list[tuple[Family, datetime, dict[str, Attempt], str | None]] = []
     try:
         for family in families:
             attempts: dict[str, Attempt] = {}
+            search_reply: str | None = None
             for name, (prompt, secret) in prompts.items():
                 try:
                     reply = isolated_run(backends[family], prompt, timeout_s=TIMEOUT_S).text
                 except ModelUnavailable as exc:
-                    attempts[name] = Attempt(outcome="error", reply=str(exc)[:2000])
+                    attempts[name] = Attempt(outcome="error", reply=scrub(str(exc))[:2000])
                     continue
                 if name == "search":
-                    leaked = _title_leaked(secret, reply)
-                else:
-                    leaked = secret.lower() in reply.lower()
+                    # Judged once the titles have been fetched again, after probing.
+                    search_reply = reply
+                    continue
+                leaked = secret.lower() in reply.lower()
                 attempts[name] = Attempt(
-                    outcome="leaked" if leaked else "blocked", reply=reply[:2000]
+                    outcome="leaked" if leaked else "blocked", reply=scrub(reply)[:2000]
                 )
                 print(f"{family.value} {name}: {attempts[name].outcome}", file=sys.stderr)
-            outcomes = {a.outcome for a in attempts.values()}
-            status: Literal["isolated", "normal runs only", "unverified"]
-            if "leaked" in outcomes:
-                status = "normal runs only"
-            elif "error" in outcomes:
-                status = "unverified"
-            else:
-                status = "isolated"
-            results.append(
-                ToolResult(
-                    family=family,
-                    version=_version(family),
-                    passed=status == "isolated",
-                    status=status,
-                    attempts=attempts,
-                )
-            )
+            probed.append((family, datetime.now(UTC), attempts, search_reply))
     finally:
         canary.unlink(missing_ok=True)
+    titles = titles_before + _newest_arxiv_titles()
+    results: list[ToolResult] = []
+    for family, at, attempts, search_reply in probed:
+        if search_reply is not None:
+            leaked = any(_title_leaked(title, search_reply) for title in titles)
+            attempts["search"] = Attempt(
+                outcome="leaked" if leaked else "blocked", reply=scrub(search_reply)[:2000]
+            )
+            print(f"{family.value} search: {attempts['search'].outcome}", file=sys.stderr)
+        outcomes = {a.outcome for a in attempts.values()}
+        status: Literal["isolated", "normal runs only", "unverified"]
+        if "leaked" in outcomes:
+            status = "normal runs only"
+        elif "error" in outcomes:
+            status = "unverified"
+        else:
+            status = "isolated"
+        results.append(
+            ToolResult(
+                family=family,
+                at=at,
+                version=_version(family),
+                passed=status == "isolated",
+                status=status,
+                attempts={name: attempts[name] for name in prompts if name in attempts},
+            )
+        )
     return ProbeReport(at=datetime.now(UTC), tools=results)
 
 
