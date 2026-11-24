@@ -4,7 +4,7 @@ title: Minilab build plan
 type: guide
 scope: internal
 created_at: '2026-11-24T01:22:50.443418Z'
-updated_at: '2026-11-24T01:23:07.567110Z'
+updated_at: '2026-11-24T13:43:59.228010Z'
 ---
 
 # Minilab build plan
@@ -31,7 +31,7 @@ updated_at: '2026-11-24T01:23:07.567110Z'
 - Benchmark constants: hidden results first posted on arXiv on or after `2026-07-01`; literature date cap `2026-06-30`; at most 8 domain pairs; memory policy `blind`.
 - Tests never call a live model or a live web API by default. Live checks are marked `@pytest.mark.live` and run only when asked.
 - Commit messages state the change and may name the bead. No AI co-author lines.
-- The repo has no remote yet. The user decides on one; until then, bead close reasons say "no remote".
+- Remote: the public repo `TheDryhtscipe/minilab` on GitHub (use the TheDryhtscipe account). Push before closing a bead. Because the repo is public, nothing from the sealed hidden set (Task 18) may ever be committed.
 
 ## Review focus
 
