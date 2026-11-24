@@ -30,8 +30,20 @@ from pydantic import (
 # Record and run IDs become file and directory names, so they must be plain names.
 # Lower case only, so that IDs that differ only in case cannot meet on a
 # case-insensitive file system.
-SafeId = Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$")]
-_SAFE_ID: TypeAdapter[str] = TypeAdapter(SafeId)
+#
+# A record ID is `<run_id>.<local>`. It names its run, so IDs made by different
+# runs can never be equal, and the store finds a record's file from its ID
+# alone. Run IDs and local names cannot hold the "." separator.
+_NAME = r"[a-z0-9][a-z0-9_-]{0,63}"
+RunId = Annotated[str, StringConstraints(pattern=rf"^{_NAME}$")]
+RecordId = Annotated[str, StringConstraints(pattern=rf"^{_NAME}\.{_NAME}$")]
+_RECORD_ID: TypeAdapter[str] = TypeAdapter(RecordId)
+_RUN_ID: TypeAdapter[str] = TypeAdapter(RunId)
+
+
+def run_of(record_id: str) -> str:
+    """Return the run ID that a record ID names."""
+    return record_id.split(".", 1)[0]
 
 
 class Status(StrEnum):
@@ -119,7 +131,7 @@ class Provenance(_Model):
     family: Family
     model: str
     prompt_hash: str
-    parents: list[SafeId] = Field(default_factory=lambda: [])
+    parents: list[RecordId] = Field(default_factory=lambda: [])
     """IDs of the records this one reformulates or refines."""
 
 
@@ -166,11 +178,12 @@ class Record(_Model):
 
     Records are frozen; the store makes changed copies. A record with no
     instance family (None or blank) is `untestable`: a new record without one
-    gets that status, and any other status is refused.
+    gets that status, and any other status is refused. The ID must name the
+    record's own run: `<run_id>.<local>`.
     """
 
-    id: SafeId
-    run_id: SafeId
+    id: RecordId
+    run_id: RunId
     pair: tuple[str, str]
     mode: Literal["plain", "structured"]
     statement: str
@@ -182,6 +195,14 @@ class Record(_Model):
     status: Status = Field(default=Status.proposed, validate_default=True)
     stages: dict[Stage, StageOutput] = Field(default_factory=lambda: {})
     costs: Costs = Field(default_factory=Costs)
+
+    @field_validator("run_id")
+    @classmethod
+    def _id_names_run(cls, value: str, info: ValidationInfo) -> str:
+        # id validates before run_id, so it is in info.data unless it failed.
+        if "id" in info.data and run_of(info.data["id"]) != value:
+            raise ValueError(f"record ID {info.data['id']} does not name run {value}")
+        return value
 
     @field_validator("instance_family")
     @classmethod
@@ -205,11 +226,18 @@ class Record(_Model):
         return value
 
 
-def _check_id(value: str) -> str:
+def _check_record_id(value: str) -> str:
     try:
-        return _SAFE_ID.validate_python(value)
+        return _RECORD_ID.validate_python(value)
     except ValidationError as exc:
-        raise ValueError(f"not a valid record or run ID: {value!r}") from exc
+        raise ValueError(f"not a valid record ID: {value!r}") from exc
+
+
+def _check_run_id(value: str) -> str:
+    try:
+        return _RUN_ID.validate_python(value)
+    except ValidationError as exc:
+        raise ValueError(f"not a valid run ID: {value!r}") from exc
 
 
 class RecordStore:
@@ -217,10 +245,10 @@ class RecordStore:
 
     Every write goes to a temporary file in the same directory, then replaces
     the target in one rename, so a reader sees either the old file or the new
-    one. `create` refuses an ID already used in any run, so `load` needs only
-    the ID. That check is not atomic across runs: two processes creating the
-    same ID in different runs at the same moment can both succeed, and `load`
-    then raises.
+    one. A record ID names its run, so the ID alone gives the file's path, and
+    two runs cannot make the same ID. `create` adds the file with a hard link,
+    which fails if the file exists, so of two creates with one ID exactly one
+    succeeds.
 
     Writes to one record are not locked against each other: two processes that
     write stages to the same record at once can lose one write. The pipeline
@@ -233,11 +261,13 @@ class RecordStore:
     def _records_dir(self, run_id: str) -> Path:
         return self.root / "runs" / run_id / "records"
 
+    def _path(self, record_id: str) -> Path:
+        record_id = _check_record_id(record_id)
+        return self._records_dir(run_of(record_id)) / f"{record_id}.json"
+
     def _find(self, record_id: str) -> Path | None:
-        matches = sorted((self.root / "runs").glob(f"*/records/{_check_id(record_id)}.json"))
-        if len(matches) > 1:
-            raise RuntimeError(f"record {record_id} exists in more than one run: {matches}")
-        return matches[0] if matches else None
+        path = self._path(record_id)
+        return path if path.is_file() else None
 
     @staticmethod
     def _read(path: Path) -> Record:
@@ -274,20 +304,21 @@ class RecordStore:
             os.close(fd)
 
     def create(self, record: Record) -> None:
-        """Store a new record. Raise `RecordExists` if its ID is taken in any run.
+        """Store a new record. Raise `RecordExists` if its ID is taken.
 
         The record is validated again first, so one built with
         `model_construct` cannot bypass the checks.
         """
         record = Record.model_validate(record.model_dump())
-        if self._find(record.id) is not None:
+        target = self._path(record.id)
+        if target.exists():
             raise RecordExists(record.id)
-        directory = self._records_dir(record.run_id)
+        directory = target.parent
         directory.mkdir(parents=True, exist_ok=True)
         temp = self._write_temp(directory, record)
         try:
             # link() fails if the target exists, so a racing create cannot overwrite.
-            os.link(temp, directory / f"{record.id}.json")
+            os.link(temp, target)
         except FileExistsError as exc:
             raise RecordExists(record.id) from exc
         finally:
@@ -347,7 +378,7 @@ class RecordStore:
         Raise `CorruptRecord` naming every file that fails to parse or sits in
         the wrong place.
         """
-        directory = self._records_dir(_check_id(run_id))
+        directory = self._records_dir(_check_run_id(run_id))
         records: builtins.list[Record] = []
         problems: builtins.list[str] = []
         for path in sorted(directory.glob("*.json")):

@@ -30,15 +30,19 @@ from minilab.records import (
 _NOW = datetime(2026, 11, 24, 12, 0, tzinfo=UTC)
 
 
+R1 = "run-1.r1"
+
+
 def _record(
-    record_id: str = "r1",
+    local: str = "r1",
     *,
     run_id: str = "run-1",
+    record_id: str | None = None,
     instance_family: str | None = "n in 1..4, P a 2x3 stochastic matrix",
     status: Status = Status.proposed,
 ) -> Record:
     return Record(
-        id=record_id,
+        id=f"{run_id}.{local}" if record_id is None else record_id,
         run_id=run_id,
         pair=("information-theory", "optimisation"),
         mode="structured",
@@ -69,7 +73,8 @@ def _output(note: str = "") -> StageOutput:
     )
 
 
-def _record_path(root: Path, run_id: str, record_id: str) -> Path:
+def _record_path(root: Path, record_id: str) -> Path:
+    run_id = record_id.split(".", 1)[0]
     return root / "runs" / run_id / "records" / f"{record_id}.json"
 
 
@@ -77,29 +82,29 @@ def test_round_trip(tmp_path: Path) -> None:
     store = RecordStore(tmp_path)
     record = _record()
     store.create(record)
-    store.write_stage("r1", Stage.generator, _output("generated"))
-    loaded = store.load("r1")
+    store.write_stage(R1, Stage.generator, _output("generated"))
+    loaded = store.load(R1)
     assert loaded == record.model_copy(update={"stages": {Stage.generator: _output("generated")}})
-    assert _record_path(tmp_path, "run-1", "r1").is_file()
+    assert _record_path(tmp_path, R1).is_file()
     # Loading reads the file, not a cache: a fresh store sees the same record.
-    assert RecordStore(tmp_path).load("r1") == loaded
+    assert RecordStore(tmp_path).load(R1) == loaded
 
 
 def test_stage_cannot_overwrite_other_stage(tmp_path: Path) -> None:
     store = RecordStore(tmp_path)
     store.create(_record())
-    store.write_stage("r1", Stage.generator, _output("generated"))
-    path = _record_path(tmp_path, "run-1", "r1")
+    store.write_stage(R1, Stage.generator, _output("generated"))
+    path = _record_path(tmp_path, R1)
     before = Record.model_validate_json(path.read_bytes())
     gen_before = before.stages[Stage.generator].model_dump_json().encode()
 
-    store.write_stage("r1", Stage.falsifier, _output("attacked"))
+    store.write_stage(R1, Stage.falsifier, _output("attacked"))
     after = Record.model_validate_json(path.read_bytes())
     assert after.stages[Stage.generator].model_dump_json().encode() == gen_before
     assert after.stages[Stage.falsifier].notes == "attacked"
 
     with pytest.raises(StageAlreadyWritten):
-        store.write_stage("r1", Stage.generator, _output("again"))
+        store.write_stage(R1, Stage.generator, _output("again"))
     # The refused write left the file as it was.
     assert Record.model_validate_json(path.read_bytes()) == after
 
@@ -118,35 +123,35 @@ def test_status_transitions(tmp_path: Path, final: Status) -> None:
     store.create(_record())
     if final is Status.untestable:
         # A record with an instance family reaches untestable only by a stage verdict.
-        store.write_stage("r1", Stage.encoding, _output(), status=final)
+        store.write_stage(R1, Stage.encoding, _output(), status=final)
     else:
-        store.write_stage("r1", Stage.falsifier, _output(), status=final)
-    path = _record_path(tmp_path, "run-1", "r1")
+        store.write_stage(R1, Stage.falsifier, _output(), status=final)
+    path = _record_path(tmp_path, R1)
     frozen = path.read_bytes()
 
     for other in Status:
         if other is final:
             continue
         with pytest.raises(FinalStatus):
-            store.write_stage("r1", Stage.scorer, _output(), status=other)
+            store.write_stage(R1, Stage.scorer, _output(), status=other)
         assert path.read_bytes() == frozen
 
     # A later stage may still add its output if it leaves the status alone.
-    updated = store.write_stage("r1", Stage.scorer, _output("scored"))
+    updated = store.write_stage(R1, Stage.scorer, _output("scored"))
     assert updated.status is final
-    assert store.write_stage("r1", Stage.queue, _output(), status=final).status is final
+    assert store.write_stage(R1, Stage.queue, _output(), status=final).status is final
 
 
 def test_non_final_status_can_change(tmp_path: Path) -> None:
     store = RecordStore(tmp_path)
     store.create(_record())
-    assert store.write_stage("r1", Stage.encoding, _output(), status=Status.ambiguous).status is (
+    assert store.write_stage(R1, Stage.encoding, _output(), status=Status.ambiguous).status is (
         Status.ambiguous
     )
-    assert store.write_stage("r1", Stage.falsifier, _output(), status=Status.survived).status is (
+    assert store.write_stage(R1, Stage.falsifier, _output(), status=Status.survived).status is (
         Status.survived
     )
-    assert store.write_stage("r1", Stage.literature, _output(), status=Status.known).status is (
+    assert store.write_stage(R1, Stage.literature, _output(), status=Status.known).status is (
         Status.known
     )
 
@@ -156,7 +161,7 @@ def test_untestable_without_instance_family(tmp_path: Path) -> None:
     assert record.status == Status.untestable
     store = RecordStore(tmp_path)
     store.create(record)
-    assert store.load("r1").status == Status.untestable
+    assert store.load(R1).status == Status.untestable
     # A record with no instance family cannot claim any other verdict.
     with pytest.raises(ValidationError):
         _record(instance_family=None, status=Status.survived)
@@ -165,20 +170,57 @@ def test_untestable_without_instance_family(tmp_path: Path) -> None:
 def test_create_refuses_existing_record(tmp_path: Path) -> None:
     store = RecordStore(tmp_path)
     store.create(_record())
-    path = _record_path(tmp_path, "run-1", "r1")
+    path = _record_path(tmp_path, R1)
     original = path.read_bytes()
     with pytest.raises(RecordExists):
         store.create(_record().model_copy(update={"statement": "something else"}))
     assert path.read_bytes() == original
 
 
-def test_create_refuses_id_used_in_another_run(tmp_path: Path) -> None:
+def test_same_local_name_in_two_runs(tmp_path: Path) -> None:
+    # A record ID names its run, so two runs can never make the same ID.
+    store = RecordStore(tmp_path)
+    store.create(_record("r1", run_id="run-1"))
+    store.create(_record("r1", run_id="run-2"))
+    assert store.load("run-1.r1").run_id == "run-1"
+    assert store.load("run-2.r1").run_id == "run-2"
+
+
+@pytest.mark.parametrize(
+    ("record_id", "run_id"),
+    [
+        ("run-2.r1", "run-1"),  # names another run
+        ("run-1", "run-1"),  # no local part
+        ("r1", "run-1"),  # no run part
+        ("run-1.a.b", "run-1"),  # two separators
+        ("run-1.", "run-1"),  # empty local part
+        (".r1", "run-1"),  # empty run part
+        ("run-10.r1", "run-1"),  # run prefix that is not the whole run ID
+    ],
+)
+def test_record_id_must_name_its_run(record_id: str, run_id: str) -> None:
+    with pytest.raises(ValidationError):
+        _record(record_id=record_id, run_id=run_id)
+
+
+def test_run_id_cannot_hold_the_separator() -> None:
+    with pytest.raises(ValidationError):
+        _record(run_id="run.1", record_id="run.1.r1")
+
+
+def test_load_reads_only_the_named_run(tmp_path: Path) -> None:
+    # A stray copy of a record in another run's directory does not change
+    # which file load and write_stage use.
     store = RecordStore(tmp_path)
     store.create(_record())
-    with pytest.raises(RecordExists):
-        store.create(_record(run_id="run-2"))
-    assert not (tmp_path / "runs" / "run-2" / "records" / "r1.json").exists()
-    assert store.load("r1").run_id == "run-1"
+    stray = tmp_path / "runs" / "run-2" / "records" / f"{R1}.json"
+    stray.parent.mkdir(parents=True)
+    shutil.copy(_record_path(tmp_path, R1), stray)
+    assert store.load(R1).run_id == "run-1"
+    store.write_stage(R1, Stage.generator, _output())
+    assert Stage.generator in store.load(R1).stages
+    with pytest.raises(CorruptRecord):
+        store.list("run-2")
 
 
 def test_list_filters_by_run_and_status(tmp_path: Path) -> None:
@@ -187,18 +229,18 @@ def test_list_filters_by_run_and_status(tmp_path: Path) -> None:
     store.create(_record("a"))
     store.create(_record("c", instance_family=None))
     store.create(_record("z", run_id="run-2"))
-    assert [r.id for r in store.list("run-1")] == ["a", "b", "c"]
-    assert [r.id for r in store.list("run-1", Status.untestable)] == ["c"]
-    assert [r.id for r in store.list("run-2")] == ["z"]
+    assert [r.id for r in store.list("run-1")] == ["run-1.a", "run-1.b", "run-1.c"]
+    assert [r.id for r in store.list("run-1", Status.untestable)] == ["run-1.c"]
+    assert [r.id for r in store.list("run-2")] == ["run-2.z"]
     assert store.list("run-3") == []
 
 
 def test_no_temp_files_left_behind(tmp_path: Path) -> None:
     store = RecordStore(tmp_path)
     store.create(_record())
-    store.write_stage("r1", Stage.generator, _output())
+    store.write_stage(R1, Stage.generator, _output())
     records_dir = tmp_path / "runs" / "run-1" / "records"
-    assert sorted(p.name for p in records_dir.iterdir()) == ["r1.json"]
+    assert sorted(p.name for p in records_dir.iterdir()) == ["run-1.r1.json"]
 
 
 @pytest.mark.parametrize("bad", ["", "../x", "a/b", ".hidden", "a\\b", "a b"])
@@ -206,16 +248,24 @@ def test_unsafe_ids_rejected(bad: str) -> None:
     with pytest.raises(ValidationError):
         _record(bad)
     with pytest.raises(ValidationError):
-        _record(run_id=bad)
+        _record(run_id=bad, record_id=f"{bad}.r1")
+
+
+@pytest.mark.parametrize("bad", ["", "../run-1.r1", "run-1/r1", "r1", "run-1.a.b"])
+def test_load_refuses_malformed_ids(tmp_path: Path, bad: str) -> None:
+    store = RecordStore(tmp_path)
+    store.create(_record())
+    with pytest.raises(ValueError):
+        store.load(bad)
 
 
 def test_load_unknown_record_raises(tmp_path: Path) -> None:
     store = RecordStore(tmp_path)
     store.create(_record())
     with pytest.raises(KeyError):
-        store.load("nope")
+        store.load("run-1.nope")
     with pytest.raises(ValueError):
-        store.load("../r1")
+        store.load("../run-1.r1")
 
 
 def test_blank_instance_family_is_untestable() -> None:
@@ -226,25 +276,25 @@ def test_blank_instance_family_is_untestable() -> None:
 def test_stage_bytes_unchanged_in_raw_file(tmp_path: Path) -> None:
     store = RecordStore(tmp_path)
     store.create(_record())
-    store.write_stage("r1", Stage.generator, _output("generated"))
-    path = _record_path(tmp_path, "run-1", "r1")
+    store.write_stage(R1, Stage.generator, _output("generated"))
+    path = _record_path(tmp_path, R1)
     raw_before = json.loads(path.read_bytes())["stages"]["generator"]
-    store.write_stage("r1", Stage.falsifier, _output("attacked"))
-    store.write_stage("r1", Stage.literature, _output("read"))
+    store.write_stage(R1, Stage.falsifier, _output("attacked"))
+    store.write_stage(R1, Stage.literature, _output("read"))
     assert json.loads(path.read_bytes())["stages"]["generator"] == raw_before
 
 
 def test_misplaced_file_is_refused_not_redirected(tmp_path: Path) -> None:
     store = RecordStore(tmp_path)
     store.create(_record("a"))
-    a_path = _record_path(tmp_path, "run-1", "a")
-    x_path = _record_path(tmp_path, "run-1", "x")
+    a_path = _record_path(tmp_path, "run-1.a")
+    x_path = _record_path(tmp_path, "run-1.x")
     shutil.copy(a_path, x_path)
     a_bytes = a_path.read_bytes()
     with pytest.raises(CorruptRecord):
-        store.load("x")
+        store.load("run-1.x")
     with pytest.raises(CorruptRecord):
-        store.write_stage("x", Stage.generator, _output())
+        store.write_stage("run-1.x", Stage.generator, _output())
     assert a_path.read_bytes() == a_bytes
 
 
@@ -286,10 +336,10 @@ def test_non_finite_floats_refused(value: float) -> None:
 def test_status_given_as_string(tmp_path: Path) -> None:
     store = RecordStore(tmp_path)
     store.create(_record())
-    store.write_stage("r1", Stage.falsifier, _output(), status=Status("killed"))
+    store.write_stage(R1, Stage.falsifier, _output(), status=Status("killed"))
     as_text: str = "killed"
     record = store.write_stage(
-        "r1",
+        R1,
         Stage.scorer,
         _output(),
         status=as_text,  # pyright: ignore[reportArgumentType]
@@ -305,12 +355,12 @@ def test_verdict_stages_refused_after_final_status(tmp_path: Path, stage: Stage)
     store = RecordStore(tmp_path)
     store.create(_record())
     first = Stage.encoding if stage is not Stage.encoding else Stage.falsifier
-    store.write_stage("r1", first, _output(), status=Status.killed)
-    path = _record_path(tmp_path, "run-1", "r1")
+    store.write_stage(R1, first, _output(), status=Status.killed)
+    path = _record_path(tmp_path, R1)
     frozen = path.read_bytes()
     if stage is not first:
         with pytest.raises(FinalStatus):
-            store.write_stage("r1", stage, _output("proved"))
+            store.write_stage(R1, stage, _output("proved"))
         assert path.read_bytes() == frozen
 
 
@@ -325,10 +375,12 @@ def test_failed_link_leaves_no_temp_file(tmp_path: Path, monkeypatch: pytest.Mon
     with pytest.raises(RecordExists):
         store.create(_record("b"))
     records_dir = tmp_path / "runs" / "run-1" / "records"
-    assert sorted(p.name for p in records_dir.iterdir()) == ["a.json"]
+    assert sorted(p.name for p in records_dir.iterdir()) == ["run-1.a.json"]
 
 
 @pytest.mark.parametrize("bad", ["R1", "Run-1"])
 def test_upper_case_ids_rejected(bad: str) -> None:
     with pytest.raises(ValidationError):
         _record(bad)
+    with pytest.raises(ValidationError):
+        _record(run_id=bad, record_id=f"{bad}.r1")
