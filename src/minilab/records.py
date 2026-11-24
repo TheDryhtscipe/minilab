@@ -226,14 +226,16 @@ class Record(_Model):
         return value
 
 
-def _check_record_id(value: str) -> str:
+def check_record_id(value: str) -> str:
+    """Return `value` if it is a valid record ID; raise `ValueError` if not."""
     try:
         return _RECORD_ID.validate_python(value)
     except ValidationError as exc:
         raise ValueError(f"not a valid record ID: {value!r}") from exc
 
 
-def _check_run_id(value: str) -> str:
+def check_run_id(value: str) -> str:
+    """Return `value` if it is a valid run ID; raise `ValueError` if not."""
     try:
         return _RUN_ID.validate_python(value)
     except ValidationError as exc:
@@ -262,7 +264,7 @@ class RecordStore:
         return self.root / "runs" / run_id / "records"
 
     def _path(self, record_id: str) -> Path:
-        record_id = _check_record_id(record_id)
+        record_id = check_record_id(record_id)
         return self._records_dir(run_of(record_id)) / f"{record_id}.json"
 
     def _find(self, record_id: str) -> Path | None:
@@ -378,7 +380,7 @@ class RecordStore:
         Raise `CorruptRecord` naming every file that fails to parse or sits in
         the wrong place.
         """
-        directory = self._records_dir(_check_run_id(run_id))
+        directory = self._records_dir(check_run_id(run_id))
         records: builtins.list[Record] = []
         problems: builtins.list[str] = []
         for path in sorted(directory.glob("*.json")):
