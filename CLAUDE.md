@@ -5,7 +5,7 @@ Minilab is a filter-first search loop for cross-domain ML mathematics. Read the 
 ## Global constraints
 
 - Repo: `/home/thedryhtscipe/dev/sci/minilab`. Beads prefix `minilab`. Lane: focused.
-- No `Any` types. `uv run pyright` in strict mode must pass on `src/` and `tests/`.
+- No `Any` types. `uv run ruff check` bans importing `typing.Any`, and `uv run pyright` in strict mode must pass on `src/` and `tests/`.
 - Never write markdown files except README.md, AGENTS.md, and CLAUDE.md. Documentation goes in DOCA.
 - Never read or change `~/dev/sci/experiments/crossconj`. Pilot files in `~/dev/sci/experiments/crossconj-ml` are read only.
 - Run every model call isolated: an empty temporary working directory, no file tools, no web tools, and no MCP. For `claude -p`: no `--bare`, `--tools ""`, `--setting-sources ""`, `--strict-mcp-config`, `--no-session-persistence`, and `ANTHROPIC_*` stripped from the environment (MuninnDB `common` memory `01M3WPMQETWRFJQPDGFY0ZVBJG`).

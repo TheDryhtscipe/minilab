@@ -8,7 +8,7 @@ _TESTS_DIR = Path(__file__).parent
 
 
 def _has_test_modules() -> bool:
-    return any(_TESTS_DIR.rglob("test_*.py"))
+    return any(_TESTS_DIR.rglob("test_*.py")) or any(_TESTS_DIR.rglob("*_test.py"))
 
 
 @pytest.hookimpl(trylast=True)
