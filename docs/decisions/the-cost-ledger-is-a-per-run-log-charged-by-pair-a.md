@@ -4,7 +4,7 @@ title: The cost ledger is a per-run log charged by pair and stage
 type: decision
 scope: internal
 created_at: '2026-11-24T16:53:02.062400Z'
-updated_at: '2026-11-24T16:53:02.062400Z'
+updated_at: '2026-11-24T17:45:33.943959Z'
 ---
 
 # The cost ledger is a per-run log charged by pair and stage
@@ -32,13 +32,14 @@ Records are frozen, and the record store only appends stage output. Writing cost
 
 ## Options considered
 
-1. **One append-only log per run (chosen).** Appends are single writes to a file opened for appending, so several processes can charge at once. There is one source of truth. A reader of one record file does not see its costs there.
+1. **One append-only log per run (chosen).** Each append is one write under a lock on the file, so several processes can charge at once. There is one source of truth. A reader of one record file does not see its costs there.
 2. **The log plus a copy in each record.** A record file would hold its own costs. Every charge would rewrite the record, and the copy could drift from the log.
 
 ## Consequences
 
 - The model adapter (Task 4) passes the pair and the stage to `charge`. It can charge a call before it knows the record.
-- `pair_spend` only reads. A caller that checks the budget and then makes a call must stop other processes charging the same pair in between, or the pair can overrun its budget.
+- `pair_spend` only reads. A caller checks the budget, makes the call, and charges it inside one `with ledger.pair_lock(pair):` block. The lock is an exclusive `flock` for each pair, so no other process charges the pair in between. It holds only on one machine. `charge` does not take the lock, so nothing stops a caller that skips it. Taking a pair's lock while you hold it blocks forever.
+- Each append takes an exclusive `flock` on the ledger file, and each read takes a shared one. No reader or appender sees another process's half-written line.
 - A ledger line that does not parse, names another run's record, or was cut short by a crash makes every read fail with `CorruptLedger`. Appends after a cut-short line are refused. Nothing is skipped, because a skipped line would hide spend.
 - One charge may log at most 10^12 tokens and 10^7 seconds. One review may log at most 10^5 minutes.
 - The cost report's machine hours are the summed call durations. Calls that ran in parallel each count in full.
