@@ -12,14 +12,17 @@ is still charged to its pair, so the per-pair budget covers every call. A
 ledger opens only for a run with a manifest, and refuses a pair or a family
 that the manifest does not list.
 
-`pair_spend` only reads. A caller that checks the budget and then makes a call
-must not let another process charge the same pair in between, or the pair can
-overrun its budget.
+`pair_spend` only reads. A caller that checks the budget, makes a call, and
+charges it does all three inside `Ledger.pair_lock`, so that no other process
+charges the same pair in between and pushes it over its budget.
 """
 
 import builtins
+import fcntl
 import os
 from collections import defaultdict
+from collections.abc import Generator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Annotated, Literal
 
@@ -113,9 +116,10 @@ _ENTRY: TypeAdapter[Charge | Review] = TypeAdapter(Entry)
 class Ledger:
     """One run's costs, kept in `runs/<run_id>/ledger.jsonl` under the store's root.
 
-    Each entry is appended with a single write to a file opened for appending,
-    so processes on one local file system can log to the same ledger at once.
-    Reads parse the whole file. A line that does not parse, names a record of
+    Each entry is appended with a single write under an exclusive `flock` on
+    the ledger file, and reads take a shared `flock`, so processes on one local
+    file system can log to and read the same ledger at once without seeing a
+    half-written line. Reads parse the whole file. A line that does not parse, names a record of
     another run, or is cut short by a crash raises `CorruptLedger` naming the
     line; nothing is skipped, because a skipped line would hide spend. An
     append after a cut-short line is refused too, so that a new entry is never
@@ -144,6 +148,7 @@ class Ledger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
         try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
             size = os.fstat(fd).st_size
             if size and os.pread(fd, 1, size - 1) != b"\n":
                 raise CorruptLedger(f"{self.path}: the last line is incomplete; refused to append")
@@ -216,9 +221,15 @@ class Ledger:
     def entries(self) -> builtins.list[Charge | Review]:
         """Return every entry in the order it was logged."""
         try:
-            data = self.path.read_bytes()
+            fd = os.open(self.path, os.O_RDONLY)
         except FileNotFoundError:
             return []
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            with os.fdopen(os.dup(fd), "rb") as handle:
+                data = handle.read()
+        finally:
+            os.close(fd)
         if data and not data.endswith(b"\n"):
             count = data.count(b"\n") + 1
             raise CorruptLedger(f"{self.path}: line {count} is incomplete")
@@ -234,6 +245,32 @@ class Ledger:
                 )
             entries.append(entry)
         return entries
+
+    @contextmanager
+    def pair_lock(self, pair: Pair) -> Generator[None]:
+        """Hold the pair's lock, so no other process using it can charge the pair.
+
+        Check the budget, make the model call, and charge it inside one
+        `with ledger.pair_lock(pair):` block; then no two processes can both
+        pass the check before either charges. The lock is an exclusive
+        `flock` on `runs/<run_id>/locks/<pair>.lock`, so it holds across
+        processes on one machine. It does not nest: taking a pair's lock again
+        while holding it blocks forever. `charge` does not take the lock, and
+        a caller that skips it is not stopped.
+
+        Raise `ValueError` for a pair the manifest does not list.
+        """
+        pair = canonical_pair(pair)
+        if pair not in self.manifest.pairs:
+            raise ValueError(f"pair {pair} is not in run {self.run_id}'s manifest")
+        path = self.path.parent / "locks" / f"{pair[0]}+{pair[1]}.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
 
     def charges(self) -> builtins.list[Charge]:
         return [entry for entry in self.entries() if isinstance(entry, Charge)]

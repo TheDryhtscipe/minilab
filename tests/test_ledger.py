@@ -1,8 +1,13 @@
 """Tests for the run manifest and the cost ledger (build plan Task 3)."""
 
 import math
+import multiprocessing
+import os
 import shutil
+import time
 from datetime import UTC, date, datetime
+from multiprocessing.queues import Queue
+from multiprocessing.synchronize import Event
 from pathlib import Path
 from typing import cast
 
@@ -533,3 +538,157 @@ def test_load_manifest_refuses_a_manifest_of_another_run(tmp_path: Path) -> None
     shutil.copy(source, target)
     with pytest.raises(ValueError, match="run-2"):
         load_manifest(tmp_path, RUN)
+
+
+# --- Several processes at once, and writes cut short ------------------------------------
+
+_FORK = multiprocessing.get_context("fork")
+_STEP = 10
+_BUDGET = 50
+
+
+def _spend_up_to_budget(root: str, start: Event) -> None:
+    """Charge `_STEP` tokens to PAIR while the pair's spend stays within `_BUDGET`."""
+    start.wait()
+    ledger = Ledger(RecordStore(Path(root)), RUN)
+    while True:
+        with ledger.pair_lock(PAIR):
+            if ledger.pair_spend(PAIR) + _STEP > _BUDGET:
+                return
+            time.sleep(0.01)  # the model call
+            _charge(ledger, record_id=None, tokens_in=_STEP)
+
+
+def test_pair_lock_keeps_processes_within_the_budget(store: RecordStore) -> None:
+    _ledger(store)
+    start = _FORK.Event()
+    workers = [
+        _FORK.Process(target=_spend_up_to_budget, args=(str(store.root), start))
+        for _ in range(6)
+    ]
+    for worker in workers:
+        worker.start()
+    start.set()
+    for worker in workers:
+        worker.join(timeout=60)
+        assert worker.exitcode == 0
+    assert Ledger(store, RUN).pair_spend(PAIR) == _BUDGET
+
+
+def test_pair_lock_refuses_a_pair_outside_the_manifest(store: RecordStore) -> None:
+    ledger = _ledger(store)
+    with pytest.raises(ValueError, match="manifest"):
+        with ledger.pair_lock(("kernels", "optimisation")):
+            pass
+
+
+def _charge_many(root: str, start: Event, family: Family) -> None:
+    start.wait()
+    ledger = Ledger(RecordStore(Path(root)), RUN)
+    for _ in range(50):
+        _charge(ledger, record_id=None, family=family, tokens_in=1)
+
+
+def _read_until_done(root: str, start: Event, done: Event) -> None:
+    start.wait()
+    ledger = Ledger(RecordStore(Path(root)), RUN)
+    while not done.is_set():
+        ledger.pair_spend(PAIR)
+
+
+def test_concurrent_charges_and_reads_never_see_a_broken_line(store: RecordStore) -> None:
+    _ledger(store)
+    start = _FORK.Event()
+    done = _FORK.Event()
+    families = list(Family)
+    writers = [
+        _FORK.Process(
+            target=_charge_many, args=(str(store.root), start, families[n % len(families)])
+        )
+        for n in range(8)
+    ]
+    readers = [
+        _FORK.Process(target=_read_until_done, args=(str(store.root), start, done))
+        for _ in range(2)
+    ]
+    for worker in writers + readers:
+        worker.start()
+    start.set()
+    for worker in writers:
+        worker.join(timeout=60)
+    done.set()
+    for worker in readers:
+        worker.join(timeout=60)
+    assert [worker.exitcode for worker in writers + readers] == [0] * 10
+    ledger = Ledger(store, RUN)
+    assert len(ledger.charges()) == 400
+    assert ledger.pair_spend(PAIR) == 400
+
+
+def _save_one(root: str, start: Event, budget: int, results: "Queue[int]") -> None:
+    start.wait()
+    try:
+        save_manifest(Path(root), _manifest(budget_tokens_per_pair=budget))
+    except ManifestExists:
+        return
+    results.put(budget)
+
+
+def test_concurrent_manifest_saves_have_one_winner(tmp_path: Path) -> None:
+    for trial in range(5):
+        root = tmp_path / str(trial)
+        start = _FORK.Event()
+        results: Queue[int] = _FORK.Queue()
+        workers = [
+            _FORK.Process(target=_save_one, args=(str(root), start, budget, results))
+            for budget in range(1, 9)
+        ]
+        for worker in workers:
+            worker.start()
+        start.set()
+        for worker in workers:
+            worker.join(timeout=60)
+            assert worker.exitcode == 0
+        winners: list[int] = []
+        while not results.empty():
+            winners.append(results.get())
+        assert len(winners) == 1
+        assert load_manifest(root, RUN).budget_tokens_per_pair == winners[0]
+
+
+def test_manifest_write_cut_short_leaves_no_trace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(fd: int) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "fsync", fail)
+    with pytest.raises(OSError, match="disk full"):
+        save_manifest(tmp_path, _manifest())
+    monkeypatch.undo()
+    assert sorted((tmp_path / "runs" / RUN).iterdir()) == []
+    save_manifest(tmp_path, _manifest())
+    assert load_manifest(tmp_path, RUN) == _manifest()
+
+
+def test_temp_file_left_by_a_crash_does_not_block_the_manifest(tmp_path: Path) -> None:
+    run_dir = tmp_path / "runs" / RUN
+    run_dir.mkdir(parents=True)
+    (run_dir / ".manifest.abc.tmp").write_bytes(b'{"run_id": "run-1", "mo')
+    with pytest.raises(FileNotFoundError):
+        load_manifest(tmp_path, RUN)
+    save_manifest(tmp_path, _manifest())
+    assert load_manifest(tmp_path, RUN) == _manifest()
+
+
+def test_ledger_write_cut_short_is_refused_not_joined(store: RecordStore, tmp_path: Path) -> None:
+    store.create(_record("a"))
+    ledger = _ledger(store)
+    _charge(ledger, record_id="run-1.a", tokens_in=1)
+    path = tmp_path / "runs" / RUN / "ledger.jsonl"
+    whole = path.read_bytes()
+    path.write_bytes(whole + whole[: len(whole) // 2])
+    with pytest.raises(CorruptLedger, match="line 2 is incomplete"):
+        ledger.entries()
+    with pytest.raises(CorruptLedger, match="incomplete"):
+        _charge(ledger, record_id="run-1.a", tokens_in=1)
