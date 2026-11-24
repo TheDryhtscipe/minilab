@@ -250,6 +250,7 @@ def call(
     started is charged and raised again. No record is written.
     """
     family = Family(family)
+    role = Role(role)
     if family is Family.gemini and role is not Role.generate:
         raise RoleNotAllowed(f"gemini generates only; refused role {role.value}")
     pair = canonical_pair(pair)
