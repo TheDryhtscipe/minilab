@@ -50,6 +50,7 @@ def check_interval_margin(enc: Encoding, cert: IntervalCertificate, point: Insta
         )
     return MarginCheck(
         result=CheckResult(accepted=True, reason=f"margin enclosure {ball} < 0"),
+        lower=_to_mpf(ball.lower()),
         upper=_to_mpf(ball.upper()),
     )
 

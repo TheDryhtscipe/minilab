@@ -16,8 +16,8 @@ MIN_DUALITY_DIGITS = 30
 GAP_SHARE = 1000
 
 # An upper bound must lie below -scale * 10^-(digits - NOISE_DIGITS), where
-# scale is the size of the bounds. Above that it cannot be told apart from a
-# zero margin that rounding made negative.
+# scale is the size of the bounds. Above that, rounding at the last step could
+# have made a zero margin negative.
 NOISE_DIGITS = 10
 
 
@@ -40,10 +40,15 @@ class DualityCertificate(BaseModel):
 def check_duality_margin(enc: Encoding, cert: DualityCertificate, point: Instance) -> MarginCheck:
     """Recompute both bounds and check them against the claim.
 
-    Requires: the recomputed bounds match the claimed ones; both lie below zero
-    by more than rounding at the certificate's precision could explain; the
-    claimed violation lies between them; and the gap between them is smaller
-    than 1/1000 of the violation.
+    Requires: the recomputed bounds match the claimed ones; both lie below
+    -scale * 10^-(digits - 10), where scale is the size of the bounds; the
+    claimed violation lies between them, so it is negative too; and the gap
+    between them is smaller than 1/1000 of the violation.
+
+    The bounds are mpf values, not enclosures. The floor catches a zero margin
+    that rounding at the final step makes negative. It cannot catch rounding
+    in large intermediate terms; the repeat check in `check` is a heuristic
+    against that, not a proof.
     """
     if not isinstance(enc, DualBounds):
         return MarginCheck.failed(
@@ -91,8 +96,6 @@ def check_duality_margin(enc: Encoding, cert: DualityCertificate, point: Instanc
                 f"distinguishable from zero at {cert.digits} digits"
             )
         )
-    if violation >= 0:
-        return MarginCheck.failed(reject(f"the claimed violation {cert.violation} is not negative"))
     if not low - tol <= violation <= high + tol:
         return MarginCheck.failed(
             reject(
@@ -114,5 +117,6 @@ def check_duality_margin(enc: Encoding, cert: DualityCertificate, point: Instanc
             reason=f"margin in [{mpmath.nstr(low, 15)}, {mpmath.nstr(high, 15)}], "
             f"gap {mpmath.nstr(gap, 3)}",
         ),
+        lower=low,
         upper=high,
     )

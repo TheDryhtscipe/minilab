@@ -39,7 +39,9 @@ def check_exact_margin(enc: Encoding, cert: ExactCertificate, point: Instance) -
         )
     if margin >= 0:
         return MarginCheck.failed(reject(f"the exact margin {margin} is not negative"))
+    value = mpmath.mpf(margin.numerator) / margin.denominator
     return MarginCheck(
         result=CheckResult(accepted=True, reason=f"exact margin {margin} < 0"),
-        upper=mpmath.mpf(margin.numerator) / margin.denominator,
+        lower=value,
+        upper=value,
     )

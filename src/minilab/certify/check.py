@@ -9,13 +9,18 @@ hold (build plan doc-5wh, Task 6):
    and dual bounds whose gap is below 1/1000 of the violation;
 3. 1 and 2 hold again at twice the precision, or at 100 digits or more if the
    margin is within 1e-6 of zero or the encoding flags the point as
-   near-degenerate; and the upper bounds on the margin from the two checks
-   agree to within 1/1000. The repeat catches cancellation, which can make a
-   positive margin read as negative well away from zero.
+   near-degenerate; and the two checks agree on the margin.
+
+For interval and exact certificates the sign is rigorous, if the encoding's
+ball or exact margin is honest. Duality bounds are mpf values, so the repeat is
+a heuristic: it catches cancellation that changes the result between the two
+precisions, not cancellation in terms larger than both.
 
 The checker never trusts a number in the certificate: it recomputes everything
-through the encoding, in a fresh call, so no solver state is carried over (the
-cold-start rule). Models never write this code.
+through the encoding. It calls the encoding object it is given for both runs,
+so state that object keeps (a cache, a solver's warm start) carries from the
+first run to the repeat. It rejects a certificate if an encoding call changes
+the working precision. Models never write this code.
 
 The encoding's capabilities (`margin_ball`, `primal_dual`) are written by a
 model, so one encoding's say-so is not enough for a kill: `check_kill` accepts
@@ -24,6 +29,7 @@ only when both independent encodings of the conjecture accept the certificate.
 
 from typing import Annotated, cast
 
+import flint
 import mpmath
 from pydantic import Field, TypeAdapter
 
@@ -47,8 +53,8 @@ NEAR_ZERO = 1e-6
 # The precision of the repeat check near zero or near degeneracy, at the least.
 RECHECK_DIGITS = 100
 
-# The upper bounds from the first and the repeat check must agree to within
-# this share of the larger.
+# Outside interval certificates, the upper bounds from the first and the
+# repeat check must agree to within this share of the larger.
 AGREEMENT_SHARE = 1000
 
 
@@ -82,11 +88,24 @@ def _check_at(
     """
     point = cert.point.at_precision(digits)
     with working_digits(digits):
+        expected = (mpmath.mp.prec, flint.ctx.prec)
+
+        def moved(step: str) -> MarginCheck | None:
+            # An encoding that sets its own precision would make the repeat
+            # check run at the same precision as the first.
+            if (mpmath.mp.prec, flint.ctx.prec) == expected:
+                return None
+            return MarginCheck.failed(
+                reject(f"the encoding changed the working precision in {step}")
+            )
+
         try:
             # Encoding code is untrusted: check the shape of what it returns.
             holds = cast(object, enc.assumptions(point))
+            if bad := moved("the assumptions"):
+                return bad, False
             if not isinstance(holds, list) or not all(
-                isinstance(h, bool) for h in cast(list[object], holds)
+                type(h) is bool for h in cast(list[object], holds)
             ):
                 return MarginCheck.failed(
                     reject("the assumption predicates did not give booleans")
@@ -96,14 +115,25 @@ def _check_at(
                 return MarginCheck.failed(
                     reject(f"the point fails assumption(s) {failed} at {digits} digits")
                 ), False
-            if enc.in_domain(point) is not True:
+            inside = cast(object, enc.in_domain(point))
+            if bad := moved("the domain predicate"):
+                return bad, False
+            if type(inside) is not bool:
+                return MarginCheck.failed(
+                    reject(f"the domain predicate did not give a bool: {type(inside).__name__}")
+                ), False
+            if not inside:
                 return MarginCheck.failed(
                     reject(f"the point is outside the domain at {digits} digits")
                 ), False
             margin = _check_margin(enc, cert, point)
+            if bad := moved("the margin"):
+                return bad, False
             if not margin.result.accepted:
                 return margin, False
             flag = cast(object, enc.near_degenerate(point))
+            if bad := moved("the near-degeneracy flag"):
+                return bad, False
             if type(flag) is not bool:
                 return MarginCheck.failed(
                     reject(f"the near-degeneracy flag is not a bool: {type(flag).__name__}")
@@ -130,8 +160,9 @@ def check_certificate(enc: Encoding, cert: Certificate) -> CheckResult:
 def _check_certificate(enc: Encoding, cert: Certificate) -> CheckResult:
     digits = _digits(cert)
     first, degenerate = _check_at(enc, cert, digits)
-    if not first.result.accepted or first.upper is None:
+    if not first.result.accepted:
         return first.result
+    assert first.upper is not None
     near_zero = abs(first.upper) < NEAR_ZERO
     recheck_digits = 2 * digits
     why = "repeated"
@@ -139,21 +170,40 @@ def _check_certificate(enc: Encoding, cert: Certificate) -> CheckResult:
         recheck_digits = max(RECHECK_DIGITS, recheck_digits)
         why = "near zero, so repeated" if near_zero else "near-degenerate, so repeated"
     second, _ = _check_at(enc, cert, recheck_digits)
-    if not second.result.accepted or second.upper is None:
+    if not second.result.accepted:
         return reject(
             f"{why} at {recheck_digits} digits; the repeat check failed: {second.result.reason}"
         )
-    with mpmath.mp.workdps(recheck_digits):
-        diff = abs(first.upper - second.upper)
-        allowed = max(abs(first.upper), abs(second.upper)) / AGREEMENT_SHARE
-        if diff > allowed:
-            return reject(
-                f"the upper bounds at {digits} and {recheck_digits} digits do not agree: "
-                f"{mpmath.nstr(first.upper, 15)} and {mpmath.nstr(second.upper, 15)}"
-            )
+    if not _agree(cert, first, second, recheck_digits):
+        return reject(
+            f"the margin bounds at {digits} and {recheck_digits} digits do not agree: "
+            f"{_bounds(first)} and {_bounds(second)}"
+        )
     return accept(
         f"{first.result.reason}; {why} at {recheck_digits} digits: {second.result.reason}"
     )
+
+
+def _bounds(check: MarginCheck) -> str:
+    if check.lower is None or check.upper is None:
+        return "none"
+    return f"[{mpmath.nstr(check.lower, 15)}, {mpmath.nstr(check.upper, 15)}]"
+
+
+def _agree(cert: Certificate, first: MarginCheck, second: MarginCheck, digits: int) -> bool:
+    """Say whether the first check and the repeat agree on the margin.
+
+    Two balls agree if they overlap: an honest ball may narrow as the precision
+    grows. Other bounds agree if the upper bounds are within 1/1000 of each
+    other.
+    """
+    assert first.lower is not None and first.upper is not None
+    assert second.lower is not None and second.upper is not None
+    if isinstance(cert, IntervalCertificate):
+        return first.lower <= second.upper and second.lower <= first.upper
+    with mpmath.mp.workdps(digits):
+        diff = abs(first.upper - second.upper)
+        return diff <= max(abs(first.upper), abs(second.upper)) / AGREEMENT_SHARE
 
 
 def check_kill(first: Encoding, second: Encoding, cert: Certificate) -> CheckResult:

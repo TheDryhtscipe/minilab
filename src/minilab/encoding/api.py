@@ -35,11 +35,20 @@ Value = Fraction | str | list[str]
 # check runs at up to twice this.
 MAX_DIGITS = 5_000
 
-# Limits on a value written as text, so that reading it cannot hang: Fraction
-# expands "1e-99999999" into a hundred-million-digit integer.
-MAX_TEXT = 20_000
+# Limits on a value written as text, so that reading it is quick and exact:
+# Fraction expands "1e-99999999" into a hundred-million-digit integer, and
+# Python refuses to read an integer string of more than 4300 digits.
+MAX_TEXT = 4_000
 MAX_EXPONENT = 10_000
-_EXPONENT = re.compile(r"[eE]([+-]?[0-9_]+)$")
+
+# A value written as text is an ASCII decimal ("-1.5e3", underscores allowed
+# between digits) or a fraction of two ASCII integers ("3/4"). Python's own
+# readers also take other Unicode digits, hexadecimal, "inf", and "nan".
+_DECIMAL = re.compile(
+    r"[+-]?(?=[0-9]|\.[0-9])[0-9_]*(?:\.[0-9_]*)?(?:[eE](?P<exp>[+-]?[0-9][0-9_]*))?",
+    re.ASCII,
+)
+_RATIO = re.compile(r"[+-]?[0-9][0-9_]*\s*/\s*[0-9][0-9_]*", re.ASCII)
 
 
 class Instance(BaseModel):
@@ -74,20 +83,25 @@ def to_fraction(value: Fraction | str) -> Fraction:
     """Read a value as an exact rational. Raise ValueError if it is not one."""
     if isinstance(value, Fraction):
         return value
-    text = _checked_text(value)
-    if text.lower() in {"nan", "inf", "+inf", "-inf", "infinity", "+infinity", "-infinity"}:
-        raise ValueError(f"not a finite rational: {value!r}")
-    return Fraction(text)
+    return Fraction(_checked_text(value))
 
 
 def _checked_text(value: str) -> str:
-    """Strip `value`. Raise ValueError if it is too long or its exponent too large."""
+    """Strip `value` and check it is a decimal or a ratio within the limits.
+
+    Raise ValueError if it is not.
+    """
     text = value.strip()
     if len(text) > MAX_TEXT:
         raise ValueError(f"a value of {len(text)} characters is too long")
-    found = _EXPONENT.search(text)
-    if found and abs(int(found.group(1))) > MAX_EXPONENT:
-        raise ValueError(f"the exponent of {text!r} is beyond {MAX_EXPONENT}")
+    if _RATIO.fullmatch(text):
+        return text
+    found = _DECIMAL.fullmatch(text)
+    if not found:
+        raise ValueError(f"not an ASCII decimal or a ratio of integers: {text[:50]!r}")
+    exponent = found.group("exp")
+    if exponent is not None and abs(int(exponent)) > MAX_EXPONENT:
+        raise ValueError(f"the exponent of {text[:50]!r} is beyond {MAX_EXPONENT}")
     return text
 
 

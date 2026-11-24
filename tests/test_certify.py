@@ -7,7 +7,9 @@ not pass the suite: the acceptance tests cover the other side.
 """
 
 import random
-from collections.abc import Callable
+import signal
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from fractions import Fraction
 from pathlib import Path
 from typing import cast
@@ -31,7 +33,7 @@ from minilab.certify import (
     check_kill,
 )
 from minilab.certify.result import working_digits
-from minilab.encoding.api import Instance, to_fraction
+from minilab.encoding.api import MAX_TEXT, Instance, to_fraction, to_mpf
 
 PILOT = Path(__file__).parent / "fixtures" / "pilot"
 
@@ -410,6 +412,22 @@ def test_exact_certificate_needs_a_rational_point() -> None:
     assert "needs a rational point" in result.reason
 
 
+@contextmanager
+def deadline(seconds: int) -> Generator[None]:
+    """Fail, rather than hang, if the block runs longer than `seconds`."""
+
+    def expire(signum: int, frame: object) -> None:
+        raise TimeoutError(f"took longer than {seconds} s")
+
+    previous = signal.signal(signal.SIGALRM, expire)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 def test_huge_precision_and_exponents_refused() -> None:
     with pytest.raises(ValidationError):
         Instance(values={}, precision_digits=10**8)
@@ -417,9 +435,38 @@ def test_huge_precision_and_exponents_refused() -> None:
         IntervalCertificate(point=POINT, digits=10**8, enclosure=("-1", "-1"))
     with pytest.raises(ValidationError):
         DualityCertificate(point=POINT, primal="-1", dual="-1", digits=10**8, violation="-1")
-    with pytest.raises(ValueError, match="exponent"):
-        to_fraction("1e-99999999")
-    assert not Instance(values={"x": "1e-99999999"}, precision_digits=30).is_rational()
+    with deadline(5):
+        with pytest.raises(ValueError, match="exponent"):
+            to_fraction("1e-99999999")
+        assert not Instance(values={"x": "1e-99999999"}, precision_digits=30).is_rational()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "-1e" + "\u0669" * 8,  # Arabic-Indic digits: Fraction reads 10^99999999
+        "\uff11\uff12",  # fullwidth 12
+        "0x10",
+        "inf",
+        "-Infinity",
+        "nan",
+        "1e5" + " " * 3 + "1",
+    ],
+)
+def test_values_must_be_ascii_decimals(text: str) -> None:
+    with deadline(5):
+        with pytest.raises(ValueError):
+            to_fraction(text)
+        with pytest.raises(ValueError):
+            to_mpf(text)
+
+
+def test_long_values_refused() -> None:
+    with pytest.raises(ValueError, match="too long"):
+        to_fraction("-0." + "1" * (MAX_TEXT + 1))
+    # Every value within the cap reads exactly: Python refuses to convert an
+    # integer string of more than 4300 digits.
+    assert to_fraction("-0." + "1" * (MAX_TEXT - 3)) < 0
     # Pydantic refuses an exponent in a Fraction field.
     with pytest.raises(ValidationError):
         CERTIFICATE.validate_json(
@@ -473,3 +520,75 @@ def test_kill_refuses_one_encoding_twice() -> None:
     result = check_kill(enc, enc, load("s1_side_counterexample"))
     assert not result.accepted
     assert "same encoding" in result.reason
+
+
+def test_encoding_must_not_change_the_precision() -> None:
+    # An encoding that pins its own precision would make both runs the same.
+    def cancel() -> tuple[mpmath.mpf, mpmath.mpf]:
+        big = mpmath.mpf(10) ** 40
+        m = (big + 1) - big - mpmath.mpf("0.5")
+        return m, m
+
+    class Pinned(DualToy):
+        def primal_dual(self, x: Instance) -> tuple[mpmath.mpf, mpmath.mpf]:
+            mpmath.mp.dps = 30
+            return self.bounds()
+
+    result = check_certificate(Pinned(cancel), dual_cert("-0.5", "-0.5", "-0.5"))
+    assert not result.accepted
+    assert "changed the working precision" in result.reason
+
+    class PinnedBall(BallToy):
+        def margin_ball(self, x: Instance) -> flint.arb:
+            flint.ctx.dps = 16
+            return self.ball()
+
+    result = check_certificate(PinnedBall(lambda: flint.arb(-1)), ball_cert("-1", "-1"))
+    assert not result.accepted
+    assert "changed the working precision" in result.reason
+
+
+def test_honest_ball_that_narrows_is_accepted() -> None:
+    # A ball that tightens at higher precision is consistent: both contain the margin.
+    def narrowing() -> flint.arb:
+        rad = "0.4999" if mpmath.mp.dps <= 16 else "1e-10"
+        return flint.arb("-0.5", rad)
+
+    result = check_certificate(BallToy(narrowing), ball_cert("-0.5", "-0.5"))
+    assert result.accepted, result.reason
+
+
+def test_ball_margin_must_be_an_arb() -> None:
+    enc = BallToy(lambda: cast(flint.arb, mpmath.mpf(-1)))
+    result = check_certificate(enc, ball_cert("-1", "-1"))
+    assert not result.accepted
+    assert "not an arb" in result.reason
+
+
+def test_empty_enclosure_rejected() -> None:
+    result = check_certificate(BallToy(lambda: flint.arb(-1)), ball_cert("-1", "-2"))
+    assert not result.accepted
+    assert "enclosure is empty" in result.reason
+
+
+class FloatExact(Toy):
+    def exact_margin(self, x: Instance) -> Fraction:
+        return cast(Fraction, -0.5)
+
+
+def test_exact_margin_must_be_a_fraction() -> None:
+    cert = ExactCertificate(point=POINT, margin=Fraction(-1, 2))
+    result = check_certificate(FloatExact(), cert)
+    assert not result.accepted
+    assert "not a Fraction" in result.reason
+
+
+class NumpyDomain(BallToy):
+    def in_domain(self, x: Instance) -> bool:
+        return cast(bool, np.True_)
+
+
+def test_domain_predicate_must_give_a_bool() -> None:
+    result = check_certificate(NumpyDomain(lambda: flint.arb(-1)), ball_cert("-1", "-1"))
+    assert not result.accepted
+    assert "domain predicate did not give a bool" in result.reason

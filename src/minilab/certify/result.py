@@ -30,18 +30,20 @@ def reject(reason: str) -> CheckResult:
 class MarginCheck:
     """The margin part of a check, with an upper bound on the margin.
 
-    `upper` decides whether the margin is close enough to zero that the repeat
-    check needs at least 100 digits, and whether the two checks agree. It is
-    None when the check failed. An mpf keeps the full range of an exact or
-    ball margin, which a float would overflow.
+    `lower` and `upper` bound the margin. They decide whether the margin is
+    close enough to zero that the repeat check needs at least 100 digits, and
+    whether the two checks agree. Both are None when the check failed. An mpf
+    keeps the full range of an exact or ball margin, which a float would
+    overflow.
     """
 
     result: CheckResult
+    lower: mpmath.mpf | None
     upper: mpmath.mpf | None
 
     @classmethod
     def failed(cls, result: CheckResult) -> "MarginCheck":
-        return cls(result=result, upper=None)
+        return cls(result=result, lower=None, upper=None)
 
 
 @contextmanager
@@ -49,7 +51,8 @@ def working_digits(digits: int) -> Generator[None]:
     """Run mpmath and python-flint at `digits` decimal digits, then restore both.
 
     Both libraries keep their precision in global state, so checks must not run
-    in parallel threads of one process.
+    in parallel threads of one process. Encoding code can change it too; the
+    checker rejects a certificate if an encoding call leaves it changed.
     """
     saved_flint = flint.ctx.prec
     try:
