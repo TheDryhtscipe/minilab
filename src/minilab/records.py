@@ -7,12 +7,13 @@ status.
 """
 
 import builtins
+import math
 import os
 import tempfile
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal
 
 from pydantic import (
     BaseModel,
@@ -22,12 +23,14 @@ from pydantic import (
     StringConstraints,
     TypeAdapter,
     ValidationError,
+    ValidationInfo,
     field_validator,
-    model_validator,
 )
 
 # Record and run IDs become file and directory names, so they must be plain names.
-SafeId = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")]
+# Lower case only, so that IDs that differ only in case cannot meet on a
+# case-insensitive file system.
+SafeId = Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$")]
 _SAFE_ID: TypeAdapter[str] = TypeAdapter(SafeId)
 
 
@@ -68,6 +71,10 @@ class Stage(StrEnum):
     queue = "queue"
 
 
+POST_VERDICT_STAGES: frozenset[Stage] = frozenset({Stage.scorer, Stage.queue})
+"""The only stages that may add output once a record has a final status."""
+
+
 class Family(StrEnum):
     claude = "claude"
     codex = "codex"
@@ -80,7 +87,11 @@ class StageAlreadyWritten(Exception):
 
 
 class FinalStatus(Exception):
-    """A write tried to change a final status."""
+    """A write tried to change a final status, or a verdict stage wrote after one."""
+
+
+class CorruptRecord(Exception):
+    """A record file does not parse, or its contents do not match its location."""
 
 
 class RecordExists(Exception):
@@ -88,7 +99,18 @@ class RecordExists(Exception):
 
 
 class _Model(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+def _check_finite(value: JsonValue, where: str) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{where}: {value} is not finite; store it as a string")
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _check_finite(item, f"{where}[{index}]")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _check_finite(item, f"{where}.{key}")
 
 
 class Provenance(_Model):
@@ -104,15 +126,22 @@ class Provenance(_Model):
 class StageOutput(_Model):
     """One stage's output on a record.
 
-    `data` holds the stage's own fields. `evidence` holds paths, relative to the
-    run directory, to files that back a verdict: a certificate, a coverage
-    report, literature notes, or a Lean file.
+    `data` holds the stage's own fields. JSON cannot hold NaN or infinity, so
+    non-finite floats are refused; store such values as strings. `evidence`
+    holds paths, relative to the run directory, to files that back a verdict:
+    a certificate, a coverage report, literature notes, or a Lean file.
     """
 
     written_at: datetime
     data: dict[str, JsonValue] = Field(default_factory=lambda: {})
     evidence: list[str] = Field(default_factory=lambda: [])
     notes: str = ""
+
+    @field_validator("data")
+    @classmethod
+    def _finite(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
+        _check_finite(value, "data")
+        return value
 
 
 class TokenCount(_Model):
@@ -126,15 +155,18 @@ class Costs(_Model):
     """Tokens by model family, wall-clock seconds by stage, and review minutes."""
 
     tokens: dict[Family, TokenCount] = Field(default_factory=lambda: {})
-    seconds: dict[Stage, Annotated[float, Field(ge=0)]] = Field(default_factory=lambda: {})
-    review_minutes: float = Field(default=0.0, ge=0)
+    seconds: dict[Stage, Annotated[float, Field(ge=0, allow_inf_nan=False)]] = Field(
+        default_factory=lambda: {}
+    )
+    review_minutes: float = Field(default=0.0, ge=0, allow_inf_nan=False)
 
 
 class Record(_Model):
     """One conjecture and everything the stages have found about it.
 
-    A record with no instance family (None or blank) is `untestable`: a new
-    record without one gets that status, and any other status is refused.
+    Records are frozen; the store makes changed copies. A record with no
+    instance family (None or blank) is `untestable`: a new record without one
+    gets that status, and any other status is refused.
     """
 
     id: SafeId
@@ -147,7 +179,7 @@ class Record(_Model):
     domain_of_validity: str
     instance_family: str | None
     provenance: Provenance
-    status: Status = Status.proposed
+    status: Status = Field(default=Status.proposed, validate_default=True)
     stages: dict[Stage, StageOutput] = Field(default_factory=lambda: {})
     costs: Costs = Field(default_factory=Costs)
 
@@ -158,16 +190,19 @@ class Record(_Model):
             return None
         return value
 
-    @model_validator(mode="after")
-    def _untestable_without_instance_family(self) -> Self:
-        if self.instance_family is None:
-            if self.status is Status.proposed:
-                self.status = Status.untestable
-            elif self.status is not Status.untestable:
+    @field_validator("status")
+    @classmethod
+    def _untestable_without_instance_family(cls, value: Status, info: ValidationInfo) -> Status:
+        # Fields validate in order, so instance_family is already in info.data
+        # (absent only if it failed its own validation).
+        if "instance_family" in info.data and info.data["instance_family"] is None:
+            if value is Status.proposed:
+                return Status.untestable
+            if value is not Status.untestable:
                 raise ValueError(
-                    f"a record with no instance family must be untestable, not {self.status}"
+                    f"a record with no instance family must be untestable, not {value}"
                 )
-        return self
+        return value
 
 
 def _check_id(value: str) -> str:
@@ -182,7 +217,10 @@ class RecordStore:
 
     Every write goes to a temporary file in the same directory, then replaces
     the target in one rename, so a reader sees either the old file or the new
-    one. Record IDs are unique across runs, so `load` needs only the ID.
+    one. `create` refuses an ID already used in any run, so `load` needs only
+    the ID. That check is not atomic across runs: two processes creating the
+    same ID in different runs at the same moment can both succeed, and `load`
+    then raises.
 
     Writes to one record are not locked against each other: two processes that
     write stages to the same record at once can lose one write. The pipeline
@@ -195,14 +233,24 @@ class RecordStore:
     def _records_dir(self, run_id: str) -> Path:
         return self.root / "runs" / run_id / "records"
 
-    def _path(self, run_id: str, record_id: str) -> Path:
-        return self._records_dir(run_id) / f"{record_id}.json"
-
     def _find(self, record_id: str) -> Path | None:
         matches = sorted((self.root / "runs").glob(f"*/records/{_check_id(record_id)}.json"))
         if len(matches) > 1:
             raise RuntimeError(f"record {record_id} exists in more than one run: {matches}")
         return matches[0] if matches else None
+
+    @staticmethod
+    def _read(path: Path) -> Record:
+        """Parse a record file and check that it sits where its contents say."""
+        try:
+            record = Record.model_validate_json(path.read_bytes())
+        except ValidationError as exc:
+            raise CorruptRecord(f"{path}: {exc}") from exc
+        if record.id != path.stem or record.run_id != path.parent.parent.name:
+            raise CorruptRecord(
+                f"{path}: holds record {record.id} of run {record.run_id}, which belongs elsewhere"
+            )
+        return record
 
     @staticmethod
     def _write_temp(directory: Path, record: Record) -> Path:
@@ -226,7 +274,12 @@ class RecordStore:
             os.close(fd)
 
     def create(self, record: Record) -> None:
-        """Store a new record. Raise `RecordExists` if its ID is taken in any run."""
+        """Store a new record. Raise `RecordExists` if its ID is taken in any run.
+
+        The record is validated again first, so one built with
+        `model_construct` cannot bypass the checks.
+        """
+        record = Record.model_validate(record.model_dump())
         if self._find(record.id) is not None:
             raise RecordExists(record.id)
         directory = self._records_dir(record.run_id)
@@ -234,7 +287,7 @@ class RecordStore:
         temp = self._write_temp(directory, record)
         try:
             # link() fails if the target exists, so a racing create cannot overwrite.
-            os.link(temp, self._path(record.run_id, record.id))
+            os.link(temp, directory / f"{record.id}.json")
         except FileExistsError as exc:
             raise RecordExists(record.id) from exc
         finally:
@@ -246,7 +299,7 @@ class RecordStore:
         path = self._find(record_id)
         if path is None:
             raise KeyError(record_id)
-        return Record.model_validate_json(path.read_bytes())
+        return self._read(path)
 
     def write_stage(
         self, record_id: str, stage: Stage, output: StageOutput, status: Status | None = None
@@ -254,15 +307,24 @@ class RecordStore:
         """Add one stage's output, and optionally set the status.
 
         Raise `StageAlreadyWritten` if the record already holds output for
-        `stage`, and `FinalStatus` if `status` would change a final status. On
-        either error the file is left unchanged. Return the updated record.
+        `stage`. Raise `FinalStatus` if the record's status is final and either
+        `status` would change it or `stage` is not a post-verdict stage (scorer
+        or queue). On any error the file is left unchanged. Return the updated
+        record.
         """
-        record = self.load(record_id)
+        path = self._find(record_id)
+        if path is None:
+            raise KeyError(record_id)
+        record = self._read(path)
+        stage = Stage(stage)
         if stage in record.stages:
             raise StageAlreadyWritten(f"{record_id}: {stage}")
-        new_status = record.status if status is None else status
-        if record.status in FINAL_STATUSES and new_status is not record.status:
-            raise FinalStatus(f"{record_id}: {record.status} is final, refused {new_status}")
+        new_status = record.status if status is None else Status(status)
+        if record.status in FINAL_STATUSES:
+            if new_status is not record.status:
+                raise FinalStatus(f"{record_id}: {record.status} is final, refused {new_status}")
+            if stage not in POST_VERDICT_STAGES:
+                raise FinalStatus(f"{record_id}: {record.status} is final, refused {stage} output")
         updated = Record.model_validate(
             {
                 **record.model_dump(),
@@ -270,22 +332,31 @@ class RecordStore:
                 "status": new_status,
             }
         )
-        directory = self._records_dir(record.run_id)
-        temp = self._write_temp(directory, updated)
+        temp = self._write_temp(path.parent, updated)
         try:
-            os.replace(temp, self._path(record.run_id, record.id))
+            os.replace(temp, path)
         except BaseException:
             temp.unlink(missing_ok=True)
             raise
-        self._sync_dir(directory)
+        self._sync_dir(path.parent)
         return updated
 
     def list(self, run_id: str, status: Status | None = None) -> builtins.list[Record]:
-        """Return a run's records sorted by ID, optionally only those with `status`."""
+        """Return a run's records sorted by ID, optionally only those with `status`.
+
+        Raise `CorruptRecord` naming every file that fails to parse or sits in
+        the wrong place.
+        """
         directory = self._records_dir(_check_id(run_id))
-        records = [
-            Record.model_validate_json(path.read_bytes())
-            for path in sorted(directory.glob("*.json"))
-            if not path.name.startswith(".")
-        ]
+        records: builtins.list[Record] = []
+        problems: builtins.list[str] = []
+        for path in sorted(directory.glob("*.json")):
+            if path.name.startswith("."):
+                continue
+            try:
+                records.append(self._read(path))
+            except CorruptRecord as exc:
+                problems.append(str(exc))
+        if problems:
+            raise CorruptRecord("; ".join(problems))
         return [r for r in records if status is None or r.status is status]

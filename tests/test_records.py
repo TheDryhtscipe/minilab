@@ -1,5 +1,9 @@
 """Tests for records and the record store (build plan Task 2)."""
 
+import json
+import math
+import os
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -8,6 +12,7 @@ from pydantic import ValidationError
 
 from minilab.records import (
     FINAL_STATUSES,
+    CorruptRecord,
     Costs,
     Family,
     FinalStatus,
@@ -211,3 +216,119 @@ def test_load_unknown_record_raises(tmp_path: Path) -> None:
         store.load("nope")
     with pytest.raises(ValueError):
         store.load("../r1")
+
+
+def test_blank_instance_family_is_untestable() -> None:
+    assert _record(instance_family="   ").status is Status.untestable
+    assert _record(instance_family="   ").instance_family is None
+
+
+def test_stage_bytes_unchanged_in_raw_file(tmp_path: Path) -> None:
+    store = RecordStore(tmp_path)
+    store.create(_record())
+    store.write_stage("r1", Stage.generator, _output("generated"))
+    path = _record_path(tmp_path, "run-1", "r1")
+    raw_before = json.loads(path.read_bytes())["stages"]["generator"]
+    store.write_stage("r1", Stage.falsifier, _output("attacked"))
+    store.write_stage("r1", Stage.literature, _output("read"))
+    assert json.loads(path.read_bytes())["stages"]["generator"] == raw_before
+
+
+def test_misplaced_file_is_refused_not_redirected(tmp_path: Path) -> None:
+    store = RecordStore(tmp_path)
+    store.create(_record("a"))
+    a_path = _record_path(tmp_path, "run-1", "a")
+    x_path = _record_path(tmp_path, "run-1", "x")
+    shutil.copy(a_path, x_path)
+    a_bytes = a_path.read_bytes()
+    with pytest.raises(CorruptRecord):
+        store.load("x")
+    with pytest.raises(CorruptRecord):
+        store.write_stage("x", Stage.generator, _output())
+    assert a_path.read_bytes() == a_bytes
+
+
+def test_create_revalidates_record(tmp_path: Path) -> None:
+    store = RecordStore(tmp_path)
+    with pytest.raises(ValidationError):
+        _record().run_id = "../../escaped"  # records are frozen
+    # Get past the frozen check the way a careless caller could.
+    bad_run = _record()
+    object.__setattr__(bad_run, "run_id", "../../escaped")
+    with pytest.raises(ValidationError):
+        store.create(bad_run)
+    bad_status = _record(instance_family=None)
+    object.__setattr__(bad_status, "status", Status.survived)
+    with pytest.raises(ValidationError):
+        store.create(bad_status)
+    assert not (tmp_path.parent / "escaped").exists()
+    assert not (tmp_path / "runs").exists() or store.list("run-1") == []
+
+
+def test_corrupt_file_named_in_list_error(tmp_path: Path) -> None:
+    store = RecordStore(tmp_path)
+    store.create(_record())
+    (tmp_path / "runs" / "run-1" / "records" / "partial.json").write_text('{"id": "par')
+    with pytest.raises(CorruptRecord, match="partial.json"):
+        store.list("run-1")
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_non_finite_floats_refused(value: float) -> None:
+    with pytest.raises(ValidationError):
+        StageOutput(written_at=_NOW, data={"margin": value})
+    with pytest.raises(ValidationError):
+        StageOutput(written_at=_NOW, data={"deep": {"xs": [1.0, value]}})
+    with pytest.raises(ValidationError):
+        Costs(seconds={Stage.generator: value})
+
+
+def test_status_given_as_string(tmp_path: Path) -> None:
+    store = RecordStore(tmp_path)
+    store.create(_record())
+    store.write_stage("r1", Stage.falsifier, _output(), status=Status("killed"))
+    as_text: str = "killed"
+    record = store.write_stage(
+        "r1",
+        Stage.scorer,
+        _output(),
+        status=as_text,  # pyright: ignore[reportArgumentType]
+    )
+    assert record.status is Status.killed
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [s for s in Stage if s not in (Stage.scorer, Stage.queue)],
+)
+def test_verdict_stages_refused_after_final_status(tmp_path: Path, stage: Stage) -> None:
+    store = RecordStore(tmp_path)
+    store.create(_record())
+    first = Stage.encoding if stage is not Stage.encoding else Stage.falsifier
+    store.write_stage("r1", first, _output(), status=Status.killed)
+    path = _record_path(tmp_path, "run-1", "r1")
+    frozen = path.read_bytes()
+    if stage is not first:
+        with pytest.raises(FinalStatus):
+            store.write_stage("r1", stage, _output("proved"))
+        assert path.read_bytes() == frozen
+
+
+def test_failed_link_leaves_no_temp_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = RecordStore(tmp_path)
+    store.create(_record("a"))
+
+    def refuse(src: str | Path, dst: str | Path) -> None:
+        raise FileExistsError(dst)
+
+    monkeypatch.setattr(os, "link", refuse)
+    with pytest.raises(RecordExists):
+        store.create(_record("b"))
+    records_dir = tmp_path / "runs" / "run-1" / "records"
+    assert sorted(p.name for p in records_dir.iterdir()) == ["a.json"]
+
+
+@pytest.mark.parametrize("bad", ["R1", "Run-1"])
+def test_upper_case_ids_rejected(bad: str) -> None:
+    with pytest.raises(ValidationError):
+        _record(bad)
