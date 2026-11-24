@@ -3,9 +3,10 @@
 S7 (pilot run, 23 November 2026): for any finite source p and any distortion
 d: X x Y -> [0, 1], R(D) - 2 D^2 is convex on [D_min, D_max].
 
-Equivalently, every second divided difference of R at three distortions
-D1 < D2 < D3 in [D_min, D_max] is at least 4. The margin is that divided
-difference minus 4. R is defined by an optimisation, so the encoding gives a
+Equivalently, at any three distortions D1 < D2 < D3 in [D_min, D_max] the
+second divided difference R[D1, D2, D3] is at least 2, the divided difference
+of 2 D^2. The weights below carry a factor of 2, so the margin is
+2 R[D1, D2, D3] - 4. R is defined by an optimisation, so the encoding gives a
 primal and a dual bound on the margin from witnesses carried in the instance:
 
 - for each of the three points, a slope s >= 0 and an output law q > 0. They
@@ -19,8 +20,9 @@ The pilot's own certificate for S7' (s7_counter3.py) uses the same bounds.
 
 Instance values: `p` (n_x decimals), `d` (n_x * n_y decimals, row by row),
 `s` (3 decimals), `q` (3 * n_y decimals, one law after another; each is
-normalised before use). All are exact decimals, so the point does not move when
-the precision changes.
+normalised before use). All are exact decimals. The assumptions read them
+exactly; the bounds and the domain check read them with to_mpf, rounded to the
+working precision, so the point they evaluate moves by that rounding.
 """
 
 import random

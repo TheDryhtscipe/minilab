@@ -3,10 +3,11 @@
 from typing import Literal
 
 import flint
+import mpmath
 from pydantic import BaseModel, ConfigDict, Field
 
 from minilab.certify.result import CheckResult, MarginCheck, reject
-from minilab.encoding.api import BallMargin, Encoding, Instance, to_arb, to_fraction
+from minilab.encoding.api import MAX_DIGITS, BallMargin, Encoding, Instance, to_arb, to_fraction
 
 
 class IntervalCertificate(BaseModel):
@@ -16,7 +17,7 @@ class IntervalCertificate(BaseModel):
 
     kind: Literal["interval"] = "interval"
     point: Instance
-    digits: int = Field(ge=1)
+    digits: int = Field(ge=1, le=MAX_DIGITS)
     enclosure: tuple[str, str]
 
 
@@ -49,5 +50,11 @@ def check_interval_margin(enc: Encoding, cert: IntervalCertificate, point: Insta
         )
     return MarginCheck(
         result=CheckResult(accepted=True, reason=f"margin enclosure {ball} < 0"),
-        upper=float(ball.upper().mid()),
+        upper=_to_mpf(ball.upper()),
     )
+
+
+def _to_mpf(exact: flint.arb) -> mpmath.mpf:
+    """Read an exact arb (radius 0) as an mpf at the working precision."""
+    man, exp = exact.man_exp()
+    return mpmath.ldexp(mpmath.mpf(int(man)), int(exp))

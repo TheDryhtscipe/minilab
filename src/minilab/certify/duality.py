@@ -6,7 +6,7 @@ import mpmath
 from pydantic import BaseModel, ConfigDict, Field
 
 from minilab.certify.result import CheckResult, MarginCheck, reject
-from minilab.encoding.api import DualBounds, Encoding, Instance, to_mpf
+from minilab.encoding.api import MAX_DIGITS, DualBounds, Encoding, Instance, to_mpf
 
 # A duality certificate must be computed at high precision (design doc-gmj,
 # "Falsifier"). Float precision gave the pilot its spurious ratios.
@@ -14,6 +14,11 @@ MIN_DUALITY_DIGITS = 30
 
 # The gap between the bounds must be smaller than this share of the violation.
 GAP_SHARE = 1000
+
+# An upper bound must lie below -scale * 10^-(digits - NOISE_DIGITS), where
+# scale is the size of the bounds. Above that it cannot be told apart from a
+# zero margin that rounding made negative.
+NOISE_DIGITS = 10
 
 
 class DualityCertificate(BaseModel):
@@ -28,15 +33,16 @@ class DualityCertificate(BaseModel):
     point: Instance
     primal: str
     dual: str
-    digits: int = Field(ge=1)
+    digits: int = Field(ge=1, le=MAX_DIGITS)
     violation: str
 
 
 def check_duality_margin(enc: Encoding, cert: DualityCertificate, point: Instance) -> MarginCheck:
     """Recompute both bounds and check them against the claim.
 
-    Requires: the recomputed bounds match the claimed ones; both lie below zero;
-    the claimed violation lies between them; and the gap between them is smaller
+    Requires: the recomputed bounds match the claimed ones; both lie below zero
+    by more than rounding at the certificate's precision could explain; the
+    claimed violation lies between them; and the gap between them is smaller
     than 1/1000 of the violation.
     """
     if not isinstance(enc, DualBounds):
@@ -77,6 +83,14 @@ def check_duality_margin(enc: Encoding, cert: DualityCertificate, point: Instanc
         return MarginCheck.failed(
             reject(f"the upper bound on the margin, {mpmath.nstr(high, 15)}, is not negative")
         )
+    floor = -scale * mpmath.mpf(10) ** -(cert.digits - NOISE_DIGITS)
+    if high >= floor:
+        return MarginCheck.failed(
+            reject(
+                f"the upper bound on the margin, {mpmath.nstr(high, 15)}, is not "
+                f"distinguishable from zero at {cert.digits} digits"
+            )
+        )
     if violation >= 0:
         return MarginCheck.failed(reject(f"the claimed violation {cert.violation} is not negative"))
     if not low - tol <= violation <= high + tol:
@@ -100,5 +114,5 @@ def check_duality_margin(enc: Encoding, cert: DualityCertificate, point: Instanc
             reason=f"margin in [{mpmath.nstr(low, 15)}, {mpmath.nstr(high, 15)}], "
             f"gap {mpmath.nstr(gap, 3)}",
         ),
-        upper=float(high),
+        upper=high,
     )

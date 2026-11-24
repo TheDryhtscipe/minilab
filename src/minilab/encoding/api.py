@@ -17,6 +17,7 @@ the checker recomputes the margin itself and never trusts a number it is given:
 """
 
 import random
+import re
 from fractions import Fraction
 from typing import Protocol, runtime_checkable
 
@@ -30,6 +31,16 @@ from pydantic import BaseModel, ConfigDict, Field
 # JSON.
 Value = Fraction | str | list[str]
 
+# The most decimal digits a point or a certificate may ask for. The repeat
+# check runs at up to twice this.
+MAX_DIGITS = 5_000
+
+# Limits on a value written as text, so that reading it cannot hang: Fraction
+# expands "1e-99999999" into a hundred-million-digit integer.
+MAX_TEXT = 20_000
+MAX_EXPONENT = 10_000
+_EXPONENT = re.compile(r"[eE]([+-]?[0-9_]+)$")
+
 
 class Instance(BaseModel):
     """One point of a conjecture's finite family of test instances."""
@@ -37,10 +48,14 @@ class Instance(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     values: dict[str, Value]
-    precision_digits: int = Field(ge=1)
+    precision_digits: int = Field(ge=1, le=MAX_DIGITS)
 
     def at_precision(self, digits: int) -> "Instance":
-        """Return the same point, to be evaluated at `digits` decimal digits."""
+        """Return the same point, to be evaluated at `digits` decimal digits.
+
+        The values do not change, but a decimal read with `to_mpf` is rounded
+        to the working precision, so the point evaluated moves by that rounding.
+        """
         return self.model_copy(update={"precision_digits": digits})
 
     def is_rational(self) -> bool:
@@ -59,10 +74,21 @@ def to_fraction(value: Fraction | str) -> Fraction:
     """Read a value as an exact rational. Raise ValueError if it is not one."""
     if isinstance(value, Fraction):
         return value
-    text = value.strip()
+    text = _checked_text(value)
     if text.lower() in {"nan", "inf", "+inf", "-inf", "infinity", "+infinity", "-infinity"}:
         raise ValueError(f"not a finite rational: {value!r}")
     return Fraction(text)
+
+
+def _checked_text(value: str) -> str:
+    """Strip `value`. Raise ValueError if it is too long or its exponent too large."""
+    text = value.strip()
+    if len(text) > MAX_TEXT:
+        raise ValueError(f"a value of {len(text)} characters is too long")
+    found = _EXPONENT.search(text)
+    if found and abs(int(found.group(1))) > MAX_EXPONENT:
+        raise ValueError(f"the exponent of {text!r} is beyond {MAX_EXPONENT}")
+    return text
 
 
 def to_mpf(value: Fraction | str) -> mpmath.mpf:
@@ -70,7 +96,7 @@ def to_mpf(value: Fraction | str) -> mpmath.mpf:
     if isinstance(value, Fraction) or "/" in value:
         exact = to_fraction(value)
         return mpmath.mpf(exact.numerator) / exact.denominator
-    return mpmath.mpf(value.strip())
+    return mpmath.mpf(_checked_text(value))
 
 
 def to_arb(value: Fraction | str) -> flint.arb:

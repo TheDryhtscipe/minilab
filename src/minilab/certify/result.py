@@ -2,6 +2,7 @@
 
 from collections.abc import Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 import flint
 import mpmath
@@ -25,21 +26,22 @@ def reject(reason: str) -> CheckResult:
     return CheckResult(accepted=False, reason=reason)
 
 
-class MarginCheck(BaseModel):
-    """The margin part of a check, with a certified upper bound on the margin.
+@dataclass(frozen=True)
+class MarginCheck:
+    """The margin part of a check, with an upper bound on the margin.
 
-    `upper` is used only to decide whether the margin is close enough to zero
-    that the check must be repeated at higher precision.
+    `upper` decides whether the margin is close enough to zero that the repeat
+    check needs at least 100 digits, and whether the two checks agree. It is
+    None when the check failed. An mpf keeps the full range of an exact or
+    ball margin, which a float would overflow.
     """
 
-    model_config = ConfigDict(frozen=True)
-
     result: CheckResult
-    upper: float
+    upper: mpmath.mpf | None
 
     @classmethod
     def failed(cls, result: CheckResult) -> "MarginCheck":
-        return cls(result=result, upper=float("nan"))
+        return cls(result=result, upper=None)
 
 
 @contextmanager

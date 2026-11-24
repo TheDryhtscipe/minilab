@@ -7,15 +7,19 @@ not pass the suite: the acceptance tests cover the other side.
 """
 
 import random
+from collections.abc import Callable
 from fractions import Fraction
 from pathlib import Path
+from typing import cast
 
 import flint
 import mpmath
+import numpy as np
 import pytest
 from fixtures.pilot.s1_side import TsallisPinskerSide
 from fixtures.pilot.s7 import S7Encoding
 from fixtures.pilot.s7_y2 import Y2Encoding, rho_float
+from pydantic import ValidationError
 
 from minilab.certify import (
     CERTIFICATE,
@@ -24,7 +28,9 @@ from minilab.certify import (
     ExactCertificate,
     IntervalCertificate,
     check_certificate,
+    check_kill,
 )
+from minilab.certify.result import working_digits
 from minilab.encoding.api import Instance, to_fraction
 
 PILOT = Path(__file__).parent / "fixtures" / "pilot"
@@ -89,67 +95,8 @@ def test_accepts_s7prime_counterexample() -> None:
     assert isinstance(cert, DualityCertificate) and cert.digits == 60
     result = check_certificate(S7Encoding(), cert)
     assert result.accepted, result.reason
-    # The pilot's certified bound on the divided difference was 0.18565 < 4.
+    # The pilot's certified bound on 2 R[D1, D2, D3] was 0.18565 < 4.
     assert abs(to_fraction(cert.violation) + 4 - Fraction("0.18565335128737")) < Fraction(1, 10**12)
-
-
-class Cancelling:
-    """A margin of 10^-40 - offset that float-like precision gets wrong.
-
-    At 30 digits, 1 + 10^-40 rounds to 1, so the margin reads as -offset.
-    Records every precision it ran at.
-    """
-
-    def __init__(self, offset: str) -> None:
-        self.offset = offset
-        self.seen: list[int] = []
-
-    def margin(self, x: Instance) -> mpmath.mpf:
-        self.seen.append(mpmath.mp.dps)
-        tiny = mpmath.mpf(10) ** -40
-        return (1 + tiny) - 1 - mpmath.mpf(self.offset)
-
-    def primal_dual(self, x: Instance) -> tuple[mpmath.mpf, mpmath.mpf]:
-        m = self.margin(x)
-        return m, m
-
-    def assumptions(self, x: Instance) -> list[bool]:
-        return [True]
-
-    def in_domain(self, x: Instance) -> bool:
-        return True
-
-    def near_degenerate(self, x: Instance) -> bool:
-        return False
-
-    def sample(self, rng: random.Random) -> Instance:
-        return Instance(values={}, precision_digits=30)
-
-
-def _cancel_cert(offset: str, claimed: str) -> DualityCertificate:
-    return DualityCertificate(
-        point=Instance(values={}, precision_digits=30),
-        primal=claimed,
-        dual=claimed,
-        digits=30,
-        violation=claimed,
-    )
-
-
-def test_near_zero_margin_rechecked_at_100_digits() -> None:
-    # False violation: -1e-41 at 30 digits, +9e-41 at 100.
-    enc = Cancelling("1e-41")
-    result = check_certificate(enc, _cancel_cert("1e-41", "-1e-41"))
-    assert not result.accepted
-    assert "near zero; the repeat check failed" in result.reason
-    assert 30 in enc.seen and max(enc.seen) >= 100
-
-    # A true violation near zero: -2e-40 at 30 digits, -1e-40 at 100. Accepted.
-    enc = Cancelling("2e-40")
-    result = check_certificate(enc, _cancel_cert("2e-40", "-2e-40"))
-    assert result.accepted, result.reason
-    assert "repeated at 100 digits" in result.reason
-    assert max(enc.seen) >= 100
 
 
 def test_accepts_s1_side_interval_certificate() -> None:
@@ -275,3 +222,254 @@ def test_fixture_encodings_sample_valid_points(
     rng = random.Random(0)
     for _ in range(5):
         assert all(enc.assumptions(enc.sample(rng)))
+
+
+# Configurable encodings for the checker's own guards. Each records the
+# precisions it ran at.
+
+POINT = Instance(values={}, precision_digits=16)
+
+
+class Toy:
+    def __init__(self, *, holds: object = None, degenerate: object = False) -> None:
+        self.holds: object = [True] if holds is None else holds
+        self.degenerate = degenerate
+        self.seen: list[int] = []
+
+    def margin(self, x: Instance) -> mpmath.mpf:
+        return mpmath.mpf(-1)
+
+    def assumptions(self, x: Instance) -> list[bool]:
+        self.seen.append(mpmath.mp.dps)
+        return cast(list[bool], self.holds)
+
+    def in_domain(self, x: Instance) -> bool:
+        return True
+
+    def near_degenerate(self, x: Instance) -> bool:
+        return cast(bool, self.degenerate)
+
+    def sample(self, rng: random.Random) -> Instance:
+        return POINT
+
+
+class DualToy(Toy):
+    """Primal and dual bounds given by a function of the working precision."""
+
+    def __init__(self, bounds: Callable[[], tuple[mpmath.mpf, mpmath.mpf]]) -> None:
+        super().__init__()
+        self.bounds = bounds
+
+    def primal_dual(self, x: Instance) -> tuple[mpmath.mpf, mpmath.mpf]:
+        return self.bounds()
+
+
+class BallToy(Toy):
+    """A ball margin given by a function of the working precision."""
+
+    def __init__(
+        self, ball: Callable[[], flint.arb], *, holds: object = None, degenerate: object = False
+    ) -> None:
+        super().__init__(holds=holds, degenerate=degenerate)
+        self.ball = ball
+
+    def margin_ball(self, x: Instance) -> flint.arb:
+        return self.ball()
+
+
+def dual_cert(primal: str, dual: str, violation: str, digits: int = 30) -> DualityCertificate:
+    point = Instance(values={}, precision_digits=digits)
+    return DualityCertificate(
+        point=point, primal=primal, dual=dual, digits=digits, violation=violation
+    )
+
+
+def ball_cert(low: str, high: str, digits: int = 16) -> IntervalCertificate:
+    point = Instance(values={}, precision_digits=digits)
+    return IntervalCertificate(point=point, digits=digits, enclosure=(low, high))
+
+
+def test_exactly_zero_margin_rejected() -> None:
+    # sqrt(30)^2 - 30 is 0, but reads as a tiny negative number at any precision.
+    def zero() -> tuple[mpmath.mpf, mpmath.mpf]:
+        m = mpmath.sqrt(30) ** 2 - 30
+        return m, m
+
+    with mpmath.mp.workdps(30):
+        claim = mpmath.nstr(zero()[0], 30)
+    assert to_fraction(claim) < 0
+    result = check_certificate(DualToy(zero), dual_cert(claim, claim, claim))
+    assert not result.accepted
+    assert "not distinguishable from zero" in result.reason
+
+
+def test_cancellation_away_from_zero_rechecked() -> None:
+    # (10^40 + 1) - 10^40 - 1/2 reads as -1/2 at 30 digits; it is +1/2.
+    def cancel() -> tuple[mpmath.mpf, mpmath.mpf]:
+        big = mpmath.mpf(10) ** 40
+        m = (big + 1) - big - mpmath.mpf("0.5")
+        return m, m
+
+    enc = DualToy(cancel)
+    result = check_certificate(enc, dual_cert("-0.5", "-0.5", "-0.5"))
+    assert not result.accepted
+    assert "repeat check" in result.reason
+    assert max(enc.seen) >= 60
+
+
+def test_recheck_precision() -> None:
+    # Away from zero and not degenerate: repeated at twice the digits.
+    enc = BallToy(lambda: flint.arb(-1))
+    assert check_certificate(enc, ball_cert("-1", "-1")).accepted
+    assert enc.seen == [16, 32]
+    # Near zero: repeated at 100 digits or more.
+    enc = BallToy(lambda: flint.arb(-1) / 10**8)
+    result = check_certificate(enc, ball_cert("-1e-8", "-1e-8"))
+    assert result.accepted, result.reason
+    assert max(enc.seen) >= 100
+    # Flagged near-degenerate: repeated at 100 digits or more.
+    enc = BallToy(lambda: flint.arb(-1), degenerate=True)
+    assert check_certificate(enc, ball_cert("-1", "-1")).accepted
+    assert max(enc.seen) >= 100
+
+
+def test_repeat_must_agree() -> None:
+    # Both balls lie below zero and meet the claim, but they disagree: the
+    # value is not stable. (Duality bounds must also match the claim, which
+    # catches drift on its own.)
+    def drift() -> flint.arb:
+        return flint.arb(-1) if mpmath.mp.dps <= 16 else flint.arb(-2)
+
+    result = check_certificate(BallToy(drift), ball_cert("-2", "-1"))
+    assert not result.accepted
+    assert "do not agree" in result.reason
+
+
+def test_non_bool_degenerate_flag_rejected() -> None:
+    enc = BallToy(lambda: flint.arb(-1), degenerate=np.True_)
+    result = check_certificate(enc, ball_cert("-1", "-1"))
+    assert not result.accepted
+    assert "near-degeneracy flag" in result.reason
+
+
+def test_non_bool_assumptions_rejected() -> None:
+    enc = BallToy(lambda: flint.arb(-1), holds=[1])
+    result = check_certificate(enc, ball_cert("-1", "-1"))
+    assert not result.accepted
+    assert "did not give booleans" in result.reason
+
+
+def test_duality_gap_rule() -> None:
+    def wide() -> tuple[mpmath.mpf, mpmath.mpf]:
+        return mpmath.mpf(-1), mpmath.mpf("-1.01")
+
+    result = check_certificate(DualToy(wide), dual_cert("-1", "-1.01", "-1"))
+    assert not result.accepted
+    assert "duality gap" in result.reason
+
+
+def test_violation_must_lie_between_bounds() -> None:
+    def tight() -> tuple[mpmath.mpf, mpmath.mpf]:
+        return mpmath.mpf(-1), mpmath.mpf(-1)
+
+    result = check_certificate(DualToy(tight), dual_cert("-1", "-1", "-2"))
+    assert not result.accepted
+    assert "outside the bounds" in result.reason
+
+
+def test_non_finite_bounds_rejected() -> None:
+    def nan() -> tuple[mpmath.mpf, mpmath.mpf]:
+        return mpmath.mpf("nan"), mpmath.mpf("nan")
+
+    result = check_certificate(DualToy(nan), dual_cert("-1", "-1", "-1"))
+    assert not result.accepted
+    assert "not finite" in result.reason
+
+    result = check_certificate(BallToy(lambda: flint.arb("nan")), ball_cert("-1", "-1"))
+    assert not result.accepted
+    assert "not finite" in result.reason
+
+
+class HugeExact(Toy):
+    def exact_margin(self, x: Instance) -> Fraction:
+        return Fraction(-(10**400))
+
+
+def test_exact_margin_of_huge_magnitude() -> None:
+    cert = ExactCertificate(point=POINT, margin=Fraction(-(10**400)))
+    result = check_certificate(HugeExact(), cert)
+    assert result.accepted, result.reason
+
+
+def test_exact_certificate_needs_a_rational_point() -> None:
+    # HugeExact's assumptions do not read the point, so only the rationality check stops it.
+    irrational = Instance(values={"x": "nan"}, precision_digits=30)
+    cert = ExactCertificate(point=irrational, margin=Fraction(-(10**400)))
+    result = check_certificate(HugeExact(), cert)
+    assert not result.accepted
+    assert "needs a rational point" in result.reason
+
+
+def test_huge_precision_and_exponents_refused() -> None:
+    with pytest.raises(ValidationError):
+        Instance(values={}, precision_digits=10**8)
+    with pytest.raises(ValidationError):
+        IntervalCertificate(point=POINT, digits=10**8, enclosure=("-1", "-1"))
+    with pytest.raises(ValidationError):
+        DualityCertificate(point=POINT, primal="-1", dual="-1", digits=10**8, violation="-1")
+    with pytest.raises(ValueError, match="exponent"):
+        to_fraction("1e-99999999")
+    assert not Instance(values={"x": "1e-99999999"}, precision_digits=30).is_rational()
+    # Pydantic refuses an exponent in a Fraction field.
+    with pytest.raises(ValidationError):
+        CERTIFICATE.validate_json(
+            '{"kind": "exact", "point": {"values": {}, "precision_digits": 30},'
+            ' "margin": "1e-99999999"}'
+        )
+
+
+def test_check_never_raises() -> None:
+    # Bypass validation, as a caller building a certificate by hand might.
+    cert = IntervalCertificate.model_construct(
+        kind="interval", point=POINT, digits=10**30, enclosure=("-1", "-1")
+    )
+    result = check_certificate(BallToy(lambda: flint.arb(-1)), cert)
+    assert not result.accepted
+
+
+def test_precision_restored_after_an_exception() -> None:
+    before_mp, before_flint = mpmath.mp.dps, flint.ctx.prec
+    with pytest.raises(RuntimeError), working_digits(200):
+        raise RuntimeError("boom")
+    assert (mpmath.mp.dps, flint.ctx.prec) == (before_mp, before_flint)
+
+
+class FloatBall(Y2Encoding):
+    """A dishonest ball margin: the float value, wrapped as an exact arb."""
+
+    def margin_ball(self, x: Instance) -> flint.arb:
+        c, a1, b = (float(scalar(x, k)) for k in ("c", "a1", "b"))
+        return flint.arb(0.25 - rho_float(c, a1, b))
+
+
+def test_kill_needs_both_encodings() -> None:
+    cert = load("grid_gap")
+    # On its own the dishonest encoding certifies the false violation.
+    assert check_certificate(FloatBall(), cert).accepted
+    result = check_kill(FloatBall(), Y2Encoding(), cert)
+    assert not result.accepted
+    assert "second encoding" in result.reason
+    result = check_kill(Y2Encoding(), FloatBall(), cert)
+    assert not result.accepted
+    assert "first encoding" in result.reason
+
+    side = load("s1_side_counterexample")
+    result = check_kill(TsallisPinskerSide(), TsallisPinskerSide(), side)
+    assert result.accepted, result.reason
+
+
+def test_kill_refuses_one_encoding_twice() -> None:
+    enc = TsallisPinskerSide()
+    result = check_kill(enc, enc, load("s1_side_counterexample"))
+    assert not result.accepted
+    assert "same encoding" in result.reason
