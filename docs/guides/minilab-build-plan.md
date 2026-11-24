@@ -4,7 +4,7 @@ title: Minilab build plan
 type: guide
 scope: internal
 created_at: '2026-11-24T01:22:50.443418Z'
-updated_at: '2026-11-24T13:43:59.228010Z'
+updated_at: '2026-11-24T15:28:10.947256Z'
 ---
 
 # Minilab build plan
@@ -127,9 +127,9 @@ Install Antigravity CLI first. Find the official install route from Google's doc
 **Produces:**
 - `DOMAINS: tuple[str, ...]`, holding the ten domains from doc-gmj in that order, with slugs: `optimisation`, `information-theory`, `probability`, `hd-statistics`, `random-matrices`, `optimal-transport`, `kernels`, `gradient-flows`, `information-geometry`, `graphs-spectral`.
 - `def all_pairs() -> list[tuple[str, str]]`: 45 sorted unordered pairs.
-- `class Scheduler`: `__init__(self, state_path: Path, rng: random.Random)`, `pick(self) -> tuple[str, str]` with weight `1 / (1 + visits)`, `record_visit(self, pair: tuple[str, str]) -> None`.
+- `class Scheduler`: `__init__(self, state_path: Path, rng: random.Random)`, `pick(self, pairs: Sequence[tuple[str, str]] | None = None) -> tuple[str, str]` with weight `1 / (1 + visits)`, `record_visit(self, pair: tuple[str, str]) -> None`. With `pairs`, `pick` chooses only from that list. The benchmark uses this for its explicit pair list (doc-gmj, stage 1).
 
-**Tests:** `test_45_pairs_no_self_pairs`; `test_weight_falls_with_visits` (over 10,000 seeded picks, a pair visited 9 times is picked less than a fresh one); `test_seeded_pick_is_deterministic`; `test_unknown_domain_rejected`.
+**Tests:** `test_45_pairs_no_self_pairs`; `test_weight_falls_with_visits` (over 10,000 seeded picks, a pair visited 9 times is picked less than a fresh one); `test_seeded_pick_is_deterministic`; `test_unknown_domain_rejected`; `test_pick_from_explicit_pairs`.
 
 ---
 
