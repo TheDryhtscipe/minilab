@@ -1,0 +1,26 @@
+{
+  "claude": {
+    "benchmark": true,
+    "probe": "runs/probes/2026-11-24.json",
+    "status": "isolated",
+    "version": "2.1.318 (Claude Code)"
+  },
+  "codex": {
+    "benchmark": true,
+    "probe": "runs/probes/2026-11-24.json",
+    "status": "isolated",
+    "version": "codex-cli 0.153.4"
+  },
+  "gemini": {
+    "benchmark": false,
+    "probe": "runs/probes/2026-11-24.json",
+    "status": "normal runs only",
+    "version": "1.5.16"
+  },
+  "local": {
+    "benchmark": true,
+    "probe": "runs/probes/2026-11-24.json",
+    "status": "isolated",
+    "version": "ollama version is 0.33.3"
+  }
+}
