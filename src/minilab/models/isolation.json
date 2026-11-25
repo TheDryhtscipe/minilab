@@ -12,9 +12,9 @@
     "version": "codex-cli 0.153.4"
   },
   "gemini": {
-    "benchmark": false,
-    "probe": "runs/probes/2026-11-24.json",
-    "status": "normal runs only",
+    "benchmark": true,
+    "probe": "runs/probes/2026-11-25.json",
+    "status": "isolated",
     "version": "1.5.16"
   },
   "local": {
