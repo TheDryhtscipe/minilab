@@ -5,7 +5,7 @@ title: agy runs with a deny-all hook and an empty home, and each call must prove
 type: decision
 scope: internal
 created_at: '2026-11-25T00:38:54.120115Z'
-updated_at: '2026-11-25T00:38:54.120115Z'
+updated_at: '2026-11-25T00:57:09.319669Z'
 ---
 
 ## Decision
@@ -19,7 +19,7 @@ This updates the Gemini parts of doc-tvd. That doc says no deny rule covers agy'
 1. `GeminiBackend.run` refuses to start (`ModelNotStarted`) if the working directory or any folder above it holds `.git`, `.jj`, or `.hg`. agy reads rules, skills, hooks, and MCP servers from every folder up to the repository root.
 2. It writes `.agents/hooks.json` into the call's empty working directory. The hook matches every tool (`*`) and returns `deny`. Its reason holds a random nonce, new for each call.
 3. It makes `.home` in the working directory. agy runs with `HOME` and the four XDG folders set inside it.
-4. agy runs with `--output-format stream-json`, the session-only `AGY_SETTINGS`, and `--disable-slash-commands`.
+4. agy runs with `--input-format stream-json`, `--output-format stream-json`, the session-only `AGY_SETTINGS`, and `--disable-slash-commands`. The prompt goes on stdin as one line: `{"event": "user", "message": {"content": <prompt>}}`. So the prompt is not on the command line (bead minilab-556222). An empty or blank prompt, or one that is not valid text, raises `ModelNotStarted`.
 5. `parse_agy` reads the stream and raises `ModelUnavailable` unless all of these hold:
    - There is one `init` event with a conversation id, and one `result` event.
    - Every step belongs to that conversation and has a step index.
@@ -53,5 +53,6 @@ The probe of 24 November 2026 found that agy's settings deny file, URL, command,
 - A call in which Gemini tries a tool still succeeds if the hook denied it. Its tokens are charged as usual.
 - A new step type in a later agy version fails every Gemini call until `_AGY_STEPS_WITHOUT_TOOLS` or the parser is updated. This is deliberate: an unknown step may run a tool.
 - A tool that ran and then failed ends in `ERROR` too. The nonce check rejects it, because its error is not this call's hook denial.
-- The prompt still goes on the command line (`--print=<prompt>`), so other local users can see it in the process list. `--input-format stream-json` may remove this; it was not tried.
+- The prompt goes on stdin, so other local users cannot see it in the process list, and it has no 128 KiB argument limit. A live call on 25 November 2026 found the prompt in no `/proc/*/cmdline` while agy ran, and a 210 KB prompt got a reply. The isolation probe, rerun with the prompt on stdin, still marks Gemini `isolated`.
+- With `--input-format stream-json`, agy ignores a stdin message with an unknown `event` (it prints a warning and exits 0 with no `result`), and it refuses content blocks other than `text`. A prompt that starts with `/` reaches the model as text.
 - The probe cannot see whether Gemini's servers ground answers in search results without a tool call. In one red-team call, the model said it had no grounding. That rests on the model's own report.

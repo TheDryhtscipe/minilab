@@ -23,14 +23,14 @@ The isolation flags for each tool:
 - Codex (`codex exec`): the user's `config.toml` and rules are not loaded (so
   no MCP servers), a read-only sandbox, web search disabled, and every tool
   feature that reaches outside the prompt turned off, including the shell.
-- Gemini (Antigravity CLI, `agy -p`): a session-only `--settings` object that
-  denies file, URL, command, and MCP actions, keeps the agent inside its empty
-  workspace, and never spends paid credits; a `PreToolUse` hook, written into
-  the call's empty directory, that denies every tool, `search_web` and the
-  browser, subagent, and workflow tools included; an empty `HOME`, so none of
-  the user's agy rules, memories, skills, or hooks load; and a parser that
-  fails any call without proof that the hook denied every tool step (bead
-  minilab-2be43f).
+- Gemini (Antigravity CLI, `agy --input-format stream-json`): a session-only
+  `--settings` object that denies file, URL, command, and MCP actions, keeps
+  the agent inside its empty workspace, and never spends paid credits; a
+  `PreToolUse` hook, written into the call's empty directory, that denies every
+  tool, `search_web` and the browser, subagent, and workflow tools included; an
+  empty `HOME`, so none of the user's agy rules, memories, skills, or hooks
+  load; and a parser that fails any call without proof that the hook denied
+  every tool step (bead minilab-2be43f).
 - Local (ollama HTTP API): the model has no tools. The HTTP client ignores
   proxy variables in the environment.
 
@@ -85,9 +85,6 @@ SYSTEM_PROMPT = (
 
 _CLAUDE_LIMIT = re.compile(r"^\s*Claude AI usage limit reached")
 """Claude has printed this usage limit message as a result that is not marked an error."""
-
-MAX_ARG_BYTES = 120_000
-"""Largest prompt agy can take: Linux caps one argument at 128 KiB."""
 
 
 class ModelUnavailable(Exception):
@@ -742,7 +739,7 @@ def _agy_tools_not_blocked(
 
 
 def parse_agy(raw: str, *, model: str, nonce: str, prompt: str = "") -> ModelReply:
-    """Parse `agy -p --output-format stream-json` output: one JSON event per line.
+    """Parse `agy --output-format stream-json` output: one JSON event per line.
 
     The events are one `init`, a `step_update` for each step, and one
     `result`. The parser raises `ModelUnavailable` for a call in which a step
@@ -826,17 +823,20 @@ class GeminiBackend:
         self.model = model
         self.binary = binary or str(Path.home() / ".local" / "bin" / "agy")
 
-    def argv(self, prompt: str = "") -> list[str]:
-        """agy reads its prompt only from the command line (`--print=<prompt>`), not stdin."""
+    def argv(self) -> list[str]:
+        """The prompt goes on stdin (`--input-format stream-json`), not on the command
+        line, so it has no 128 KiB argument limit and other local users cannot read it
+        in the process list."""
         argv = [
             self.binary,
+            "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--disable-slash-commands",
             "--settings", json.dumps(AGY_SETTINGS),
         ]
         if self.model is not None:
             argv += ["--model", self.model]
-        return argv + [f"--print={prompt}"]
+        return argv
 
     def run(
         self, prompt: str, *, cwd: Path, env: Mapping[str, str], timeout_s: float
@@ -847,18 +847,22 @@ class GeminiBackend:
         Before agy starts, the backend writes `agy_hooks` into `cwd/.agents/` and
         makes an empty home folder, `cwd/.home`, for `HOME` and the XDG folders. So
         agy loads none of the user's rules, memories, skills, hooks, plugins, or
-        MCP servers, and keeps no record of the call; it still finds the user's
-        login in the OS keyring over D-Bus. It raises `ModelNotStarted` for a
-        prompt over `MAX_ARG_BYTES`, one with a NUL character or that is not valid
-        text (see `run_command`), a `cwd` inside a repository, or a hook or home
-        folder that cannot be written.
+        MCP servers, and keeps no record of the call in the user's own home: its
+        transcript stays in `cwd/.home` until the caller removes `cwd`
+        (`isolated_run` does). agy still finds the user's login in the OS keyring
+        over D-Bus. The prompt goes to agy on stdin as
+        one stream-json user message. It raises `ModelNotStarted` for an empty or
+        blank prompt, one that is not valid text, a `cwd` inside a repository, or a
+        hook or home folder that cannot be written.
         """
-        size = len(prompt.encode("utf-8", errors="replace"))
-        if size > MAX_ARG_BYTES:
-            raise ModelNotStarted(
-                f"agy: prompt is {size} bytes; the limit for one "
-                f"command-line argument is {MAX_ARG_BYTES}"
-            )
+        if not prompt.strip():
+            raise ModelNotStarted("agy: the prompt is empty")
+        try:
+            prompt.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ModelNotStarted(f"agy: the prompt is not valid text: {exc}") from exc
+        # One user message on one line: json.dumps escapes every line break.
+        message = json.dumps({"event": "user", "message": {"content": prompt}}) + "\n"
         here = cwd.resolve()
         for folder in (here, *here.parents):
             for marker in _AGY_REPOSITORY_MARKERS:
@@ -885,9 +889,9 @@ class GeminiBackend:
         }
         model = self.model or "agy-default"
         return _run_and_parse(
-            self.argv(prompt),
+            self.argv(),
             lambda out: parse_agy(out, model=model, nonce=nonce, prompt=prompt),
-            stdin="", cwd=cwd, env=own_env, timeout_s=timeout_s,
+            stdin=message, cwd=cwd, env=own_env, timeout_s=timeout_s,
         )
 
 
