@@ -4,7 +4,8 @@ Search may suggest a kill; only a certificate makes one (design doc-gmj,
 "Falsifier"). `check_certificate` accepts a certificate only if all of these
 hold (build plan doc-5wh, Task 6):
 
-1. the point satisfies every assumption predicate and the domain predicate;
+1. the encoding gives one predicate for each of the conjecture's assumptions,
+   and the point satisfies every one of them and the domain predicate;
 2. the margin is negative: exactly, by a rigorous enclosure, or between primal
    and dual bounds whose gap is below 1/1000 of the upper bound;
 3. 1 and 2 hold again at twice the precision, or at 100 digits or more if the
@@ -27,6 +28,16 @@ Models never write this code.
 The encoding's capabilities (`margin_ball`, `primal_dual`) are written by a
 model, so one encoding's say-so is not enough for a kill: `check_kill` accepts
 only when both independent encodings of the conjecture accept the certificate.
+
+`check_kill` takes only `Sandboxed` encodings, so model code never runs in this
+process: each run is a fresh child process with a time limit, and the checker
+compares values it rebuilt itself (minilab.encoding.sandbox). That closes what
+the notes above leave open: state kept on a class or in a module, and an
+encoding that patches the other encoding or this checker. For a `Sandboxed`
+encoding, only the child checks that the working precision is unchanged, and
+the encoding can patch the child. `check_certificate`
+also takes an in-process factory, for tests and the search; such an encoding
+can reach anything in this process.
 """
 
 from typing import Annotated, cast
@@ -40,6 +51,8 @@ from minilab.certify.exact import ExactCertificate, check_exact_margin
 from minilab.certify.interval import IntervalCertificate, check_interval_margin
 from minilab.certify.result import CheckResult, MarginCheck, accept, reject, show, working_digits
 from minilab.encoding.api import Encoding, EncodingFactory, Instance
+from minilab.encoding.sandbox import Sandboxed
+from minilab.records import Family
 
 # A certificate is one of the three kinds, tagged by its `kind` field. Read one
 # from JSON with `CERTIFICATE.validate_json`.
@@ -78,6 +91,7 @@ def _check_at(
     enc: Encoding,
     cert: Certificate,
     digits: int,
+    assumptions: int,
 ) -> tuple[MarginCheck, bool]:
     """Run conditions 1 and 2 at `digits` digits.
 
@@ -109,6 +123,13 @@ def _check_at(
             ):
                 return MarginCheck.failed(
                     reject("the assumption predicates did not give booleans")
+                ), False
+            if len(cast(list[bool], holds)) != assumptions:
+                return MarginCheck.failed(
+                    reject(
+                        f"the encoding gave {len(cast(list[bool], holds))} assumption "
+                        f"predicates; the conjecture has {assumptions}"
+                    )
                 ), False
             failed = [i for i, h in enumerate(cast(list[bool], holds)) if not h]
             if failed:
@@ -146,14 +167,16 @@ def _check_at(
     return margin, degenerate
 
 
-def check_certificate(make: EncodingFactory, cert: Certificate) -> CheckResult:
+def check_certificate(make: EncodingFactory, cert: Certificate, *, assumptions: int) -> CheckResult:
     """Accept `cert` as a violation of the conjecture `make` encodes, or say why not.
 
-    `make` builds a fresh encoding; it is called once for each run. This trusts
+    `make` builds a fresh encoding; it is called once for each run.
+    `assumptions` is the number of assumptions the conjecture states, from its
+    record: the encoding must give exactly that many predicates. This trusts
     the encoding. A kill needs `check_kill`, which asks both encodings.
     """
     try:
-        return _check_certificate(make, cert)
+        return _check_certificate(make, cert, assumptions)
     except (Exception, SystemExit) as exc:  # noqa: BLE001 - answer, except to KeyboardInterrupt
         return reject(f"the check raised {_describe(exc)}")
 
@@ -177,12 +200,14 @@ def _build(make: EncodingFactory, digits: int) -> Encoding | CheckResult:
     return enc
 
 
-def _check_certificate(make: EncodingFactory, cert: Certificate) -> CheckResult:
+def _check_certificate(make: EncodingFactory, cert: Certificate, assumptions: int) -> CheckResult:
+    if type(assumptions) is not int or assumptions < 0:
+        return reject(f"the number of assumptions must be a count, not {assumptions!r}")
     digits = _digits(cert)
     enc = _build(make, digits)
     if isinstance(enc, CheckResult):
         return enc
-    first, degenerate = _check_at(enc, cert, digits)
+    first, degenerate = _check_at(enc, cert, digits, assumptions)
     if not first.result.accepted:
         return first.result
     assert first.enclosure is not None
@@ -197,7 +222,7 @@ def _check_certificate(make: EncodingFactory, cert: Certificate) -> CheckResult:
         return fresh
     if fresh is enc:
         return reject("the factory returned the same encoding object twice")
-    second, _ = _check_at(fresh, cert, recheck_digits)
+    second, _ = _check_at(fresh, cert, recheck_digits, assumptions)
     if not second.result.accepted:
         return reject(
             f"{why} at {recheck_digits} digits; the repeat check failed: {second.result.reason}"
@@ -229,19 +254,26 @@ def _agree(first: MarginCheck, second: MarginCheck) -> bool:
 
 
 def check_kill(
-    make_first: EncodingFactory, make_second: EncodingFactory, cert: Certificate
+    first: Sandboxed, second: Sandboxed, cert: Certificate, *, assumptions: int
 ) -> CheckResult:
     """Accept `cert` as a kill only if both independent encodings accept it.
 
-    The two factories build the two families' encodings of one conjecture
-    (design doc-gmj, "Encoding"). Model code computes the ball and duality
-    bounds, so a single encoding could certify a violation that is not there.
-    This refuses one factory passed twice, but cannot tell which family wrote
-    an encoding: the caller (Task 7's encode_twice) must give one per family.
+    `first` and `second` are the two families' encodings of one conjecture
+    (design doc-gmj, "Encoding"), each run in the sandbox. Model code computes
+    the ball and duality bounds, so a single encoding could certify a violation
+    that is not there. This needs two different families, and never Gemini,
+    which only generates. It trusts each `Sandboxed.family`: the caller
+    (encode_twice) must fill it in truthfully. `assumptions` is as for
+    `check_certificate`.
     """
-    if make_first is make_second:
-        return reject("a kill needs two independent encodings, not the same encoding twice")
-    results = [check_certificate(make, cert) for make in (make_first, make_second)]
+    sandboxed = cast(tuple[object, object], (first, second))
+    if not all(type(make) is Sandboxed for make in sandboxed):
+        return reject("a kill needs both encodings to run in the sandbox (Sandboxed)")
+    if first.family is second.family:
+        return reject(f"a kill needs encodings from two families, not two from {first.family}")
+    if Family.gemini in (first.family, second.family):
+        return reject("a kill cannot use an encoding written by Gemini, which only generates")
+    results = [check_certificate(make, cert, assumptions=assumptions) for make in (first, second)]
     for name, result in zip(("first", "second"), results, strict=True):
         if not result.accepted:
             return reject(f"the {name} encoding refuses: {result.reason}")
