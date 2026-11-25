@@ -10,24 +10,42 @@ the record's author, never Gemini):
    conjecture's result, quoting the passage.
 
 A match counts only if code can confirm it: the candidate is one the search
-found, the quote appears in the text the checker was shown, and the checker
+found and showed the checker, the quote passes `quote_found`, and the checker
 says the passage states the same result or a stronger one (`same` or
 `implies`). Then the status is `known`. A proof by `exact?` counts on its
 own, because Lean checked it.
 
-Under a date cap, mathlib matches are notes only: neither Loogle (latest
-mathlib) nor the repo's mathlib pin can be capped (decision on bead
-minilab-4e42a7).
+`quote_found` reads only a candidate's `text`, which holds only what the
+source said: never its title, and never the labels the prompt adds. On arXiv
+and MathOverflow a quote needs at least `MIN_QUOTE` characters after
+normalising; for mathlib it may be the declaration's name or any
+`MIN_MATHLIB_QUOTE` characters of its text. Normalising joins words split by
+a hyphen at a line break and writes >=, <=, and != for their symbols. It
+cannot tell such a split word from a real hyphen at a line end.
 
-A source that could not be searched is `unchecked`, never "not found". With
-no counting match and any source unchecked, or a checker reply that cannot be
-read, the result is `unchecked`. `run_literature_stage` then writes the log
-but not the stage, and raises `LiteratureUnchecked`, so the record is
-unchanged and the stage runs again on resume. A counting match from a source
-that answered still makes the record `known`.
+Under a date cap nothing posted or revised after the cap is shown: a late
+paper or post is dropped, and the title and text of a late revision are
+withheld. Mathlib matches are notes only, and mathlib's state takes no part
+in the status, since neither Loogle (latest mathlib) nor the repo's mathlib
+pin can be capped (decision doc-53t, bead minilab-4e42a7).
 
-Every query, its outcome, and its hits are logged in the output, and the
-stage writes the whole output to `runs/<run_id>/literature/`.
+The status, in order of precedence:
+
+1. `known`: a match counts.
+2. `unchecked`: a source that counts could not be searched, or the
+   checker's verdict could not be read. An outage is never "not found".
+3. `unconfirmed`: the checker named a `same` or `implies` match from a
+   source that counts, but its quote fails the check.
+4. `not_found`: none of these.
+
+On `unchecked`, `run_literature_stage` writes the log but not the stage, and
+raises `LiteratureUnchecked`, so the record is unchanged and the stage runs
+again on resume. On `unconfirmed` it writes the stage and leaves the
+record's status, and the notes name the match that could not be confirmed.
+
+Every query, its outcome, its hits, and the hits shown to the checker are
+logged in the output, and the stage writes the whole output to
+`runs/<run_id>/literature/`.
 """
 
 import json
@@ -42,7 +60,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
 from minilab.ledger import Ledger
 from minilab.literature.arxiv import Paper, arxiv_query, search_arxiv
-from minilab.literature.http import LiteratureHttp, SourceUnavailable
+from minilab.literature.http import LiteratureHttp, SourceUnavailable, default_client
 from minilab.literature.loogle import Hit, QueryRejected, search_exact, search_loogle
 from minilab.literature.mathoverflow import Post, search_mathoverflow
 from minilab.literature.pdf import pdf_text
@@ -54,22 +72,28 @@ SourceName = Literal["mathlib", "arxiv", "mathoverflow"]
 SourceState = Literal["checked", "unchecked"]
 Closeness = Literal["same", "implies", "special_case", "related", "unrelated"]
 Outcome = Literal["ok", "unavailable", "rejected"]
-LiteratureStatus = Literal["known", "not_found", "unchecked"]
+LiteratureStatus = Literal["known", "unchecked", "unconfirmed", "not_found"]
 
 SOURCES: tuple[SourceName, ...] = ("mathlib", "arxiv", "mathoverflow")
 KNOWN_CLOSENESS: frozenset[str] = frozenset({"same", "implies"})
 
 MAX_QUERIES = 3
 MAX_ARXIV = 8
-MAX_POSTS = 8
+"""arXiv candidates, taken in turn from each query's hits."""
+MAX_ANSWERS = 6
+MAX_QUESTIONS = 6
+"""MathOverflow candidates: answers first, then questions."""
 MAX_HITS = 10
+"""Mathlib candidates: `exact?` hits first, then Loogle hits."""
 PDF_PAPERS = 3
 """The top arXiv candidates whose PDFs are read."""
 HEAD_CHARS = 1500
 EXCERPT_CHARS = 6000
 POST_CHARS = 3000
-MIN_QUOTE = 12
-"""The shortest quote that confirms a match, unless it is the candidate's whole text."""
+MIN_QUOTE = 40
+"""The shortest quote, after normalising, that confirms an arXiv or MathOverflow match."""
+MIN_MATHLIB_QUOTE = 12
+"""The shortest quote that confirms a mathlib match, unless it is the declaration's name."""
 
 
 class LiteratureUnchecked(Exception):
@@ -91,19 +115,35 @@ class QueryLog(_Model):
     detail: str = ""
     hits: list[str] = Field(default_factory=lambda: [])
     """Keys of the candidates this query found, after the date cap."""
+    shown: list[str] = Field(default_factory=lambda: [])
+    """Keys of this query's hits that the checker was shown. Some hits are cut
+    by the candidate limits; `exact?` hits are never judged, as Lean checked them."""
+
+
+class Section(_Model):
+    """One part of a candidate's source text, under the label the prompt gives it."""
+
+    label: str
+    text: str
 
 
 class Candidate(_Model):
-    """A paper, post, or declaration shown to the checker, under its key."""
+    """A paper, post, or declaration found by the search, under its key."""
 
     key: str
     source: SourceName
-    title: str
-    text: str
-    """Exactly what the checker was shown, apart from the key and title."""
+    title: str | None
+    """None when withheld under the date cap; `note` says why."""
+    sections: list[Section]
+    """The source's own text. The prompt shows each under its label."""
     link: str
     posted: datetime | None
     note: str = ""
+
+    @property
+    def text(self) -> str:
+        """The source text the checker was shown, without the key, title, or labels."""
+        return "\n\n".join(s.text for s in self.sections)
 
 
 class Match(_Model):
@@ -246,8 +286,16 @@ Answer with one JSON object with the keys "arxiv", "mathoverflow", and "loogle",
 nothing else."""
 
 
+def _render(candidate: Candidate) -> str:
+    title = "(withheld under the date cap)" if candidate.title is None else candidate.title
+    body = "\n".join(f"{s.label}: {s.text}" for s in candidate.sections)
+    return (
+        f"=== {candidate.key} ===\nTitle: {title}\n{body or '(text withheld under the date cap)'}"
+    )
+
+
 def judge_prompt(record: Record, candidates: list[Candidate]) -> str:
-    shown = "\n\n".join(f"=== {c.key} ===\nTitle: {c.title}\n{c.text}" for c in candidates)
+    shown = "\n\n".join(_render(c) for c in candidates)
     return f"""Decide whether any of the texts below already states this conjecture's result.
 
 {_record_text(record)}
@@ -261,7 +309,9 @@ For each text that bears on the conjecture, give:
 - "closeness": "same" (it states this result), "implies" (it states a stronger result that
   gives this one directly), "special_case" (it states only a special case), "related" (same
   objects, a different claim), or "unrelated";
-- "quote": the passage that states the result, copied exactly from the text above;
+- "quote": the passage that states the result, copied exactly from the text above, at
+  least {MIN_QUOTE} characters, and never from a title or a label such as "Abstract:".
+  For a mathlib declaration, its name will do;
 - "note": one or two sentences on how the passage matches the conjecture.
 
 Leave out unrelated texts. Answer with one JSON object, {{"matches": [...]}}, and nothing
@@ -296,45 +346,47 @@ def excerpt(text: str, terms: set[str]) -> str:
 def _paper_candidate(
     paper: Paper, rank: int, record: Record, client: LiteratureHttp, cache_dir: Path | None
 ) -> Candidate:
-    parts: list[str] = []
+    sections: list[Section] = []
     notes: list[str] = []
+    if paper.withheld is not None:
+        notes.append(paper.withheld)
     if paper.summary is not None:
-        parts.append(f"Abstract: {paper.summary}")
-    else:
-        notes.append("abstract withheld: the paper was revised after the cap")
+        sections.append(Section(label="Abstract", text=paper.summary))
     if rank < PDF_PAPERS:
         try:
             text = pdf_text(paper.pdf_url, client=client, cache_dir=cache_dir)
-            parts.append(f"From the PDF ({paper.pdf_url}):\n{excerpt(text, _terms(record))}")
+            sections.append(Section(label="From the PDF", text=excerpt(text, _terms(record))))
+            notes.append(f"PDF: {paper.pdf_url}")
         except SourceUnavailable as exc:
             notes.append(f"PDF not read: {exc}")
     return Candidate(
         key=f"arxiv:{paper.arxiv_id}",
         source="arxiv",
         title=paper.title,
-        text="\n".join(parts),
+        sections=sections,
         link=paper.abs_url,
         posted=paper.published,
         note="; ".join(notes),
     )
 
 
+def _post_key(post: Post) -> str:
+    if post.answer_id is None:
+        return f"mathoverflow:q{post.question_id}"
+    return f"mathoverflow:a{post.answer_id}"
+
+
 def _post_candidate(post: Post) -> Candidate:
-    key = (
-        f"mathoverflow:q{post.question_id}"
-        if post.answer_id is None
-        else f"mathoverflow:a{post.answer_id}"
-    )
     label = "Question" if post.kind == "question" else "Answer"
-    text = f"{label}: {post.body[:POST_CHARS]}" if post.body is not None else ""
+    sections = [] if post.body is None else [Section(label=label, text=post.body[:POST_CHARS])]
     return Candidate(
-        key=key,
+        key=_post_key(post),
         source="mathoverflow",
         title=post.title,
-        text=text,
+        sections=sections,
         link=post.link,
         posted=post.created,
-        note=f"body withheld: {post.withheld}" if post.withheld else "",
+        note=post.withheld or "",
     )
 
 
@@ -344,16 +396,21 @@ def _hit_candidate(hit: Hit) -> Candidate:
             key=f"mathlib:exact?:{hit.name}",
             source="mathlib",
             title="exact? closed the Lean statement",
-            text=hit.name,
+            sections=[Section(label="Term", text=hit.name)],
             link="",
             posted=None,
         )
-    doc = f"\n{hit.doc}" if hit.doc else ""
+    sections = [
+        Section(label="Declaration", text=f"{hit.name} : {hit.type}"),
+        Section(label="Module", text=hit.module),
+    ]
+    if hit.doc:
+        sections.append(Section(label="Docstring", text=hit.doc))
     return Candidate(
         key=f"mathlib:{hit.name}",
         source="mathlib",
         title=hit.name,
-        text=f"{hit.name} : {hit.type}\nModule: {hit.module}{doc}",
+        sections=sections,
         link="",
         posted=None,
     )
@@ -362,19 +419,32 @@ def _hit_candidate(hit: Hit) -> Candidate:
 # --- matching ---
 
 
-def _normal(text: str) -> str:
-    return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
+_HYPHEN_BREAK = re.compile(r"-[ \t]*\r?\n\s*")
+_SYMBOLS = {"≥": ">=", "≤": "<=", "≠": "!="}
+
+
+def normalise(text: str) -> str:
+    """`text` for comparing quotes: line-end hyphens joined, symbols spelt, spaces collapsed."""
+    text = _HYPHEN_BREAK.sub("", unicodedata.normalize("NFKC", text))
+    for symbol, spelt in _SYMBOLS.items():
+        text = text.replace(symbol, spelt)
+    return " ".join(text.casefold().split())
 
 
 def quote_found(quote: str, candidate: Candidate) -> bool:
-    """Whether `quote` is in the text the checker was shown for `candidate`."""
-    shown = _normal(f"{candidate.title}\n{candidate.text}")
-    wanted = _normal(quote)
+    """Whether `quote` confirms a match on `candidate`, as the module describes.
+
+    Only `candidate.text` is read: never the title, the key, or a label.
+    """
+    wanted = normalise(quote)
     if not wanted:
         return False
-    if len(wanted) < MIN_QUOTE and wanted != _normal(candidate.text):
-        return False
-    return wanted in shown
+    shown = normalise(candidate.text)
+    if candidate.source == "mathlib":
+        if wanted == normalise(candidate.key.removeprefix("mathlib:")):
+            return wanted in shown
+        return len(wanted) >= MIN_MATHLIB_QUOTE and wanted in shown
+    return len(wanted) >= MIN_QUOTE and wanted in shown
 
 
 def _counts(source: SourceName, before: date | None) -> bool:
@@ -413,6 +483,9 @@ class _Search:
 
     def arxiv(self, phrases: list[str]) -> None:
         query = arxiv_query(phrases)
+        if not query:
+            self._note("arxiv", json.dumps(phrases), "rejected", "nothing is left after cleaning")
+            return
         try:
             papers = search_arxiv(query, self.before, client=self.client)
         except SourceUnavailable as exc:
@@ -433,7 +506,7 @@ class _Search:
             return
         keys: list[str] = []
         for post in posts:
-            key = _post_candidate(post).key
+            key = _post_key(post)
             keys.append(key)
             self.posts.setdefault(key, post)
         self._note("mathoverflow", query, "ok", hits=keys)
@@ -477,12 +550,34 @@ class _Search:
             for s in SOURCES
         }
 
+    def _arxiv_keys(self) -> list[str]:
+        """Up to MAX_ARXIV papers, taken in turn from each query's hits."""
+        lists = [q.hits for q in self.log if q.source == "arxiv" and q.outcome == "ok"]
+        chosen: list[str] = []
+        depth = max((len(hits) for hits in lists), default=0)
+        for i in range(depth):
+            for hits in lists:
+                if len(chosen) < MAX_ARXIV and i < len(hits) and hits[i] not in chosen:
+                    chosen.append(hits[i])
+        return chosen
+
     def candidates(self) -> list[Candidate]:
-        found = [_hit_candidate(h) for h in list(self.hits.values())[:MAX_HITS]]
-        for rank, paper in enumerate(list(self.papers.values())[:MAX_ARXIV]):
+        exact = [h for h in self.hits.values() if h.via == "exact?"]
+        loogle = [h for h in self.hits.values() if h.via != "exact?"]
+        found = [_hit_candidate(h) for h in exact + loogle[: max(MAX_HITS - len(exact), 0)]]
+        for rank, key in enumerate(self._arxiv_keys()):
+            paper = self.papers[key]
             found.append(_paper_candidate(paper, rank, self.record, self.client, self.cache_dir))
-        found += [_post_candidate(p) for p in list(self.posts.values())[:MAX_POSTS]]
+        answers = [p for p in self.posts.values() if p.kind == "answer"][:MAX_ANSWERS]
+        questions = [p for p in self.posts.values() if p.kind == "question"][:MAX_QUESTIONS]
+        found += [_post_candidate(p) for p in answers + questions]
         return found
+
+    def mark_shown(self, shown: set[str]) -> None:
+        """Record on each query which of its hits the checker was shown."""
+        self.log = [
+            q.model_copy(update={"shown": [k for k in q.hits if k in shown]}) for q in self.log
+        ]
 
 
 def literature_check(
@@ -502,7 +597,7 @@ def literature_check(
     Nothing is written. Raise NoChecker if no family may check the record,
     and model failures as `call` raises them.
     """
-    client = client or LiteratureHttp()
+    client = client or default_client()
     checker = pick_checker(record.provenance.family, ledger.manifest.families)
     reply = call(
         checker,
@@ -546,6 +641,7 @@ def literature_check(
 
     judged = True
     judged_candidates = [c for c in candidates if not c.key.startswith("mathlib:exact?:")]
+    search.mark_shown({c.key for c in judged_candidates})
     if judged_candidates:
         verdict = call(
             checker,
@@ -585,28 +681,37 @@ def literature_check(
                     )
                 )
 
+    unconfirmed: list[Match] = []
     for m in matches:
         if m.closeness not in KNOWN_CLOSENESS:
             continue
         source = by_key[m.key].source
-        if not m.verified:
-            notes.append(f"Unverified {m.closeness} match {m.key}: the quote is not in its text.")
-        elif not m.counts and source == "mathlib":
+        if not _counts(source, before):
             notes.append(
                 f"mathlib match {m.key} ({m.closeness}) is a note only: mathlib cannot be "
                 f"capped at {before}."
             )
+        elif not m.verified:
+            unconfirmed.append(m)
+            notes.append(
+                f"Could not confirm the {m.closeness} match {m.key}: its quote is not in "
+                "the text the checker was shown, or is too short."
+            )
 
+    # Under a date cap mathlib can never count, so its state takes no part.
+    missing = [s for s in SOURCES if _counts(s, before) and sources[s] == "unchecked"]
     if any(m.counts for m in matches):
         status: LiteratureStatus = "known"
         notes.append("Known: " + ", ".join(m.key for m in matches if m.counts) + ".")
-    elif judged and all(state == "checked" for state in sources.values()):
-        status = "not_found"
-    else:
+    elif missing or not judged:
         status = "unchecked"
-        missing = [s for s, state in sources.items() if state == "unchecked"]
         if missing:
             notes.append("Unchecked sources: " + ", ".join(missing) + ".")
+    elif unconfirmed:
+        status = "unconfirmed"
+        notes.append("Unconfirmed: " + ", ".join(m.key for m in unconfirmed) + ".")
+    else:
+        status = "not_found"
     return LiteratureOutput(
         status=status,
         before=before,
@@ -638,8 +743,9 @@ def run_literature_stage(
     """Run `literature_check` with the run's date cap, log it, and write the stage.
 
     The whole output goes to `runs/<run_id>/literature/<id>.<time>.json` on
-    every attempt. A `known` result sets the status; `not_found` leaves it.
-    An `unchecked` result writes no stage and raises LiteratureUnchecked.
+    every attempt. A `known` result sets the status; `unconfirmed` and
+    `not_found` write the stage and leave the status. An `unchecked` result
+    writes no stage and raises LiteratureUnchecked.
     Raise ValueError for a record that is not proposed or survived, or that
     already has a literature stage.
     """

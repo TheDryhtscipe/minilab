@@ -2,7 +2,8 @@
 
 Loogle searches mathlib by name, constant, and type pattern over its JSON API.
 A query Loogle cannot parse raises `QueryRejected`: the search did not run,
-but the service is up.
+but the service is up. A reply with neither `hits` nor `error` raises
+`SourceUnavailable`, never an empty result.
 
 `exact?` runs only when a Lean statement exists. The statement's one `sorry`
 becomes `exact?`, and the file goes through `check_lean`. A success gives the
@@ -17,10 +18,10 @@ import re
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from minilab.lean.runner import LeanUnavailable, check_lean
-from minilab.literature.http import LiteratureHttp, SourceUnavailable
+from minilab.literature.http import LiteratureHttp, SourceUnavailable, default_client
 
 API = "https://loogle.lean-lang.org/json"
 EXACT_TIMEOUT_S = 120.0
@@ -61,7 +62,7 @@ class _LoogleHit(BaseModel):
 class _LoogleReply(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    hits: list[_LoogleHit] = Field(default_factory=lambda: [])
+    hits: list[_LoogleHit] | None = None
     error: str | None = None
 
 
@@ -69,13 +70,15 @@ def search_loogle(
     query: str, *, client: LiteratureHttp | None = None, max_hits: int = DEFAULT_MAX_HITS
 ) -> list[Hit]:
     """Search mathlib with Loogle. Raise QueryRejected or SourceUnavailable."""
-    body = (client or LiteratureHttp()).get(API, {"q": query})
+    body = (client or default_client()).get(API, {"q": query})
     try:
         reply = _LoogleReply.model_validate_json(body)
     except ValidationError as exc:
         raise SourceUnavailable(f"Loogle: the response cannot be read: {exc}") from exc
     if reply.error is not None:
         raise QueryRejected(f"Loogle: {reply.error}")
+    if reply.hits is None:
+        raise SourceUnavailable("Loogle: the response has neither hits nor an error")
     return [
         Hit(name=h.name, type=" ".join(h.type.split()), module=h.module, doc=h.doc, via="loogle")
         for h in reply.hits[:max_hits]

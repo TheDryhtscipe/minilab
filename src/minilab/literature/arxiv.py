@@ -5,9 +5,13 @@ cap (`submittedDate`), and every result whose first version (`published` in
 the feed) is after the cap is dropped, whatever the API returned.
 
 A paper first posted before the cap may have later versions. The feed's
-abstract belongs to the latest version, so for a paper updated after the cap
-the abstract is left out, and the PDF to read is the first version's. Version
-1 is the only version whose date the feed gives besides the latest.
+title and abstract belong to the latest version, so for a paper updated after
+the cap both are left out (`withheld` says why), and the PDF to read is the
+first version's. Version 1 is the only version whose date the feed gives
+besides the latest.
+
+A date with no time zone cannot be placed against the cap, so it raises
+`SourceUnavailable`, as any reply the filter cannot read does.
 """
 
 import re
@@ -16,7 +20,7 @@ from xml.etree import ElementTree
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from minilab.literature.http import LiteratureHttp, SourceUnavailable
+from minilab.literature.http import LiteratureHttp, SourceUnavailable, default_client
 
 API = "https://export.arxiv.org/api/query"
 ABS = "https://arxiv.org/abs/"
@@ -32,9 +36,10 @@ _SYNTAX = re.compile(r'["()\[\]:]')
 class Paper(BaseModel):
     """One arXiv paper as the filter may use it.
 
-    `summary` is None when the paper was revised after the cap: the feed's
-    abstract may come from a version the cap excludes. `pdf_url` is the
-    version to read: the latest, or version 1 when the latest is after the cap.
+    `title` and `summary` are None when the paper was revised after the cap:
+    the feed's title and abstract may come from a version the cap excludes,
+    and `withheld` says so. `pdf_url` is the version to read: the latest, or
+    version 1 when the latest is after the cap.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -42,8 +47,9 @@ class Paper(BaseModel):
     arxiv_id: str
     version: int = Field(ge=1)
     """The latest version."""
-    title: str
+    title: str | None
     summary: str | None
+    withheld: str | None
     published: datetime
     """When version 1 was posted."""
     updated: datetime
@@ -73,9 +79,12 @@ def _text(entry: ElementTree.Element, tag: str) -> str:
 
 def _when(entry: ElementTree.Element, tag: str) -> datetime:
     try:
-        return datetime.fromisoformat(_text(entry, tag))
+        when = datetime.fromisoformat(_text(entry, tag))
     except ValueError as exc:
         raise SourceUnavailable(f"arXiv: an entry's {tag} is not a date") from exc
+    if when.tzinfo is None:
+        raise SourceUnavailable(f"arXiv: an entry's {tag} has no time zone: {_text(entry, tag)}")
+    return when
 
 
 def _paper(entry: ElementTree.Element, before: date | None) -> Paper | None:
@@ -91,8 +100,13 @@ def _paper(entry: ElementTree.Element, before: date | None) -> Paper | None:
     return Paper(
         arxiv_id=arxiv_id,
         version=version,
-        title=_text(entry, "title"),
+        title=None if revised else _text(entry, "title"),
         summary=None if revised else _text(entry, "summary"),
+        withheld=(
+            f"title and abstract withheld: revised on {updated:%Y-%m-%d}, after the cap {before}"
+            if revised
+            else None
+        ),
         published=published,
         updated=updated,
         revised_after_cap=revised,
@@ -116,7 +130,7 @@ def search_arxiv(
     expression = query
     if before is not None:
         expression = f"({query}) AND submittedDate:[190001010000 TO {before:%Y%m%d}2359]"
-    body = (client or LiteratureHttp()).get(
+    body = (client or default_client()).get(
         API,
         {
             "search_query": expression,

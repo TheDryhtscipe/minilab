@@ -18,7 +18,13 @@ import tempfile
 from pathlib import Path
 
 import minilab
-from minilab.literature.http import HostNotAllowed, LiteratureHttp, SourceUnavailable, check_url
+from minilab.literature.http import (
+    HostNotAllowed,
+    LiteratureHttp,
+    SourceUnavailable,
+    check_url,
+    default_client,
+)
 
 PDF_HOST = "arxiv.org"
 MAX_PDF_BYTES = 64 * 1024**2
@@ -122,5 +128,5 @@ def pdf_text(
     directory = cache_dir if cache_dir is not None else default_cache_dir()
     target = directory / f"{hashlib.sha256(url.encode()).hexdigest()[:32]}.pdf"
     if not target.is_file():
-        _download(url, target, client or LiteratureHttp())
+        _download(url, target, client or default_client())
     return _convert(target, timeout_s)
