@@ -4,12 +4,17 @@
 "Constraints" and "Generator"):
 
 - Gemini generates only. Any other role for `Family.gemini` is refused.
-- The pair's token budget is checked before the call. The check, the call,
-  and the ledger charge run inside one `Ledger.pair_lock`, so two processes
-  on the same pair cannot both pass the check and then overrun the budget.
-  The lock does not nest: never call `call` while holding the pair's lock.
-  A call is refused once the pair's spend is at or over its budget, so the
-  last call that is let through can overrun the budget by its own tokens.
+- The pair's token budget is checked before the call. Inside one
+  `Ledger.pair_lock` the adapter checks the pair's spend, which counts the
+  reservations of calls still in flight, and reserves tokens for this call:
+  the prompt's estimate plus `Budget.reserve_output_tokens`. Then it releases
+  the lock and makes the call, so other calls on the pair can run at the same
+  time. Afterwards the call's charge settles the reservation. The lock does
+  not nest: never call `call` while holding the pair's lock.
+  A call is refused once the pair's spend is at or over its budget. So the
+  pair can overrun its budget by the last admitted call's tokens, plus, for
+  each call that was in flight with it, what that call spent beyond its
+  reservation.
 - Every call runs isolated: a fresh empty temporary working directory, removed
   afterwards, and an environment reduced to an allowlist, so no
   `ANTHROPIC_*` or other credential or tool-routing variable reaches the tool.
@@ -18,7 +23,9 @@
   is charged as an estimate: input is the larger of the tokens the tool
   reported and the prompt's estimate, output is what the tool reported or
   zero. Then the exception is raised again. A call that failed before the
-  tool started (`ModelNotStarted`) used nothing and is not charged.
+  tool started (`ModelNotStarted`) used nothing: its reservation is released
+  and it is not charged. If the charge or the release itself fails, the
+  reservation stays open and keeps counting as spend.
   The adapter never writes to a record, so a failure leaves the record as it
   was and the run can resume.
 
@@ -37,7 +44,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from minilab.ledger import Ledger
+from minilab.ledger import MAX_TOKENS, Ledger
 from minilab.models.backends import (
     DEFAULT_TIMEOUT_S,
     Backend,
@@ -158,11 +165,15 @@ class Budget(BaseModel):
     """The token budget for one domain pair: every model call for the pair counts.
 
     It may be smaller than the run manifest's budget, never larger.
+    `reserve_output_tokens` is the output each call reserves on top of its
+    prompt's estimate while it runs. A call that writes more than this can
+    push the pair further over its budget when other calls run beside it.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     tokens_per_pair: int = Field(gt=0)
+    reserve_output_tokens: int = Field(default=32_000, ge=0, le=MAX_TOKENS)
 
     @classmethod
     def from_manifest(cls, manifest: RunManifest) -> "Budget":
@@ -276,44 +287,54 @@ def call(
     if backend.family != family:
         raise ValueError(f"the backend for {family} is a {backend.family} backend")
     stage = ROLE_STAGE[role]
+    reserve = min(estimate_tokens(prompt) + budget.reserve_output_tokens, MAX_TOKENS)
     with ledger.pair_lock(pair):
         spend = ledger.pair_spend(pair)
         if spend >= budget.tokens_per_pair:
             raise BudgetExceeded(
                 f"pair {pair} has spent {spend} of {budget.tokens_per_pair} tokens"
             )
-        started = time.monotonic()
-        try:
-            reply = isolated_run(backend, prompt, timeout_s=timeout_s)
-        except ModelNotStarted:
-            raise
-        except BaseException as exc:
-            reported_in = exc.tokens_in if isinstance(exc, ModelUnavailable) else None
-            reported_out = exc.tokens_out if isinstance(exc, ModelUnavailable) else None
-            try:
-                ledger.charge(
-                    pair=pair,
-                    stage=stage,
-                    family=family,
-                    tokens_in=max(reported_in or 0, estimate_tokens(prompt)),
-                    tokens_out=reported_out or 0,
-                    seconds=time.monotonic() - started,
-                    estimated=True,
-                    record_id=record_id,
-                )
-            except Exception as charge_exc:
-                exc.add_note(f"charging this failed call also failed: {charge_exc!r}")
-            raise
-        ledger.charge(
-            pair=pair,
-            stage=stage,
-            family=family,
-            tokens_in=reply.tokens_in,
-            tokens_out=reply.tokens_out,
-            seconds=time.monotonic() - started,
-            estimated=reply.estimated,
-            record_id=record_id,
+        reservation = ledger.reserve(
+            pair=pair, stage=stage, family=family, tokens=reserve, record_id=record_id
         )
+    started = time.monotonic()
+    try:
+        reply = isolated_run(backend, prompt, timeout_s=timeout_s)
+    except ModelNotStarted as exc:
+        try:
+            ledger.release(reservation)
+        except Exception as release_exc:
+            exc.add_note(f"releasing this call's reservation also failed: {release_exc!r}")
+        raise
+    except BaseException as exc:
+        reported_in = exc.tokens_in if isinstance(exc, ModelUnavailable) else None
+        reported_out = exc.tokens_out if isinstance(exc, ModelUnavailable) else None
+        try:
+            ledger.charge(
+                pair=pair,
+                stage=stage,
+                family=family,
+                tokens_in=max(reported_in or 0, estimate_tokens(prompt)),
+                tokens_out=reported_out or 0,
+                seconds=time.monotonic() - started,
+                estimated=True,
+                record_id=record_id,
+                reservation=reservation,
+            )
+        except Exception as charge_exc:
+            exc.add_note(f"charging this failed call also failed: {charge_exc!r}")
+        raise
+    ledger.charge(
+        pair=pair,
+        stage=stage,
+        family=family,
+        tokens_in=reply.tokens_in,
+        tokens_out=reply.tokens_out,
+        seconds=time.monotonic() - started,
+        estimated=reply.estimated,
+        record_id=record_id,
+        reservation=reservation,
+    )
     return reply
 
 

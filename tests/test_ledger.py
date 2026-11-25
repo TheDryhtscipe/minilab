@@ -692,3 +692,141 @@ def test_ledger_write_cut_short_is_refused_not_joined(store: RecordStore, tmp_pa
         ledger.entries()
     with pytest.raises(CorruptLedger, match="incomplete"):
         _charge(ledger, record_id="run-1.a", tokens_in=1)
+
+
+# --- Reservations (minilab-294360) -------------------------------------------------------
+
+
+def _reserve(
+    ledger: Ledger,
+    tokens: int,
+    *,
+    record_id: str | None = None,
+    pair: tuple[str, str] = PAIR,
+    family: Family = Family.claude,
+) -> str:
+    return ledger.reserve(
+        pair=pair, stage=Stage.encoding, family=family, tokens=tokens, record_id=record_id
+    )
+
+
+def test_open_reservation_counts_until_settled(store: RecordStore) -> None:
+    ledger = _ledger(store)
+    reservation = _reserve(ledger, 500)
+    assert ledger.pair_spend(PAIR) == 500
+    assert [r.id for r in ledger.open_reservations()] == [reservation]
+    ledger.charge(
+        pair=PAIR, stage=Stage.encoding, family=Family.claude, tokens_in=30, tokens_out=7,
+        seconds=1.0, estimated=False, reservation=reservation,
+    )
+    assert ledger.pair_spend(PAIR) == 37
+    assert ledger.open_reservations() == []
+
+
+def test_released_reservation_costs_nothing(store: RecordStore) -> None:
+    ledger = _ledger(store)
+    reservation = _reserve(ledger, 500)
+    ledger.release(reservation)
+    assert ledger.pair_spend(PAIR) == 0
+    assert ledger.open_reservations() == []
+    assert cost_report(store, ledger, RUN).total_tokens == 0
+
+
+def test_reservation_is_settled_at_most_once(store: RecordStore) -> None:
+    ledger = _ledger(store)
+    reservation = _reserve(ledger, 50)
+    ledger.release(reservation)
+    with pytest.raises(ValueError, match="not open"):
+        ledger.release(reservation)
+    with pytest.raises(ValueError, match="not open"):
+        ledger.charge(
+            pair=PAIR, stage=Stage.encoding, family=Family.claude, tokens_in=1, tokens_out=0,
+            seconds=0.0, estimated=False, reservation=reservation,
+        )
+    with pytest.raises(ValueError, match="not open"):
+        ledger.release("0" * 32)
+    assert len(ledger.entries()) == 2
+
+
+def test_settling_charge_must_match_the_reservation(store: RecordStore) -> None:
+    ledger = _ledger(store)
+    reservation = _reserve(ledger, 50)
+    with pytest.raises(ValueError, match="pair"):
+        ledger.charge(
+            pair=OTHER_PAIR, stage=Stage.encoding, family=Family.claude, tokens_in=1,
+            tokens_out=0, seconds=0.0, estimated=False, reservation=reservation,
+        )
+    with pytest.raises(ValueError, match="family"):
+        ledger.charge(
+            pair=PAIR, stage=Stage.encoding, family=Family.codex, tokens_in=1,
+            tokens_out=0, seconds=0.0, estimated=False, reservation=reservation,
+        )
+    assert ledger.pair_spend(PAIR) == 50
+
+
+def test_reserve_refuses_what_charge_refuses(store: RecordStore) -> None:
+    store.create(_record("a", pair=OTHER_PAIR))
+    ledger = _ledger(store)
+    with pytest.raises(ValueError, match="pair"):
+        _reserve(ledger, 1, record_id="run-1.a")
+    with pytest.raises(ValueError, match="manifest"):
+        _reserve(ledger, 1, pair=("kernels", "optimisation"))
+    with pytest.raises(ValidationError):
+        _reserve(ledger, -1)
+    assert ledger.entries() == []
+
+
+def test_open_reservation_is_an_estimated_cost(store: RecordStore) -> None:
+    store.create(_record("a"))
+    ledger = _ledger(store)
+    _reserve(ledger, 40, record_id="run-1.a", family=Family.codex)
+    _reserve(ledger, 60)
+    report = cost_report(store, ledger, RUN)
+    assert report.total_tokens == 100
+    assert report.unattributed_tokens == 60
+    assert report.has_estimates
+    costs = ledger.costs("run-1.a")
+    assert costs.tokens[Family.codex] == TokenCount(tokens_in=40, tokens_out=0, estimated=True)
+
+
+def test_settling_an_unknown_reservation_on_disk_is_corrupt(
+    store: RecordStore, tmp_path: Path
+) -> None:
+    ledger = _ledger(store)
+    reservation = _reserve(ledger, 5)
+    ledger.release(reservation)
+    path = tmp_path / "runs" / RUN / "ledger.jsonl"
+    release_line = path.read_bytes().splitlines()[1] + b"\n"
+    path.write_bytes(path.read_bytes() + release_line)
+    with pytest.raises(CorruptLedger, match="line 3"):
+        ledger.entries()
+
+
+def _release_once(root: str, start: Event, reservation: str, results: "Queue[str]") -> None:
+    start.wait()
+    ledger = Ledger(RecordStore(Path(root)), RUN)
+    try:
+        ledger.release(reservation)
+        results.put("released")
+    except ValueError:
+        results.put("refused")
+
+
+def test_concurrent_settles_of_one_reservation_have_one_winner(store: RecordStore) -> None:
+    ledger = _ledger(store)
+    reservation = _reserve(ledger, 5)
+    start = _FORK.Event()
+    results: Queue[str] = _FORK.Queue()
+    workers = [
+        _FORK.Process(target=_release_once, args=(str(store.root), start, reservation, results))
+        for _ in range(6)
+    ]
+    for worker in workers:
+        worker.start()
+    start.set()
+    for worker in workers:
+        worker.join(timeout=60)
+        assert worker.exitcode == 0
+    outcomes = sorted(results.get(timeout=5) for _ in workers)
+    assert outcomes == ["refused"] * 5 + ["released"]
+    ledger.entries()
