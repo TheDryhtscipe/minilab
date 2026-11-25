@@ -9,3 +9,4 @@ __pycache__/
 state/.*.lock
 state/.*.tmp
 .orc/
+lean/MinilabCheck_*.lean
