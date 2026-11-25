@@ -43,7 +43,7 @@ from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
-from minilab.formalise.formaliser import Binder, FormalOutput, strip_comments
+from minilab.formalise.formaliser import Binder, FormalOutput, lean_view
 from minilab.formalise.vacuity import VacuityResult
 from minilab.ledger import Ledger
 from minilab.models.adapter import Budget, Role, call, pick_checker
@@ -175,9 +175,9 @@ Assumptions:
 {assumptions or "  (none)"}
 Domain of validity: {record.domain_of_validity}
 
-The Lean file:
+The Lean file, as Lean prints it (definitions, then the theorem):
 ```lean
-{strip_comments(formal.source).strip()}
+{lean_view(formal)}
 ```
 
 Judge each of these hypotheses of `{formal.theorem}`:

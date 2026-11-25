@@ -35,8 +35,9 @@ declaration other than the root one whose name ends in `conjecture`, any
 attribute,
 `instance`, `variable`, `unsafe`, `partial`, `set_option`, `native_decide`,
 `eval%`, `plausible`, Aesop rule clauses, `decide` with a configuration, an
-interpolated string, and any `do` block. Every `namespace` and `section`
-must be closed. Lean checks the file with auto-bound implicits off
+interpolated string, a string or character literal, any comment left after
+the Python reader removed them (Lean's lexer finds it), and any `do` block.
+Every `namespace` and `section` must be closed. Lean checks the file with auto-bound implicits off
 (`CHECK_OPTIONS`, given on Lean's command line).
 
 `formal_from_source` then compiles the file once, with a probe appended. The
@@ -44,9 +45,12 @@ probe finds `conjecture` in Lean's environment and prints each binder written
 before its colon: name, type, whether it is a proposition (a hypothesis),
 whether it is an instance binder, which earlier binders its type mentions,
 and which file definitions. It also prints the conclusion (which keeps any
-`∀` or `→` after the colon) and the definitions the file wrote. These come
-from Lean's own elaborated statement, not from reading the text, so the
-vacuity linter and the hypothesis audit work on what Lean will prove. The
+`∀` or `→` after the colon) and the definitions the file wrote, each
+printed whole (`def N : T := V`, or a type with its constructors). These
+come from Lean's own elaborated statement, not from reading the text, so
+the vacuity linter and the hypothesis audit work on what Lean will prove,
+and the audit and round-trip prompts show only what Lean printed
+(`lean_view`), never the source. The
 linter treats only the propositions before the colon as hypotheses: a
 condition inside a variable's type (a subtype, a set, a structure's field)
 or a premise after the colon is not one of them. Each
@@ -122,14 +126,17 @@ class Binder(BaseModel):
 class FormalOutput(BaseModel):
     """One formalisation: the Lean source and what the probe found in it.
 
-    `lean_statement` is the text of `conjecture` without its proof, as Lean
-    parsed it (`command_check`); the text reading `lean_statement` only when
-    Lean did not find it.
+    `lean_statement` is `conjecture` without its proof, as Lean printed it
+    (`statement_text`). When the probe did not run, it is the text Lean
+    parsed as `conjecture` (`command_check`), or else the text reading
+    `lean_statement`.
     `binders` are the binders before the colon; `conclusion` is the rest.
     `definitions` are the file's `def`s and the types it declares
     (`inductive`, `structure`, `class inductive`); `types` lists the latter.
     `definition_uses` maps each file definition to the file definitions its
-    value (a type's: its constructors) mentions. `problems` says why the
+    value (a type's: its constructors) mentions, and `definition_text` to
+    the definition as Lean printed it. `opens` are the namespaces whose
+    scoped declarations were active at `conjecture`. `problems` says why the
     file is not `ok`. `attempts` counts the model calls that led to this
     file.
     """
@@ -149,6 +156,8 @@ class FormalOutput(BaseModel):
     definitions: list[str]
     types: list[str] = []
     definition_uses: dict[str, list[str]] = {}
+    definition_text: dict[str, str] = {}
+    opens: list[str] = []
     ok: bool
     problems: list[str]
     attempts: int = 1
@@ -162,8 +171,35 @@ class FormalOutput(BaseModel):
 # --- reading the source ---
 
 
-def _ident_char(ch: str) -> bool:
-    return ch.isalnum() or ch in "_'!?"
+def _letterlike(ch: str) -> bool:
+    """Lean's `isLetterLike`: Greek (not λ, Π, Σ), Coptic, letter-like symbols, script."""
+    c = ord(ch)
+    return (
+        (0x3B1 <= c <= 0x3C9 and c != 0x3BB)
+        or (0x391 <= c <= 0x3A9 and c not in (0x3A0, 0x3A3))
+        or 0x3CA <= c <= 0x3FB
+        or 0x1F00 <= c <= 0x1FFE
+        or 0x2100 <= c <= 0x214F
+        or 0x1D49C <= c <= 0x1D59F
+    )
+
+
+def _ident_first(ch: str) -> bool:
+    """Lean's `isIdFirst`: an ASCII letter, `_`, or a letter-like character."""
+    return (ch.isascii() and ch.isalpha()) or ch == "_" or _letterlike(ch)
+
+
+def _ident_rest(ch: str) -> bool:
+    """Lean's `isIdRest`: an identifier's later characters, subscripts included."""
+    c = ord(ch)
+    return (
+        _ident_first(ch)
+        or (ch.isascii() and ch.isdigit())
+        or ch in "'!?"
+        or 0x2080 <= c <= 0x2089
+        or 0x2090 <= c <= 0x209C
+        or 0x1D62 <= c <= 0x1D6A
+    )
 
 
 _CHAR_LITERAL = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]+\}|.)|[^'\\\n])'")
@@ -175,11 +211,16 @@ def _scan(source: str) -> tuple[str, str]:
 
     The two texts have the same length, so a position found in the second
     names the same place in the first. Newlines inside comments and strings
-    are kept, so line numbers do not change.
+    are kept, so line numbers do not change. A `'` starts a character
+    literal unless it continues an identifier, as in Lean: `!` alone is a
+    token, so `!'"'` is `!` and the literal `'"'`. This reader only gives
+    the model reasons it can act on; Lean's own lexer refuses every comment
+    and literal (`command_check`).
     """
     kept: list[str] = []
     code: list[str] = []
     i, n = 0, len(source)
+    in_ident = False
     while i < n:
         if source.startswith("--", i):
             end = source.find("\n", i)
@@ -199,6 +240,7 @@ def _scan(source: str) -> tuple[str, str]:
             kept.append(filler)
             code.append(filler)
             i = j
+            in_ident = False
             continue
         if source[i] == "«":
             # A quoted identifier: opaque, so a `"` inside it opens no string.
@@ -208,9 +250,9 @@ def _scan(source: str) -> tuple[str, str]:
             kept.append(text)
             code.append("".join(ch if ch in "«»\n" else "x" for ch in text))
             i = end
+            in_ident = True
             continue
-        before = source[i - 1] if i else " "
-        raw = _RAW_STRING.match(source, i) if not _ident_char(before) else None
+        raw = _RAW_STRING.match(source, i) if not in_ident else None
         if raw is not None:
             close = '"' + raw.group(1)
             end = source.find(close, raw.end())
@@ -219,6 +261,7 @@ def _scan(source: str) -> tuple[str, str]:
             kept.append(text)
             code.append(_blank(text))
             i = end
+            in_ident = False
             continue
         if source[i] == '"':
             j = i + 1
@@ -229,14 +272,16 @@ def _scan(source: str) -> tuple[str, str]:
             kept.append(text)
             code.append('"' + _blank(text[1:-1]) + '"' if len(text) > 1 else text)
             i = end
+            in_ident = False
             continue
-        if source[i] == "'" and not _ident_char(before):
+        if source[i] == "'" and not in_ident:
             found = _CHAR_LITERAL.match(source, i)
             if found is not None:
                 kept.append(found.group())
                 code.append(_blank(found.group()))
                 i = found.end()
                 continue
+        in_ident = _ident_rest(source[i]) if in_ident else _ident_first(source[i])
         kept.append(source[i])
         code.append(source[i])
         i += 1
@@ -437,7 +482,8 @@ def _command_check(source: str, marker: str) -> str:
     allowlist). Lean parses it with Mathlib's syntax and elaborates only its
     `open`, `namespace`, `section` and `end` commands (so scoped notation
     parses). It prints `PROBLEM` for each refusal, then `ARITY` (how many
-    binders `conjecture` has before its colon, or null), then `DONE`.
+    binders `conjecture` has before its colon, or null), `STATEMENT`,
+    `OPENS`, then `DONE`.
     """
     return (
         "import Mathlib\n\n"
@@ -462,6 +508,9 @@ class CommandCheck(NamedTuple):
     statement: str | None
 
 
+_NAMES: TypeAdapter[list[str]] = TypeAdapter(list[str])
+
+
 def command_check(source: str, *, timeout_s: float = DEFAULT_LEAN_TIMEOUT_S) -> CommandCheck:
     """What the file may not use, how many binders `conjecture` has, and its statement.
 
@@ -474,12 +523,21 @@ def command_check(source: str, *, timeout_s: float = DEFAULT_LEAN_TIMEOUT_S) -> 
     `open` must be inside a `section` or `namespace`, no declaration may
     have a name Lean treats as internal, and every `namespace` and `section`
     must be closed. Only the root `conjecture` may have that last name; one
-    inside a `section` counts. The statement is the text Lean parsed as
-    `conjecture`, from its first token to the end of its type.
+    inside a `section` counts. The Python reader removes comments first
+    (`checked_source`); Lean's lexer then refuses any comment left in the
+    text, doc comments too, and every string and character literal. So a
+    trick that fools the Python reader cannot keep a comment in the file. The statement is
+    the text Lean parsed as `conjecture`, from its first token to the end of
+    its type.
     No model code runs in any Lean check, since the guard turns code
     generation off; the allowlist is a second guard that gives the model a
     reason it can act on. Raise LeanTimeout if Lean hits `timeout_s`.
     """
+    return _command_check_run(source, timeout_s)[0]
+
+
+def _command_check_run(source: str, timeout_s: float) -> tuple[CommandCheck, list[str]]:
+    """`command_check`, and the namespaces whose scoped declarations are active at `conjecture`."""
     text = checked_source(source).encode("utf-8")
     marker = f"MINILAB_CMD_{secrets.token_hex(8)}_"
     result = check_lean(
@@ -490,6 +548,7 @@ def command_check(source: str, *, timeout_s: float = DEFAULT_LEAN_TIMEOUT_S) -> 
     problems: list[str] = []
     arity: int | None = None
     statement: str | None = None
+    opens: list[str] = []
     done = 0
     for tag, payload in marker_messages(result, 0, marker):
         try:
@@ -509,11 +568,16 @@ def command_check(source: str, *, timeout_s: float = DEFAULT_LEAN_TIMEOUT_S) -> 
                 continue
             if 0 <= start <= end <= len(text):
                 statement = text[start:end].decode("utf-8", "replace").strip()
+        elif tag == "OPENS":
+            try:
+                opens = _NAMES.validate_python(value)
+            except ValidationError:
+                problems.append("the command check's opens could not be read")
         elif tag == "DONE":
             done += 1
     if done != 1:
         problems.append("the command check did not finish: " + "; ".join(result.errors)[:1000])
-    return CommandCheck(problems, arity, statement)
+    return CommandCheck(problems, arity, statement), opens
 
 
 # --- the probe ---
@@ -530,15 +594,18 @@ def new_nonce() -> str:
     return secrets.token_hex(8)
 
 
-def probe(marker: str, arity: int) -> str:
+def probe(marker: str, arity: int, opens: list[str] | None = None) -> str:
     """The command appended after the model's source; see `formal_from_source`.
 
     The probe is the guard's `#minilab_probe` (`lean/Minilab/Guard.lean`),
     compiled when the guard is built. It finds `conjecture` in Lean's
     environment and prints each of its first `arity` binders, its
-    conclusion, and the file's definitions.
+    conclusion, and the file's definitions. `opens` are the namespaces the
+    command check found active at `conjecture`; their scoped instances are
+    active while the probe checks instance arguments.
     """
-    return f"\n#minilab_probe {lean_string_literal(marker)} {arity}\n"
+    names = lean_string_literal(json.dumps(opens or [], ensure_ascii=False))
+    return f"\n#minilab_probe {lean_string_literal(marker)} {arity} {names}\n"
 
 
 class _RawBinder(BaseModel):
@@ -577,6 +644,8 @@ class _RawDef(BaseModel):
     type: bool
     sorry: bool
     uses: list[str]
+    text: str
+    truncated: bool
 
 
 def _foreign_problem(where: str, shown: str) -> str:
@@ -684,7 +753,7 @@ def formal_from_source(
     problems = source_problems(source)
     if problems:
         return refused(problems)
-    problems, arity, parsed = command_check(source, timeout_s=timeout_s)
+    (problems, arity, parsed), opens = _command_check_run(source, timeout_s)
     if parsed is not None:
         statement = parsed
     if not problems and arity is None:
@@ -694,7 +763,7 @@ def formal_from_source(
     body = checked_source(source)
     source_lines = body.count("\n")
     marker = f"{PROBE_PREFIX}{new_nonce()}_"
-    result = check_lean(body + probe(marker, arity), timeout_s, options=CHECK_OPTIONS)
+    result = check_lean(body + probe(marker, arity, opens), timeout_s, options=CHECK_OPTIONS)
     if result.timed_out:
         raise LeanTimeout(f"Lean did not finish the formaliser check in {timeout_s} s")
     problems = source_errors(result, source_lines)
@@ -765,6 +834,10 @@ def formal_from_source(
         )
         for b, label in zip(raw_binders, binder_labels([b.name for b in raw_binders]), strict=True)
     ]
+    if raw_body is not None and len(binders) == arity:
+        statement = statement_text(
+            binders, raw_body.type + (CUT if raw_body.truncated else ""), opens
+        )
     return FormalOutput(
         family=family,
         model=model,
@@ -778,10 +851,57 @@ def formal_from_source(
         definitions=[d.name for d in raw_defs],
         types=[d.name for d in raw_defs if d.type],
         definition_uses={d.name: [u for u in d.uses if u != d.name] for d in raw_defs},
+        definition_text={d.name: d.text + (CUT if d.truncated else "") for d in raw_defs},
+        opens=opens,
         ok=not problems,
         problems=problems,
         attempts=attempts,
     )
+
+
+# --- what Lean printed ---
+
+CUT = " …(cut)"
+"""Marks text the probe cut to its length limit."""
+
+
+def _binder_text(binder: Binder) -> str:
+    name = binder.name or "_"
+    shown = binder.type + (CUT if binder.truncated else "")
+    return f"[{name} : {shown}]" if binder.instance else f"({name} : {shown})"
+
+
+def statement_text(binders: list[Binder], conclusion: str, opens: list[str]) -> str:
+    """`conjecture` without its proof, built from what Lean printed.
+
+    Lean printed the types after the file, where no `open` is in force, so a
+    name an `open` brought in is printed in full. `opens` are shown as
+    `open scoped … in`: their scoped instances and notation were active
+    when Lean read the statement.
+    """
+    head = f"open scoped {' '.join(opens)} in\n" if opens else ""
+    parts = " ".join(_binder_text(b) for b in binders)
+    return f"{head}theorem {THEOREM}{' ' + parts if parts else ''} :\n    {conclusion}"
+
+
+def lean_view(formal: FormalOutput) -> str:
+    """The formalisation as Lean printed it: each definition, then the statement.
+
+    This is what the audit and round-trip prompts show, never the model's
+    source text (user decision, doc-xwa decision 13). Lean printed every
+    part from its elaborated terms, so a comment, a string, or any other
+    text in the source cannot reach a prompt. Names still can: they are the
+    model's own.
+    """
+    parts = [formal.definition_text.get(d, f"def {d} : (not printed)") for d in formal.definitions]
+    parts.append(
+        statement_text(
+            formal.binders,
+            formal.conclusion + (CUT if formal.conclusion_truncated else ""),
+            formal.opens,
+        )
+    )
+    return "\n\n".join(parts)
 
 
 # --- the model call ---
@@ -826,7 +946,8 @@ Rules for the file:
   theorem in a `namespace`.
 - Use Mathlib's usual instances: build no instance in a statement
   (`haveI`, `letI`, `⟨…⟩` or `@` in an instance argument).
-- Write no comments and no string literals. Use plain names, never `«…»`.
+- Write no comments, no string literals, and no character literals. Use
+  plain names, never `«…»`.
   Use no `axiom`, `set_option`, `macro`, `notation`, or `#eval`, and no
   name containing "minilab".
 

@@ -221,8 +221,6 @@ def _program(terms: list[tuple[str, str, bool]], nonce: str, arity: int) -> str:
     )
 
 
-_IDENT = re.compile(r"^[^\W\d][\w'.!?]*$")
-
 _OPTIONS = """set_option autoImplicit false in
 set_option linter.unusedTactic false in
 set_option linter.unreachableTactic false in
@@ -298,7 +296,7 @@ def vacuity(
     if witness is not None:
         terms, notes = witness_terms(formal, witness)
     # A type cannot be unfolded by `simp`; naming one is an error.
-    defs = [_quoted(d) for d in formal.definitions if _IDENT.match(d) and d not in formal.types]
+    defs = [_quoted(d) for d in formal.definitions if d not in formal.types]
     nonce = new_nonce()
     contra = f"{CONTRA}_{nonce}"
 
