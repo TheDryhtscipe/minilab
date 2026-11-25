@@ -43,8 +43,10 @@ import math
 import os
 import re
 import secrets
+import selectors
 import signal
 import subprocess
+import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Protocol
@@ -62,6 +64,18 @@ DEFAULT_TIMEOUT_S = 900.0
 
 KILL_WAIT_S = 5.0
 """After a timeout kills the tool, how long to wait for its output pipes to close."""
+
+MAX_OUTPUT_BYTES = 16 * 2**20
+"""Most bytes of standard output one tool call may print. Past this the call fails.
+
+A reply of 16 MiB is about 4 million tokens, far more than any model writes in
+one call. Peak memory for one call is a few times this (the bytes, then the
+decoded text)."""
+
+STDERR_KEEP_BYTES = 64 * 2**10
+"""Bytes kept from the end of a tool's standard error; the rest is read and dropped."""
+
+_READ_CHUNK = 2**16
 
 SYSTEM_PROMPT = (
     "You are a careful research mathematician. You have no tools: answer from your own "
@@ -128,6 +142,14 @@ def _tail(text: str, limit: int = 500) -> str:
     return text if len(text) <= limit else "..." + text[-limit:]
 
 
+class OutputTooLarge(ModelUnavailable):
+    """The tool printed more than `MAX_OUTPUT_BYTES` bytes, so the call was stopped.
+
+    `tokens_out` estimates the output read so far, at `CHARS_PER_TOKEN` bytes
+    per token, so the adapter charges it.
+    """
+
+
 class ToolExit(ModelUnavailable):
     """The tool started and exited non-zero. `stdout` is what it printed."""
 
@@ -166,6 +188,11 @@ def run_command(
     `KILL_WAIT_S` seconds rather than waited on. Raise `ModelUnavailable` on a
     timeout, and `ToolExit` (a `ModelUnavailable`) on a non-zero exit; the
     message carries the end of stderr.
+
+    At most `MAX_OUTPUT_BYTES` of stdout are kept in memory. If the tool
+    prints more, its group is killed at once and `OutputTooLarge` (a
+    `ModelUnavailable`) is raised, carrying an estimate of the output tokens
+    read. Only the last `STDERR_KEEP_BYTES` of stderr are kept.
     """
     tool = argv[0] if argv else "(no command)"
     if not argv:
@@ -192,21 +219,26 @@ def run_command(
         )
     except (OSError, ValueError) as exc:
         raise ModelNotStarted(f"{tool}: cannot start: {exc}") from exc
+    max_out = MAX_OUTPUT_BYTES
     try:
         try:
-            out_b, err_b = proc.communicate(data, timeout=timeout_s)
+            out_b, err_b = _exchange(proc, data, timeout_s=timeout_s, max_out=max_out)
         except subprocess.TimeoutExpired as exc:
             _killpg(proc.pid)
-            try:
-                proc.communicate(timeout=KILL_WAIT_S)
-            except subprocess.TimeoutExpired:
-                for pipe in (proc.stdin, proc.stdout, proc.stderr):
-                    if pipe is not None:
-                        pipe.close()
-                proc.wait()
+            _drain_then_close(proc)
             raise ModelUnavailable(f"{tool}: timed out after {timeout_s} s") from exc
+        except _Overflow as exc:
+            _killpg(proc.pid)
+            _drain_then_close(proc, read=False)
+            err = exc.err.decode("utf-8", errors="replace")
+            raise OutputTooLarge(
+                f"{tool}: printed more than {max_out} bytes; stopped: {_tail(err)}",
+                tokens_out=math.ceil(exc.read / CHARS_PER_TOKEN),
+            ) from exc
     finally:
         _killpg(proc.pid)
+        if proc.returncode is None:
+            _drain_then_close(proc, read=False)
     out = out_b.decode("utf-8", errors="replace")
     err = err_b.decode("utf-8", errors="replace")
     if proc.returncode != 0:
@@ -214,6 +246,95 @@ def run_command(
             f"{tool}: exit {proc.returncode}: {_tail(err) or _tail(out)}", stdout=out
         )
     return out
+
+
+class _Overflow(Exception):
+    """Standard output passed its cap. `read` is the bytes of it read; `err` is stderr's tail."""
+
+    def __init__(self, read: int, err: bytes) -> None:
+        super().__init__(read)
+        self.read = read
+        self.err = err
+
+
+def _exchange(
+    proc: "subprocess.Popen[bytes]", data: bytes, *, timeout_s: float, max_out: int
+) -> tuple[bytes, bytes]:
+    """Write `data` to the tool's stdin and read its stdout and stderr until both close.
+
+    Like `Popen.communicate`, but stdout is capped at `max_out` bytes (raise
+    `_Overflow` past it) and only the end of stderr is kept. Raise
+    `subprocess.TimeoutExpired` if the pipes are still open after `timeout_s`
+    seconds. Wait for the tool to exit before returning.
+    """
+    assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+    deadline = time.monotonic() + timeout_s
+    out = bytearray()
+    err = bytearray()
+    sent = 0
+    with selectors.DefaultSelector() as sel:
+        if data:
+            os.set_blocking(proc.stdin.fileno(), False)
+            sel.register(proc.stdin, selectors.EVENT_WRITE)
+        else:
+            proc.stdin.close()
+        sel.register(proc.stdout, selectors.EVENT_READ)
+        sel.register(proc.stderr, selectors.EVENT_READ)
+        while sel.get_map():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise subprocess.TimeoutExpired(proc.args, timeout_s)
+            for key, _ in sel.select(left):
+                pipe = key.fileobj
+                if pipe is proc.stdin:
+                    try:
+                        sent += os.write(proc.stdin.fileno(), data[sent : sent + _READ_CHUNK])
+                    except BlockingIOError:
+                        continue
+                    except BrokenPipeError:
+                        sent = len(data)
+                    if sent >= len(data):
+                        sel.unregister(proc.stdin)
+                        proc.stdin.close()
+                    continue
+                fd = key.fd
+                chunk = os.read(fd, _READ_CHUNK)
+                if not chunk:
+                    sel.unregister(pipe)
+                    continue
+                if pipe is proc.stdout:
+                    out += chunk
+                    if len(out) > max_out:
+                        raise _Overflow(len(out), bytes(err))
+                else:
+                    err += chunk
+                    if len(err) > STDERR_KEEP_BYTES:
+                        del err[: len(err) - STDERR_KEEP_BYTES]
+    # The pipes closed, so the tool is exiting: allow it a moment even at the deadline.
+    left = deadline - time.monotonic()
+    try:
+        proc.wait(timeout=max(left, 0.1))
+    except subprocess.TimeoutExpired:
+        raise subprocess.TimeoutExpired(proc.args, timeout_s) from None
+    return bytes(out), bytes(err)
+
+
+def _drain_then_close(proc: "subprocess.Popen[bytes]", *, read: bool = True) -> None:
+    """After the group was killed: close the pipes and reap the tool.
+
+    With `read`, first discard what is left on stdout and stderr for up to
+    `KILL_WAIT_S` seconds, so the pipes close cleanly; a child that left the
+    group and still holds them is not waited on longer than that.
+    """
+    if read:
+        try:
+            _exchange(proc, b"", timeout_s=KILL_WAIT_S, max_out=MAX_OUTPUT_BYTES)
+        except (subprocess.TimeoutExpired, _Overflow, OSError, ValueError):
+            pass
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        if pipe is not None:
+            pipe.close()
+    proc.wait()
 
 
 def _run_and_parse(
