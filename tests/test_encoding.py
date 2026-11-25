@@ -10,6 +10,7 @@ import time
 from fractions import Fraction
 from pathlib import Path
 
+import mpmath
 import pytest
 
 import minilab.certify.check as check_module
@@ -19,6 +20,7 @@ from minilab.encoding.sandbox import (
     Call,
     ForbiddenSource,
     Sandboxed,
+    SandboxFailure,
     check_source,
     run_encoding,
     run_unchecked,
@@ -157,6 +159,16 @@ def test_encoding_sandbox_timeout_and_no_network() -> None:
     [result] = out.results
     assert result.error is not None
     assert "OSError" in result.error or "unreachable" in result.error
+    links = minimal(
+        "import os\n"
+        "names = [line.split(':')[0].strip() for line in open('/proc/net/dev').readlines()[2:]]\n"
+        "if names != ['lo']:\n"
+        "    raise RuntimeError('interfaces: ' + ', '.join(names))\n"
+        "return mpmath.mpf(1)"
+    )
+    out = run_unchecked(links, [Call(method="margin", point=POINT, digits=30)], timeout_s=30)
+    assert out.failure is None, out.failure
+    assert out.results[0].error is None, out.results[0].error
 
     # A timed-out encoding never gives a verdict: the kill is refused.
     cert = load("grid_gap")
@@ -176,11 +188,12 @@ def test_sandbox_hides_files_and_blocks_writes() -> None:
         "        seen.append(path)\n"
         "    except OSError:\n"
         "        pass\n"
-        "try:\n"
-        f"    open({str(REPO / 'sandbox-write-probe')!r}, 'w').write('x')\n"
-        "    seen.append('wrote')\n"
-        "except OSError:\n"
-        "    pass\n"
+        f"for where in ({str(REPO)!r}, {str(REPO / 'src')!r}, {str(REPO / '.venv')!r}, '/usr'):\n"
+        "    try:\n"
+        "        open(where + '/sandbox-write-probe', 'w').write('x')\n"
+        "        seen.append('wrote ' + where)\n"
+        "    except OSError:\n"
+        "        pass\n"
         "if seen:\n"
         "    raise RuntimeError('visible: ' + ', '.join(seen))\n"
         "return mpmath.mpf(1)"
@@ -189,7 +202,8 @@ def test_sandbox_hides_files_and_blocks_writes() -> None:
     assert out.failure is None, out.failure
     [result] = out.results
     assert result.error is None, result.error
-    assert not (REPO / "sandbox-write-probe").exists()
+    for where in (REPO, REPO / "src", REPO / ".venv"):
+        assert not (where / "sandbox-write-probe").exists()
 
 
 def test_each_run_is_a_fresh_process() -> None:
@@ -419,3 +433,57 @@ def test_child_rejects_precision_change() -> None:
     [result] = out.results
     assert result.error is not None
     assert "changed the working precision" in result.error
+
+
+def test_sandbox_limits_tasks_and_tmp() -> None:
+    forks = minimal(
+        "import os\n"
+        "made = 0\n"
+        "try:\n"
+        "    for _ in range(200):\n"
+        "        if os.fork() == 0:\n"
+        "            import time\n"
+        "            time.sleep(30)\n"
+        "            os._exit(0)\n"
+        "        made += 1\n"
+        "except OSError:\n"
+        "    pass\n"
+        "return mpmath.mpf(made)"
+    )
+    out = run_unchecked(forks, [Call(method="margin", point=POINT, digits=30)], timeout_s=20)
+    assert out.failure is None, out.failure
+    made = out.results[0].rebuild()
+    assert isinstance(made, mpmath.mpf)
+    assert made < 64
+
+    fill = minimal(
+        "written = 0\n"
+        "try:\n"
+        "    for i in range(20):\n"
+        "        with open(f'/tmp/f{i}', 'wb') as f:\n"
+        "            f.write(bytes(32 * 1024**2))\n"
+        "        written += 1\n"
+        "except OSError:\n"
+        "    pass\n"
+        "return mpmath.mpf(written)"
+    )
+    out = run_unchecked(fill, [Call(method="margin", point=POINT, digits=30)], timeout_s=30)
+    assert out.failure is None, out.failure
+    assert out.results[0].rebuild() == mpmath.mpf(2)
+
+
+def test_parent_never_raises() -> None:
+    long_name = "import " + "a" * 5000
+    out = run_encoding(long_name, [], timeout_s=30)
+    assert out.failure is not None and "forbidden" in out.failure
+    deep = (
+        "x = " + "-" * 50000 + "1\nENCODING = int\n"
+    )  # under the size cap; parsing raises MemoryError
+    out = run_encoding(deep, [], timeout_s=30)
+    assert out.failure is not None
+    from minilab.encoding.sandbox import CallResult
+    from minilab.encoding.wire import WireRational
+
+    forged = CallResult(value=WireRational(numerator="0x1", denominator="0x0"))
+    with pytest.raises(SandboxFailure, match="cannot be rebuilt"):
+        forged.rebuild()

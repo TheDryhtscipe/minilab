@@ -33,7 +33,9 @@ only when both independent encodings of the conjecture accept the certificate.
 process: each run is a fresh child process with a time limit, and the checker
 compares values it rebuilt itself (minilab.encoding.sandbox). That closes what
 the notes above leave open: state kept on a class or in a module, and an
-encoding that patches the other encoding or this checker. `check_certificate`
+encoding that patches the other encoding or this checker. For a `Sandboxed`
+encoding, only the child checks that the working precision is unchanged, and
+the encoding can patch the child. `check_certificate`
 also takes an in-process factory, for tests and the search; such an encoding
 can reach anything in this process.
 """

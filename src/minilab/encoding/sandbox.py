@@ -12,8 +12,10 @@ Two guards, in order:
    syntax check, so this only catches honest mistakes early.
 2. `run_encoding` runs the module in a fresh child process under bwrap: no
    network, a read-only view of the system and of the Python install, none of
-   the user's files, a private /tmp, limits on memory and output, and a time
-   limit. This is the guard that matters. bwrap was chosen over `unshare -rn`,
+   the user's files, a small private /tmp, and a time limit. It runs in a
+   systemd user scope (a cgroup) that caps the memory and the number of tasks
+   of the whole process tree, tmpfs pages included; per-process limits alone
+   let forked children add up. This is the guard that matters. bwrap was chosen over `unshare -rn`,
    which also works on this machine, because it also hides files and blocks
    writes. Hiding /run matters too: a Unix socket there (such as Docker's)
    stays reachable without a network.
@@ -72,9 +74,17 @@ Method = Literal[
     "primal_dual",
 ]
 
-# Limits on the child process.
+# Limits on the child process tree.
 MEMORY_BYTES = 4 * 1024**3
 OUTPUT_BYTES = 64 * 1024**2
+TMP_BYTES = 64 * 1024**2
+MAX_TASKS = 64
+
+# The longest encoding source accepted, in characters.
+MAX_SOURCE = 200_000
+
+# The longest failure text kept.
+MAX_FAILURE = 3_900
 
 # The default time limit for one sandbox run, in seconds.
 DEFAULT_TIMEOUT_S = 60.0
@@ -116,7 +126,12 @@ class CallResult(_Model):
             raise SandboxFailure(self.error)
         if self.value is None:
             raise SandboxFailure("the sandbox sent neither a value nor an error")
-        return from_wire(self.value)
+        try:
+            return from_wire(self.value)
+        except Exception as exc:  # noqa: BLE001 - the child wrote this value
+            raise SandboxFailure(
+                f"the sandbox sent a value that cannot be rebuilt: {describe(exc)}"
+            ) from exc
 
 
 class EncodingOutput(_Model):
@@ -130,6 +145,10 @@ class EncodingOutput(_Model):
 class Request(_Model):
     source: str
     calls: list[Call]
+
+
+def _clip(text: str) -> str:
+    return text if len(text) <= MAX_FAILURE else text[: MAX_FAILURE - 3] + "..."
 
 
 def describe(exc: BaseException) -> str:
@@ -154,10 +173,12 @@ def check_source(source: str) -> None:
 
     Raise ForbiddenSource. This is a first check only; the sandbox is the guard.
     """
+    if len(source) > MAX_SOURCE:
+        raise ForbiddenSource(f"the encoding is longer than {MAX_SOURCE} characters")
     try:
         tree = ast.parse(source)
-    except SyntaxError as exc:
-        raise ForbiddenSource(f"the encoding does not parse: {exc}") from exc
+    except (SyntaxError, ValueError, MemoryError, RecursionError) as exc:
+        raise ForbiddenSource(_clip(f"the encoding does not parse: {describe(exc)}")) from exc
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -205,12 +226,26 @@ def _bind_paths() -> list[Path]:
 
 def _command() -> list[str]:
     args = [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--quiet",
+        "-p",
+        f"MemoryMax={MEMORY_BYTES}",
+        "-p",
+        "MemorySwapMax=0",
+        "-p",
+        f"TasksMax={MAX_TASKS}",
         "bwrap",
         "--unshare-all",
         "--die-with-parent",
         "--new-session",
         "--cap-drop",
         "ALL",
+        "--unsetenv",
+        "XDG_RUNTIME_DIR",
+        "--unsetenv",
+        "DBUS_SESSION_BUS_ADDRESS",
         "--ro-bind",
         "/usr",
         "/usr",
@@ -222,7 +257,9 @@ def _command() -> list[str]:
             args += ["--ro-bind", link, link]
     for path in ("/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d"):
         args += ["--ro-bind-try", path, path]
-    args += ["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]
+    args += ["--dev", "/dev", "--proc", "/proc"]
+    for tmp in ("/tmp", "/dev/shm"):
+        args += ["--size", str(TMP_BYTES), "--tmpfs", tmp]
     for path in _bind_paths():
         args += ["--ro-bind", str(path), str(path)]
     # The root holding the mount points is a tmpfs; make it read-only too.
@@ -241,8 +278,22 @@ _ENV = {
 }
 
 
+# systemd-run needs these to reach the user's service manager; bwrap unsets
+# them for the child.
+_BUS_VARIABLES = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+
+
+def _env() -> dict[str, str]:
+    env = dict(_ENV)
+    env.update({k: os.environ[k] for k in _BUS_VARIABLES if k in os.environ})
+    return env
+
+
 def _limits(timeout_s: float) -> None:
-    """Set limits in the child before bwrap starts. Runs between fork and exec."""
+    """Set per-process limits before systemd-run starts. Runs between fork and exec.
+
+    The cgroup scope caps the whole tree; these catch one runaway process early.
+    """
     resource.setrlimit(resource.RLIMIT_AS, (MEMORY_BYTES, MEMORY_BYTES))
     resource.setrlimit(resource.RLIMIT_FSIZE, (OUTPUT_BYTES, OUTPUT_BYTES))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -270,7 +321,7 @@ def _run(request: Request, timeout_s: float) -> EncodingOutput:
             stdin=stdin,
             stdout=stdout,
             stderr=stderr,
-            env=_ENV,
+            env=_env(),
             start_new_session=True,
             preexec_fn=lambda: _limits(timeout_s),
         )
@@ -282,7 +333,7 @@ def _run(request: Request, timeout_s: float) -> EncodingOutput:
             return EncodingOutput(failure=f"the encoding timed out after {timeout_s:g}s")
         if code != 0:
             return EncodingOutput(
-                failure=f"the sandbox exited with code {code}: {_tail(stderr)[-1500:]}"
+                failure=_clip(f"the sandbox exited with code {code}: {_tail(stderr)[-1500:]}")
             )
         stdout.seek(0)
         raw = stdout.read(OUTPUT_BYTES + 1)
@@ -291,7 +342,9 @@ def _run(request: Request, timeout_s: float) -> EncodingOutput:
     try:
         output = EncodingOutput.model_validate_json(raw)
     except ValidationError as exc:
-        return EncodingOutput(failure=f"the sandbox's output is unreadable: {str(exc)[:500]}")
+        return EncodingOutput(
+            failure=_clip(f"the sandbox's output is unreadable: {str(exc)[:500]}")
+        )
     if output.failure is None and len(output.results) != len(request.calls):
         return EncodingOutput(
             failure=f"the sandbox gave {len(output.results)} results for {len(request.calls)} calls"
@@ -311,7 +364,7 @@ def run_encoding(
     try:
         check_source(source)
     except ForbiddenSource as exc:
-        return EncodingOutput(failure=str(exc))
+        return EncodingOutput(failure=_clip(str(exc)))
     return run_unchecked(source, calls, timeout_s)
 
 
