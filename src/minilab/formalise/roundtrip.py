@@ -17,7 +17,7 @@ from collections.abc import Mapping
 
 from pydantic import BaseModel, ConfigDict
 
-from minilab.formalise.formaliser import THEOREM, FormalOutput, lean_view
+from minilab.formalise.formaliser import THEOREM, FormalOutput, fenced, lean_view
 from minilab.ledger import Ledger
 from minilab.models.adapter import Budget, Role, call, pick_checker
 from minilab.models.backends import Backend
@@ -45,9 +45,7 @@ including the meaning of each definition the theorem uses. Do not guess what
 the author meant, and do not add or drop conditions. Reply with the English
 statement only.
 
-```lean
-{lean_view(formal)}
-```"""
+{fenced(lean_view(formal))}"""
 
 
 def roundtrip(

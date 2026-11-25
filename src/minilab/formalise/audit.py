@@ -43,7 +43,7 @@ from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
-from minilab.formalise.formaliser import Binder, FormalOutput, lean_view
+from minilab.formalise.formaliser import Binder, FormalOutput, fenced, lean_view
 from minilab.formalise.vacuity import VacuityResult
 from minilab.ledger import Ledger
 from minilab.models.adapter import Budget, Role, call, pick_checker
@@ -117,15 +117,18 @@ def _balanced(text: str) -> bool:
 def script_matches(record: Record, formal: FormalOutput) -> dict[str, str]:
     """Hypothesis label to "assumption i" (1-based) or "domain", by exact stated text.
 
-    A hypothesis whose type mentions a file definition is never matched.
+    A hypothesis whose type mentions a file definition is never matched, nor
+    one that depends on an instance binder: its `<` may be that binder's, which
+    the printed text does not show.
     """
+    instances = {b.index for b in formal.binders if b.instance}
     stated: list[tuple[str, str]] = [
         (_normal(a), f"assumption {i}") for i, a in enumerate(record.assumptions, 1)
     ]
     stated.append((_normal(record.domain_of_validity), DOMAIN))
     found: dict[str, str] = {}
     for hypothesis in formal.hypotheses:
-        if hypothesis.truncated or hypothesis.defs:
+        if hypothesis.truncated or hypothesis.defs or instances & set(hypothesis.deps):
             continue
         lean = _normal(hypothesis.type)
         for text, where in stated:
@@ -176,9 +179,7 @@ Assumptions:
 Domain of validity: {record.domain_of_validity}
 
 The Lean file, as Lean prints it (definitions, then the theorem):
-```lean
-{lean_view(formal)}
-```
+{fenced(lean_view(formal))}
 
 Judge each of these hypotheses of `{formal.theorem}`:
 {listed or "  (none)"}

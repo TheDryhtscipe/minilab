@@ -103,7 +103,9 @@ Aesop's rule clauses (`aesop (add …)`), and `decide` with a configuration
 strings, while Lean elaborates the terms inside the braces. String and
 character literals are refused: a string can carry free text, and a
 character literal (`!'"'`) once made the Python reader take a comment for a
-string. Doc comments are refused like any other comment. `open … renaming` and
+string. `Name` literals (`` `foo ``, `` ``foo ``) are refused: written with
+`«»` they hold any text, and the definition that holds one is printed in the
+prompts. Doc comments are refused like any other comment. `open … renaming` and
 `open … hiding` are refused because the statement text is cut from inside
 the `open … in`, so a renaming would change what that text means. With code
 generation off none of them can
@@ -115,7 +117,8 @@ def deniedKinds : List Name :=
    `Lean.Parser.Term.byElab, ``Lean.Parser.Tactic.nativeDecide,
    `Mathlib.Meta.eval_expr, `plausibleSyntax, interpolatedStrKind, strLitKind, charLitKind,
    ``Lean.Parser.Command.docComment,
-   ``Lean.Parser.Command.openRenaming, ``Lean.Parser.Command.openHiding]
+   ``Lean.Parser.Command.openRenaming, ``Lean.Parser.Command.openHiding,
+   ``Lean.Parser.Term.quotedName, ``Lean.Parser.Term.doubleQuotedName]
 
 /-- The identifiers in `s` written with `«»`, with their lines' syntax. -/
 partial def quotedIdents (s : Syntax) (acc : Array Syntax) : Array Syntax :=
@@ -149,6 +152,8 @@ def refusal (kind : Name) (node : Syntax) : Option String :=
   else if kind == interpolatedStrKind then some "an interpolated string"
   else if kind == strLitKind then some "a string literal"
   else if kind == charLitKind then some "a character literal"
+  else if kind == ``Lean.Parser.Term.quotedName || kind == ``Lean.Parser.Term.doubleQuotedName then
+    some "a `Name` literal"
   else if kind == ``Lean.Parser.Command.docComment then some "a comment"
   else if kind == ``Lean.Parser.Command.openRenaming then some "`open … renaming`"
   else if kind == ``Lean.Parser.Command.openHiding then some "`open … hiding`"
@@ -377,11 +382,13 @@ instance of another type that unfolds to this one (`OrderDual.instLE`). The
 printed type does not show instance arguments, so such an argument changes
 the meaning of a statement without changing its text. `let` and `have` (a
 `let` that its body does not depend on) are unfolded first, so their values
-are checked where they are used. The instance the search finds may be a
-variable only if it is in `allowed`, the theorem's own binders: a variable
-of a class type bound inside the statement (`fun (i : LT ℝ) => …`,
+are checked where they are used. The instance the search finds may mention
+a variable of a class type only if it is in `allowed`, the theorem's own
+binders: such a variable bound inside the statement (`fun (i : LT ℝ) => …`,
 `∃ i : LE ℝ, …`, a `match` alternative) is a local instance there, so the
-search would find it and pass whatever value fills it. -/
+search would find it and pass whatever value fills it. A variable of any
+other type bound inside the statement may appear (`Fin.fintype n` under
+`∀ n : ℕ`). -/
 def foreignInstances (allowed : Array FVarId) (e : Expr) : MetaM (Array String) := do
   let found ← IO.mkRef (#[] : Array String)
   let pre : Expr → MetaM TransformStep := fun t => do
@@ -402,8 +409,13 @@ def foreignInstances (allowed : Array FVarId) (e : Expr) : MetaM (Array String) 
         let fine ← withNewMCtxDepth do
           match ← trySynthInstance cls with
           | .some s =>
-            if s.hasAnyFVar (fun f => !allowed.contains f) then pure false
-            else isDefEq a s
+            let mut inner := false
+            for f in (collectFVars {} s).fvarSet.toList do
+              if allowed.contains f then continue
+              match ← f.findDecl? with
+              | some d => if (← isClass? d.type).isSome then inner := true
+              | none => inner := true
+            if inner then pure false else isDefEq a s
           | _ => pure false
         if !fine then
           found.modify (·.push ((toString (← ppExpr a)).take 200).toString)
@@ -450,6 +462,20 @@ def ppDefinition (ci : ConstantInfo) : MetaM String := do
     | some v => return s!"def {user} : {← ppExpr ci.type} :=\n  {← ppExpr v}"
     | none => return s!"def {user} : {← ppExpr ci.type}"
 
+/-- The foreign instances (`foreignInstances`, through `scan`) in `e`, a
+definition's type or value (`isLambda`) or a constructor's type, under its
+own binders. Like the theorem's binders, the definition's own arguments of a
+class type are instances the search may find. -/
+def foreignUnder (scan : Array FVarId → Expr → TermElabM (Array String)) (e : Expr)
+    (isLambda : Bool) : TermElabM (Array String) := do
+  let k : Array Expr → Expr → TermElabM (Array String) := fun xs b => do
+    let ids := xs.map (·.fvarId!)
+    let mut out : Array String := #[]
+    for i in [0:xs.size] do
+      out := out ++ (← scan (ids.extract 0 i) (← ids[i]!.getType))
+    return out ++ (← scan ids b)
+  if isLambda then lambdaTelescope e k else forallTelescope e k
+
 /-- Print `SORRY`, the constants of the file other than `conjecture` that
 depend on `sorryAx` (internal and generated ones too); `DEF` for each
 definition the file wrote, with its text as Lean prints it; one `BINDER`
@@ -458,21 +484,29 @@ rest of its statement, with whether the statement itself depends on
 `sorryAx`. Print `NONE` in place of `BINDER` and `BODY` if there is no
 `conjecture`. Binder types are shown without `optParam` and `autoParam`.
 
-`opens` is a JSON array of the namespaces the command check found active at
-`conjecture` (`OPENS`). Their scoped instances are made active while the
-instance arguments are checked, as they were when Lean elaborated the
-statement, and inactive again afterwards. Types are printed outside them,
+Each `DEF` lists the foreign instances (`foreignInstances`) in the
+definition's type and value, or in each constructor's type: Lean prints a
+definition without its instance arguments, so `@LT.lt ℝ ⟨…⟩ 0 x` would
+print as `0 < x`. A `BINDER` is an instance if it is written `[…]` or its
+type is a class: either way it is a local instance in the statement.
+
+`opens` are the namespaces the command check found active at `conjecture`
+(`OPENS`). Their scoped instances are made active while the instance
+arguments of the statement and of every definition are checked, as they
+were when Lean elaborated the statement, and inactive again afterwards. A
+definition elaborated under other scoped instances is refused. Types are printed outside them,
 so a name an `open` brought in is printed in full (`Trick.cos`). -/
-@[command_elab probeCmd] def elabProbe : CommandElab := fun stx => do
-  let some marker := stx[1].isStrLit? | throwError "expected the marker"
-  let some arity := stx[2].isNatLit? | throwError "expected the arity"
-  let some opensText := stx[3].isStrLit? | throwError "expected the opens"
-  let opens ← match (do (← Json.parse opensText).getArr?) with
-    | .ok items => items.mapM fun j => match j.getStr? with
-      | .ok t => pure t.toName
-      | .error e => throwError "the opens could not be read: {e}"
-    | .error e => throwError "the opens could not be read: {e}"
+def probe (marker : String) (arity : Nat) (opens : Array Name) : CommandElabM Unit := do
   let env ← getEnv
+  -- Instances are checked with the statement's scoped instances active.
+  for ns in opens do
+    activateScoped ns
+  let active ← getEnv
+  setEnv env
+  let foreignIn : Array FVarId → Expr → TermElabM (Array String) := fun allowed e => do
+    let printed ← getEnv
+    setEnv active
+    try foreignInstances allowed e finally setEnv printed
   let mut withSorry : Array String := #[]
   for (name, _) in env.constants.map₂.toList do
     if name != `conjecture && (← collectAxioms name).contains ``sorryAx then
@@ -505,9 +539,21 @@ so a name an `open` brought in is printed in full (`Trick.cos`). -/
           | none => e) ci.type
       | _ => ci.value?.getD ci.type
     let text ← liftTermElabM (ppDefinition ci)
+    let foreign ← liftTermElabM do
+      let mut out ← foreignUnder foreignIn ci.type false
+      match ci with
+      | ConstantInfo.inductInfo v =>
+        for c in v.ctors do
+          if let some cc := env.find? c then
+            out := out ++ (← foreignUnder foreignIn cc.type false)
+      | _ =>
+        if let some v := ci.value? then
+          out := out ++ (← foreignUnder foreignIn v true)
+      pure out
     say marker "DEF" (Json.mkObj [("name", toJson (userName name)),
       ("type", toJson (ci matches ConstantInfo.inductInfo _)),
       ("sorry", toJson (ax.contains ``sorryAx)), ("uses", mentions uses),
+      ("foreign", toJson foreign),
       ("text", toJson (text.take maxDefChars)),
       ("truncated", toJson (decide (text.length > maxDefChars)))])
   match env.find? `conjecture with
@@ -519,21 +565,11 @@ so a name an `open` brought in is printed in full (`Trick.cos`). -/
     let mut typeSorry := false
     for c in info.type.getUsedConstants do
       if (← collectAxioms c).contains ``sorryAx then typeSorry := true
-    -- Instances are checked with the statement's scoped instances active.
-    let outer ← getEnv
-    for ns in opens do
-      activateScoped ns
-    let active ← getEnv
-    setEnv outer
     liftTermElabM do
       forallBoundedTelescope info.type (some arity) fun xs body => do
         if xs.size != arity then
           throwError "`conjecture` has fewer binders than its header"
         let ids := xs.map (·.fvarId!)
-        let foreignIn : Array FVarId → Expr → TermElabM (Array String) := fun allowed e => do
-          let printed ← getEnv
-          setEnv active
-          try foreignInstances allowed e finally setEnv printed
         for i in [0:xs.size] do
           let d ← xs[i]!.fvarId!.getDecl
           let ty := (← instantiateMVars d.type).consumeTypeAnnotations
@@ -544,7 +580,8 @@ so a name an `open` brought in is printed in full (`Trick.cos`). -/
           let s := toString (← ppExpr ty)
           say marker "BINDER" (Json.mkObj [("index", toJson i),
               ("name", toJson (binderName d.userName)),
-              ("prop", toJson isP), ("instance", toJson d.binderInfo.isInstImplicit),
+              ("prop", toJson isP),
+              ("instance", toJson (d.binderInfo.isInstImplicit || (← isClass? ty).isSome)),
               ("deps", toJson deps), ("defs", mentions ty),
               ("foreign", toJson (← foreignIn (ids.extract 0 i) ty)),
               ("type", toJson (s.take maxTypeChars)),
@@ -559,6 +596,21 @@ so a name an `open` brought in is printed in full (`Trick.cos`). -/
             ("defs", mentions b), ("foreign", toJson (← foreignIn ids b)),
             ("type", toJson (s.take maxTypeChars)),
             ("truncated", toJson (decide (s.length > maxTypeChars)))])
+
+/-- Run `probe`. Lean prints the types of `fun`, `∃` and other inner
+binders (`pp.funBinderTypes`): `∃ y, …` hides whether `y` is an integer or
+a real. -/
+@[command_elab probeCmd] def elabProbe : CommandElab := fun stx => do
+  let some marker := stx[1].isStrLit? | throwError "expected the marker"
+  let some arity := stx[2].isNatLit? | throwError "expected the arity"
+  let some opensText := stx[3].isStrLit? | throwError "expected the opens"
+  let opens ← match (do (← Json.parse opensText).getArr?) with
+    | .ok items => items.mapM fun j => match j.getStr? with
+      | .ok t => pure t.toName
+      | .error e => throwError "the opens could not be read: {e}"
+    | .error e => throwError "the opens could not be read: {e}"
+  withScope (fun sc => { sc with opts := sc.opts.setBool `pp.funBinderTypes true })
+    (probe marker arity opens)
 
 -- ## The vacuity goals
 

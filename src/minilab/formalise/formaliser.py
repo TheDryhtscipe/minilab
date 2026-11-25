@@ -17,8 +17,8 @@ Our checks are the guard's own commands, compiled when it is built, given
 their inputs as literals.
 
 Two gates come before the compile, as a second guard and to give the model
-reasons it can act on. `source_problems` reads the text and refuses imports
-other than Mathlib, a list of dangerous words (`sorryAx` among them), any
+reasons it can act on. `source_problems` reads the text and refuses any
+import but `import Mathlib`, a list of dangerous words (`sorryAx` among them), any
 name with `minilab` in it (the checks add declarations with that prefix),
 and any number of the word `sorry` other than one. It skips comments and
 plain string literals, and `«…»` names are opaque. It reads an interpolated
@@ -394,8 +394,8 @@ def source_problems(source: str) -> list[str]:
     if not modules:
         problems.append("the file must import Mathlib")
     for module in modules:
-        if module != "Mathlib" and not module.startswith("Mathlib."):
-            problems.append(f"import of {module}: only Mathlib may be imported")
+        if module != "Mathlib":
+            problems.append(f"import of {module}: only `import Mathlib` is allowed")
     for word, pattern in _FORBIDDEN:
         if pattern.search(code):
             problems.append(f"forbidden construct `{word}`")
@@ -644,6 +644,7 @@ class _RawDef(BaseModel):
     type: bool
     sorry: bool
     uses: list[str]
+    foreign: list[str]
     text: str
     truncated: bool
 
@@ -817,6 +818,14 @@ def formal_from_source(
             problems.append(_foreign_problem(f"the type of binder {b.index}", shown))
     for shown in raw_body.foreign if raw_body is not None else []:
         problems.append(_foreign_problem("the conclusion", shown))
+    for d in raw_defs:
+        for shown in d.foreign:
+            problems.append(_foreign_problem(f"the definition `{d.name}`", shown))
+        if d.truncated:
+            problems.append(
+                f"the printed text of the definition `{d.name}` was cut, so the checks "
+                "cannot read it in full; split it into shorter definitions"
+            )
     extra = sorted(set(result.axioms) - STANDARD_AXIOMS - {SORRY_AXIOM})
     if extra:
         problems.append(f"the file uses axioms beyond Lean's standard ones: {', '.join(extra)}")
@@ -902,6 +911,14 @@ def lean_view(formal: FormalOutput) -> str:
         )
     )
     return "\n\n".join(parts)
+
+
+def fenced(text: str, lang: str = "lean") -> str:
+    """`text` in a code fence longer than any run of backticks inside it,
+    so nothing in the text can close the fence."""
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}{lang}\n{text}\n{fence}"
 
 
 # --- the model call ---
