@@ -52,6 +52,7 @@ from minilab.certify.interval import IntervalCertificate, check_interval_margin
 from minilab.certify.result import CheckResult, MarginCheck, accept, reject, show, working_digits
 from minilab.encoding.api import Encoding, EncodingFactory, Instance
 from minilab.encoding.sandbox import Sandboxed
+from minilab.records import Family
 
 # A certificate is one of the three kinds, tagged by its `kind` field. Read one
 # from JSON with `CERTIFICATE.validate_json`.
@@ -260,15 +261,18 @@ def check_kill(
     `first` and `second` are the two families' encodings of one conjecture
     (design doc-gmj, "Encoding"), each run in the sandbox. Model code computes
     the ball and duality bounds, so a single encoding could certify a violation
-    that is not there. This refuses one source passed twice, but cannot tell
-    which family wrote an encoding: the caller (encode_twice) must give one per
-    family. `assumptions` is as for `check_certificate`.
+    that is not there. This needs two different families, and never Gemini,
+    which only generates. It trusts each `Sandboxed.family`: the caller
+    (encode_twice) must fill it in truthfully. `assumptions` is as for
+    `check_certificate`.
     """
     sandboxed = cast(tuple[object, object], (first, second))
     if not all(type(make) is Sandboxed for make in sandboxed):
         return reject("a kill needs both encodings to run in the sandbox (Sandboxed)")
-    if first.source == second.source:
-        return reject("a kill needs two independent encodings, not the same encoding twice")
+    if first.family is second.family:
+        return reject(f"a kill needs encodings from two families, not two from {first.family}")
+    if Family.gemini in (first.family, second.family):
+        return reject("a kill cannot use an encoding written by Gemini, which only generates")
     results = [check_certificate(make, cert, assumptions=assumptions) for make in (first, second)]
     for name, result in zip(("first", "second"), results, strict=True):
         if not result.accepted:

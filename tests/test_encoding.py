@@ -25,6 +25,7 @@ from minilab.encoding.sandbox import (
     run_encoding,
     run_unchecked,
 )
+from minilab.records import Family
 
 PILOT = Path(__file__).parent / "fixtures" / "pilot"
 REPO = Path(__file__).resolve().parents[1]
@@ -172,7 +173,12 @@ def test_encoding_sandbox_timeout_and_no_network() -> None:
 
     # A timed-out encoding never gives a verdict: the kill is refused.
     cert = load("grid_gap")
-    result = check_kill(Sandboxed(loop, timeout_s=2), Sandboxed(Y2), cert, assumptions=2)
+    result = check_kill(
+        Sandboxed(loop, Family.claude, timeout_s=2),
+        Sandboxed(Y2, Family.codex),
+        cert,
+        assumptions=2,
+    )
     assert not result.accepted
     assert "timed out" in result.reason
 
@@ -298,8 +304,12 @@ ENCODING = Exact
 
 
 def test_sandboxed_checks_match_the_pilot() -> None:
-    assert check_certificate(Sandboxed(S7), load("s7_counterexample"), assumptions=2).accepted
-    result = check_certificate(Sandboxed(S7), load("warm_start_artefact"), assumptions=2)
+    assert check_certificate(
+        Sandboxed(S7, Family.claude), load("s7_counterexample"), assumptions=2
+    ).accepted
+    result = check_certificate(
+        Sandboxed(S7, Family.claude), load("warm_start_artefact"), assumptions=2
+    )
     assert not result.accepted
     assert "upper bound on the margin" in result.reason
 
@@ -307,22 +317,34 @@ def test_sandboxed_checks_match_the_pilot() -> None:
 def test_kill_needs_both_encodings() -> None:
     cert = load("grid_gap")
     # On its own the dishonest encoding certifies the false violation.
-    assert check_certificate(Sandboxed(FLOAT), cert, assumptions=2).accepted
-    result = check_kill(Sandboxed(FLOAT), Sandboxed(Y2), cert, assumptions=2)
+    assert check_certificate(Sandboxed(FLOAT, Family.claude), cert, assumptions=2).accepted
+    result = check_kill(
+        Sandboxed(FLOAT, Family.claude), Sandboxed(Y2, Family.codex), cert, assumptions=2
+    )
     assert not result.accepted
     assert "second encoding" in result.reason
 
     side = load("s1_side_counterexample")
     other = S1.replace("ENCODING =", "# written by the other family\nENCODING =")
-    result = check_kill(Sandboxed(S1), Sandboxed(other), side, assumptions=4)
+    result = check_kill(
+        Sandboxed(S1, Family.claude), Sandboxed(other, Family.codex), side, assumptions=4
+    )
     assert result.accepted, result.reason
 
 
-def test_kill_refuses_one_encoding_twice() -> None:
+def test_kill_needs_two_families() -> None:
     side = load("s1_side_counterexample")
-    result = check_kill(Sandboxed(S1), Sandboxed(S1), side, assumptions=4)
+    other = S1 + "\n# written again\n"
+    result = check_kill(
+        Sandboxed(S1, Family.claude), Sandboxed(other, Family.claude), side, assumptions=4
+    )
     assert not result.accepted
-    assert "same encoding" in result.reason
+    assert "two families" in result.reason
+    result = check_kill(
+        Sandboxed(S1, Family.gemini), Sandboxed(other, Family.codex), side, assumptions=4
+    )
+    assert not result.accepted
+    assert "Gemini" in result.reason
 
 
 def test_kill_needs_sandboxed_encodings() -> None:
@@ -331,7 +353,7 @@ def test_kill_needs_sandboxed_encodings() -> None:
     side = load("s1_side_counterexample")
     result = check_kill(
         TsallisPinskerSide,  # type: ignore[arg-type]
-        Sandboxed(S1),
+        Sandboxed(S1, Family.codex),
         side,
         assumptions=4,
     )
@@ -359,12 +381,16 @@ def test_encoding_cannot_tamper_with_the_checker(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(check_module, "check_certificate", check_module.check_certificate)
     exec(compile(tamper, "<tamper>", "exec"), {"__name__": "tamper"})  # noqa: S102
     assert check_module.check_certificate is not check_certificate
-    assert check_kill(Sandboxed(FLOAT), Sandboxed(Y2), cert, assumptions=2).accepted
+    assert check_kill(
+        Sandboxed(FLOAT, Family.claude), Sandboxed(Y2, Family.codex), cert, assumptions=2
+    ).accepted
     monkeypatch.undo()
     assert check_module.check_certificate is check_certificate
 
     # Through the sandbox it patches only its own process.
-    result = check_kill(Sandboxed(tamper), Sandboxed(Y2), cert, assumptions=2)
+    result = check_kill(
+        Sandboxed(tamper, Family.claude), Sandboxed(Y2, Family.codex), cert, assumptions=2
+    )
     assert not result.accepted
     assert "second encoding refuses" in result.reason
 
@@ -372,7 +398,7 @@ def test_encoding_cannot_tamper_with_the_checker(monkeypatch: pytest.MonkeyPatch
 def test_assumption_count_must_match() -> None:
     # S1's encoding gives four predicates; a conjecture with five is not what it encodes.
     side = load("s1_side_counterexample")
-    result = check_certificate(Sandboxed(S1), side, assumptions=5)
+    result = check_certificate(Sandboxed(S1, Family.claude), side, assumptions=5)
     assert not result.accepted
     assert "4 assumption predicates" in result.reason
     none = S1.replace(
@@ -381,7 +407,7 @@ def test_assumption_count_must_match() -> None:
         1,
     )
     assert none != S1
-    result = check_certificate(Sandboxed(none), side, assumptions=4)
+    result = check_certificate(Sandboxed(none, Family.claude), side, assumptions=4)
     assert not result.accepted
     assert "0 assumption predicates" in result.reason
 
@@ -410,7 +436,9 @@ class Boom(Y2Encoding):
 ENCODING = Boom
 """
     )
-    result = check_kill(Sandboxed(boom), Sandboxed(Y2), load("grid_gap"), assumptions=2)
+    result = check_kill(
+        Sandboxed(boom, Family.claude), Sandboxed(Y2, Family.codex), load("grid_gap"), assumptions=2
+    )
     assert not result.accepted
     assert "first encoding refuses" in result.reason
     assert "raised" in result.reason

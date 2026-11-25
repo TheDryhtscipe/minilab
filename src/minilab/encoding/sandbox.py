@@ -50,6 +50,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 import minilab
 from minilab.encoding.api import MAX_DIGITS, Encoding, Instance
 from minilab.encoding.wire import WireValue, from_wire
+from minilab.records import Family
 
 # Modules an encoding may import, with their submodules. `random` is needed for
 # the sampler's signature; the plan's list did not name it.
@@ -468,11 +469,14 @@ def _run_class(capabilities: tuple[str, ...]) -> type[_SandboxRun]:
 class Sandboxed:
     """An encoding's source as an `EncodingFactory`: each call builds a fresh run.
 
-    Pass two of these to `check_kill`. The capabilities are read once, by a
-    probe run; a later run that lacks one gives an error for that call.
+    `family` is the model family that wrote the source; the caller
+    (encode_twice) fills it in, and `check_kill` needs two different ones. Pass
+    two of these to `check_kill`. The capabilities are read once, by a probe
+    run; a later run that lacks one gives an error for that call.
     """
 
     source: str
+    family: Family
     timeout_s: float = DEFAULT_TIMEOUT_S
     _probe: list[tuple[str, ...]] = field(default_factory=lambda: [], compare=False, repr=False)
 
