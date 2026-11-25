@@ -8,7 +8,7 @@ runner compiles it with no network and a read-only view of the files it needs.
 import time
 from pathlib import Path
 
-from minilab.lean.runner import check_lean, lean_project, theorem_names
+from minilab.lean.runner import check_lean, lean_project
 
 SMOKE = """import Mathlib.Data.Nat.Basic
 
@@ -113,26 +113,53 @@ def test_eval_cannot_write_files(tmp_path: Path) -> None:
     assert any(str(target) in error for error in result.errors), result.errors
 
 
-def test_theorem_names_follow_namespaces_and_skip_comments() -> None:
-    source = """
--- theorem in_line_comment : True := trivial
-/- theorem in_block_comment : True := trivial -/
-theorem top : True := trivial
-namespace A.B
-@[simp] private theorem inner (n : ℕ) : n = n := rfl
-section S
-lemma in_section : True := trivial
-end S
-end A.B
-noncomputable section
-protected theorem C.qualified : True := trivial
-end
-theorem _root_.rooted : True := trivial
+# A false statement proved from a custom axiom. Each must show the axiom.
+CUSTOM_AXIOM = """axiom cheat : False
+
+theorem bad : (1 : Nat) = 2 := cheat.elim
 """
-    assert theorem_names(source) == [
-        "top",
-        "A.B.inner",
-        "A.B.in_section",
-        "C.qualified",
-        "rooted",
-    ]
+
+# The regex that finds theorem lines misses `open X in theorem`.
+CUSTOM_AXIOM_OPEN_IN = """import Mathlib.Data.Nat.Basic
+
+axiom cheat : False
+
+open Nat in theorem bad2 : (1 : ℕ) = 2 := cheat.elim
+"""
+
+# No theorem at all, only the axiom.
+AXIOM_ONLY = """axiom cheat : False
+"""
+
+# `#exit` stops Lean before anything appended to the source can run.
+EXIT_EARLY = """axiom cheat : False
+
+theorem bad : (1 : Nat) = 2 := cheat.elim
+
+#exit
+"""
+
+
+def test_custom_axiom_listed() -> None:
+    result = check_lean(CUSTOM_AXIOM, timeout_s=120)
+    assert result.ok, result.errors
+    assert "cheat" in result.axioms
+    assert result.axioms_by_theorem["bad"] == ["cheat"]
+
+
+def test_custom_axiom_behind_open_in_listed() -> None:
+    result = check_lean(CUSTOM_AXIOM_OPEN_IN, timeout_s=120)
+    assert result.ok, result.errors
+    assert "cheat" in result.axioms
+    assert result.axioms_by_theorem["bad2"] == ["cheat"]
+
+
+def test_declared_axiom_listed_without_theorem() -> None:
+    result = check_lean(AXIOM_ONLY, timeout_s=120)
+    assert "cheat" in result.axioms
+
+
+def test_axiom_check_that_never_ran_fails_closed() -> None:
+    result = check_lean(EXIT_EARLY, timeout_s=120)
+    assert not result.ok
+    assert any("axiom check" in error for error in result.errors), result.errors

@@ -1,9 +1,15 @@
 """Compile Lean source against the repo's mathlib (build plan doc-5wh, Task 9).
 
 `check_lean` writes the source to a temporary file inside the repo's `lean/`
-project, appends `#print axioms` for each theorem it declares, and runs
-`lake env lean --json` on it. It reads Lean's messages back and gives a
-`LeanResult`.
+project and runs `lake env lean --json` on it. It reads Lean's messages back
+and gives a `LeanResult`.
+
+Axioms are not found from the source text. The runner puts `import Lean`
+before the source and appends one Lean command that walks every constant the
+file declares and prints the axioms of each. So a theorem in any form, an
+`axiom` declaration, and a definition all count. If that command gives no
+result (for example after `#exit`), the result is not `ok`: a missing axiom
+check never reads as "no axioms".
 
 The runner uses `lake env lean` and not the installed `lean-beam` tools.
 lean-beam keeps a Lean server running, but each check is a new file, so the
@@ -22,7 +28,6 @@ A time-out, or a missing toolchain, is never a verdict. A time-out gives
 
 import json
 import os
-import re
 import shutil
 import signal
 import subprocess
@@ -58,8 +63,8 @@ class LeanUnavailable(Exception):
 class LeanMessage(BaseModel):
     """One message from Lean. `line` and `column` are 1-based in the source given.
 
-    `axioms_of` names the theorem when the message came from an appended
-    `#print axioms` line, not from the source.
+    `axioms_of` is set when the message came from the appended axiom check,
+    not from the source.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -74,13 +79,16 @@ class LeanMessage(BaseModel):
 class LeanResult(BaseModel):
     """What one compile gave.
 
-    - `ok`: Lean exited cleanly with no error message and did not time out.
-      A proof with `sorry` can still be `ok`; check `has_sorry`.
+    - `ok`: Lean exited cleanly with no error message, did not time out, and
+      the axiom check ran. A proof with `sorry` can still be `ok`; check
+      `has_sorry`.
     - `errors`: each error as `"line:column: text"`.
     - `has_sorry`: Lean warned of `sorry`, or a theorem depends on `sorryAx`.
       A proof Lean rejected also depends on `sorryAx`.
-    - `axioms`: every axiom any theorem depends on, sorted.
+    - `axioms`: every axiom any declaration in the source depends on, sorted.
+      An `axiom` the source declares is listed even if nothing uses it.
     - `axioms_by_theorem`: the axioms of each theorem, by its full name.
+      Private theorems are listed by the name they were declared with.
     - `timed_out`: Lean hit the time limit. Nothing else in the result counts.
     - `messages`: every message, errors, warnings, and information.
     """
@@ -107,87 +115,13 @@ class _RawMessage(BaseModel):
     data: str
 
 
-# --- finding the theorems ---
+class _Constant(BaseModel):
+    """One constant from the axiom check: its name, theorem or not, and axioms."""
 
-
-def _strip_comments(source: str) -> str:
-    """Blank out comments and string literals, keeping every newline in place."""
-    out: list[str] = []
-    i = 0
-    depth = 0
-    n = len(source)
-    while i < n:
-        two = source[i : i + 2]
-        ch = source[i]
-        if depth > 0:
-            if two == "/-":
-                depth += 1
-                out.append("  ")
-                i += 2
-            elif two == "-/":
-                depth -= 1
-                out.append("  ")
-                i += 2
-            else:
-                out.append("\n" if ch == "\n" else " ")
-                i += 1
-        elif two == "/-":
-            depth = 1
-            out.append("  ")
-            i += 2
-        elif two == "--":
-            end = source.find("\n", i)
-            end = n if end == -1 else end
-            out.append(" " * (end - i))
-            i = end
-        elif ch == '"':
-            out.append(" ")
-            i += 1
-            while i < n and source[i] != '"':
-                step = 2 if source[i] == "\\" else 1
-                out.append("".join("\n" if c == "\n" else " " for c in source[i : i + step]))
-                i += step
-            out.append(" ")
-            i += 1
-        else:
-            out.append(ch)
-            i += 1
-    return "".join(out)
-
-
-_MODIFIERS = r"(?:(?:private|protected|public|noncomputable|nonrec|unsafe|partial)\s+)*"
-_THEOREM = re.compile(
-    r"^\s*(?:@\[[^\]]*\]\s*)?" + _MODIFIERS + r"(?:theorem|lemma)\s+([^\s(\[{:⦃]+)"
-)
-_NAMESPACE = re.compile(r"^\s*namespace\s+(\S+)")
-_SECTION = re.compile(r"^\s*" + _MODIFIERS + r"section\b")
-_END = re.compile(r"^\s*end\b")
-
-
-def theorem_names(source: str) -> list[str]:
-    """The full names of the theorems and lemmas `source` declares, in order.
-
-    Follows `namespace`, `section`, and `end`, and skips comments.
-    """
-    scopes: list[str] = []
-    names: list[str] = []
-    for line in _strip_comments(source).splitlines():
-        if match := _NAMESPACE.match(line):
-            scopes.append(match.group(1))
-        elif _SECTION.match(line):
-            scopes.append("")
-        elif _END.match(line):
-            if scopes:
-                scopes.pop()
-        elif match := _THEOREM.match(line):
-            name = match.group(1)
-            if name.startswith("_root_."):
-                full = name.removeprefix("_root_.")
-            else:
-                full = ".".join([s for s in scopes if s] + [name])
-            if full not in names:
-                names.append(full)
-    return names
+    name: str
+    theorem: bool
+    internal: bool
+    axioms: list[str]
 
 
 # --- running Lean ---
@@ -282,16 +216,52 @@ def _severity(raw: str) -> Severity:
     return "information"
 
 
-_DEPENDS = re.compile(r"depends on axioms:\s*\[(.*)\]", re.DOTALL)
-_NO_AXIOMS = "does not depend on any axioms"
+# The line put before the source, so the axiom check can use Lean's meta API.
+# Mathlib imports Lean already, so for Mathlib sources this costs nothing.
+IMPORT_LEAN = "import Lean\n"
+
+# The axiom check prints one information message that starts with this.
+AXIOM_MARKER = "MINILAB_AXIOMS "
+
+# Appended after the source. It walks every constant the file declares (not
+# the imported ones) and prints, for each, its name with any private prefix
+# removed, whether it is a theorem, whether the name is internal, and the
+# axioms it depends on. Names are written in full so that the source's own
+# `open`s and namespaces do not change what they mean.
+AXIOM_CHECK = """
+#eval show Lean.Elab.Command.CommandElabM Unit from do
+  let env ← Lean.getEnv
+  let mut out : Array Lean.Json := #[]
+  for (name, info) in env.constants.map₂.toList do
+    let found ← Lean.collectAxioms name
+    let user := (Lean.privateToUserName? name).getD name
+    let isTheorem := match info with
+      | Lean.ConstantInfo.thmInfo _ => true
+      | _ => false
+    out := out.push (Lean.Json.mkObj [
+      ("name", Lean.toJson user.toString),
+      ("theorem", Lean.toJson isTheorem),
+      ("internal", Lean.toJson user.isInternal),
+      ("axioms", Lean.toJson (found.map Lean.Name.toString))])
+  Lean.logInfo (Lean.MessageData.ofFormat
+    (Std.Format.text ("MINILAB_AXIOMS " ++ (Lean.Json.arr out).compress)))
+"""
+
+_AXIOM_CHECK_LABEL = "(axiom check)"
 
 
 def _parse(
-    stdout: str, source_lines: int, appended: dict[int, str]
-) -> tuple[list[LeanMessage], list[str]]:
-    """Lean's JSON messages, and any other lines it printed."""
+    stdout: str, source_lines: int
+) -> tuple[list[LeanMessage], list[str], list[list[_Constant]]]:
+    """Lean's JSON messages, any other lines it printed, and the axiom check results.
+
+    Message lines are moved back by the one line of `IMPORT_LEAN`. Only an
+    information message from the appended lines counts as an axiom check
+    result, so the source cannot print one of its own.
+    """
     messages: list[LeanMessage] = []
     other: list[str] = []
+    checks: list[list[_Constant]] = []
     for line in stdout.splitlines():
         if not line.strip():
             continue
@@ -300,38 +270,34 @@ def _parse(
         except (json.JSONDecodeError, ValidationError):
             other.append(line)
             continue
-        number = raw.pos.line
-        theorem = appended.get(number)
-        if theorem is None and number > source_lines:
-            theorem = "(appended line)"
+        number = raw.pos.line - 1
+        appended = number > source_lines
+        severity = _severity(raw.severity)
+        text = raw.data.strip()
+        if appended and severity == "information" and text.startswith(AXIOM_MARKER):
+            try:
+                found = json.loads(text.removeprefix(AXIOM_MARKER))
+                checks.append(
+                    [_Constant.model_validate(item) for item in cast(list[object], found)]
+                )
+                continue
+            except (json.JSONDecodeError, ValidationError, TypeError):
+                pass
         messages.append(
             LeanMessage(
-                severity=_severity(raw.severity),
+                severity=severity,
                 line=number,
                 column=raw.pos.column + 1,
-                text=_clip(raw.data.strip()),
-                axioms_of=theorem,
+                text=_clip(text),
+                axioms_of=_AXIOM_CHECK_LABEL if appended else None,
             )
         )
-    return messages, other
-
-
-def _axioms(messages: list[LeanMessage], names: list[str]) -> dict[str, list[str]]:
-    found: dict[str, list[str]] = {}
-    for message in messages:
-        if message.axioms_of not in names or message.severity != "information":
-            continue
-        if _NO_AXIOMS in message.text:
-            found[message.axioms_of] = []
-        elif match := _DEPENDS.search(message.text):
-            parts = [part.strip() for part in match.group(1).split(",")]
-            found[message.axioms_of] = sorted(part for part in parts if part)
-    return found
+    return messages, other, checks
 
 
 def _error_text(message: LeanMessage) -> str:
     if message.axioms_of is not None:
-        return f"{message.line}:{message.column}: (axioms of {message.axioms_of}) {message.text}"
+        return f"{message.line}:{message.column}: {message.axioms_of} {message.text}"
     return f"{message.line}:{message.column}: {message.text}"
 
 
@@ -351,13 +317,7 @@ def check_lean(
 
     body = source if source.endswith("\n") else source + "\n"
     source_lines = body.count("\n")
-    names = theorem_names(body)
-    appended: dict[int, str] = {}
-    lines = [body, "\n"]
-    for offset, name in enumerate(names):
-        appended[source_lines + 2 + offset] = name
-        lines.append(f"#print axioms {name}\n")
-    text = "".join(lines)
+    text = IMPORT_LEAN + body + AXIOM_CHECK
 
     handle, path_text = tempfile.mkstemp(prefix=CHECK_PREFIX, suffix=".lean", dir=project)
     source_file = Path(path_text)
@@ -393,13 +353,18 @@ def check_lean(
     finally:
         source_file.unlink(missing_ok=True)
 
-    messages, other = _parse(out_text, source_lines, appended)
+    messages, other, checks = _parse(out_text, source_lines)
     errors = [_error_text(m) for m in messages if m.severity == "error"]
     if code != 0 and not errors:
         detail = "\n".join(other + [err_text.strip()]).strip()
         errors.append(_clip(f"Lean exited with code {code}: {detail}"))
-    by_theorem = _axioms(messages, names)
-    axioms = sorted({axiom for found in by_theorem.values() for axiom in found})
+    if len(checks) != 1:
+        errors.append(
+            f"the axiom check gave {len(checks)} results, not 1, so the axioms are unknown"
+        )
+    constants = checks[0] if len(checks) == 1 else []
+    by_theorem = {c.name: sorted(c.axioms) for c in constants if c.theorem and not c.internal}
+    axioms = sorted({axiom for c in constants for axiom in c.axioms})
     has_sorry = SORRY_AXIOM in axioms or any(
         m.severity == "warning" and SORRY_WARNING in m.text for m in messages
     )
