@@ -73,6 +73,11 @@ Method = Literal[
     "exact_margin",
     "margin_ball",
     "primal_dual",
+    # A falsifier reformulation's maps and a mechanism's predicate
+    # (minilab.falsify). They take a point, like the encoding methods.
+    "there",
+    "back",
+    "predicate",
 ]
 
 # Limits on the child process tree.
@@ -402,6 +407,7 @@ class _SandboxRun:
             self._answers[key] = run_encoding(self._sandbox.source, calls, self._sandbox.timeout_s)
         output = self._answers[key]
         if output.failure is not None:
+            self._sandbox.note_failure(output.failure)
             raise SandboxFailure(output.failure)
         return output.results[methods.index(method)].rebuild()
 
@@ -472,21 +478,36 @@ class Sandboxed:
     `family` is the model family that wrote the source; the caller
     (encode_twice) fills it in, and `check_kill` needs two different ones. Pass
     two of these to `check_kill`. The capabilities are read once, by a probe
-    run; a later run that lacks one gives an error for that call.
+    run; a later run that lacks one gives an error for that call. A probe run
+    that fails raises SandboxFailure and is not kept, so the next call probes
+    again.
+
+    `failures` lists every run that failed as a whole (a time-out, a crash,
+    unreadable output), as against an error the encoding raised in one call.
+    The checker turns both into a refusal; a caller that must not take a
+    sandbox failure for a mathematical refusal reads `failures`.
     """
 
     source: str
     family: Family
     timeout_s: float = DEFAULT_TIMEOUT_S
     _probe: list[tuple[str, ...]] = field(default_factory=lambda: [], compare=False, repr=False)
+    _failures: list[str] = field(default_factory=lambda: [], compare=False, repr=False)
+
+    @property
+    def failures(self) -> tuple[str, ...]:
+        return tuple(self._failures)
+
+    def note_failure(self, failure: str) -> None:
+        self._failures.append(failure)
 
     def _capabilities(self) -> tuple[str, ...]:
         if not self._probe:
             output = run_encoding(self.source, [], self.timeout_s)
-            found = (
-                () if output.failure else tuple(c for c in CAPABILITIES if c in output.capabilities)
-            )
-            self._probe.append(found)
+            if output.failure is not None:
+                self.note_failure(output.failure)
+                raise SandboxFailure(output.failure)
+            self._probe.append(tuple(c for c in CAPABILITIES if c in output.capabilities))
         return self._probe[0]
 
     def __call__(self) -> Encoding:
