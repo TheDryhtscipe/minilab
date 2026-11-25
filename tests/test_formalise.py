@@ -617,6 +617,10 @@ def test_word_list_catches_eval_bang_and_run_tac(bad: str, word: str) -> None:
             "do",
         ),
         ("namespace Open\nend Open\nsection\n", "end"),
+        ("def q : ℕ := eval% 3\n", "eval_expr"),
+        ("theorem helper : True := by aesop (add safe trivial)\n", "Aesop rule clause"),
+        ("theorem helper : 3 = 3 := by decide +native\n", "configuration"),
+        ("theorem helper : 3 = 3 := by decide (config := {})\n", "configuration"),
     ],
 )
 def test_command_allowlist_refuses_before_compiling(bad: str, problem: str) -> None:
@@ -660,7 +664,9 @@ def test_ordinary_file_passes_and_only_header_binders_count() -> None:
     formal = probed(ORDINARY)
     assert formal.ok, formal.problems
     # ε and `ε > 0` belong to the conclusion, not to the header.
-    assert [b.name for b in formal.binders] == ["m", "x", "y", "inst", "z", "h"]
+    assert [b.name for b in formal.binders] == ["m", "x", "y", "", "z", "h"]
+    # The unnamed instance binder has no name (Lean's `inst✝` is not one).
+    assert formal.binders[3].label == "#3"
     assert formal.conclusion.startswith("∀ ε > 0")
     # Only the definitions the source wrote: no matchers, no deriving helpers.
     assert sorted(formal.definitions) == ["Foo.g", "f", "s"]
@@ -904,3 +910,51 @@ def test_lean_timeout_in_formalise_leaves_record_unchanged(store: RecordStore) -
             record.id, ledger=ledger, budget=BUDGET, backends=backends, lean_timeout_s=0.5
         )
     assert path.read_bytes() == before
+
+
+# --- model code that runs while Lean compiles (second adversarial review) ---
+
+ADVERSARIAL = FIXTURES / "adversarial"
+
+
+def _past_the_allowlist(monkeypatch: pytest.MonkeyPatch, name: str) -> FormalOutput:
+    """The fixture compiled and probed as if the command allowlist had a hole.
+
+    Each fixture hides an IO action in an Aesop rule clause. When it runs, it
+    reads the check file through /proc/self/cmdline, takes the run's marker
+    from it, prints forged results to stdout, and exits. The allowlist now
+    refuses the clause, so it is switched off here: the test is that no model
+    code runs at all, whatever the allowlist misses.
+    """
+    import minilab.formalise.formaliser as formaliser
+
+    source = (ADVERSARIAL / name).read_text(encoding="utf-8")
+    assert source_problems(source) == []
+
+    def no_problems(_source: str, *, timeout_s: float) -> tuple[list[str], int | None]:
+        return [], 2
+
+    monkeypatch.setattr(formaliser, "command_check", no_problems)
+    return formal_from_source(source, Family.claude, "m", timeout_s=LEAN_TIMEOUT)
+
+
+def test_model_code_cannot_forge_the_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    formal = _past_the_allowlist(monkeypatch, "forge_probe.lean")
+    # The forged probe claims `(h : 0 ≤ n)` and `n + 0 = n`; Lean has `n < 0` and `n = 5`.
+    assert [b.type for b in formal.binders] == ["ℕ", "n < 0"], formal
+    assert formal.conclusion == "n = 5"
+    assert not formal.ok
+    assert any("aesop" in p for p in formal.problems), formal.problems
+
+
+def test_model_code_cannot_forge_the_vacuity_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    formal = _past_the_allowlist(monkeypatch, "forge_vacuity.lean")
+    assert [b.type for b in formal.binders] == ["ℕ", "n < 0"], formal
+    # Forced through, as if every earlier guard had passed it.
+    forced = formal.model_copy(update={"ok": True, "problems": []})
+    witness = Instance(values={"n": "3"}, precision_digits=30)
+    result = vacuity(forced, witness, timeout_s=LEAN_TIMEOUT)
+    # The forged run claims the witness n = 3 satisfies `n < 0`.
+    assert result.checked
+    assert [(c.label, c.state) for c in result.witness] == [("h", "fails")], result
+    assert not result.satisfied_by_witness

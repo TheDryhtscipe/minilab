@@ -8,10 +8,10 @@ Every declaration the linter adds, and every marker it reads, carries a
 random tag made for this run (`MinilabContraGoal_<tag>`), and a run counts
 only if exactly one `READY` marker came back and every marker names a binder
 of the right kind. The tag stops a file from declaring or printing the
-linter's names ahead of time. It is no defence against model code that runs
-while the file compiles, which could read the tag from the file; that is
-the formaliser's command check's job, and the linter trusts an `ok`
-formalisation from `formal_from_source` to have passed it.
+linter's names ahead of time. Model code cannot read the tag at compile
+time: the Lean runner's guard turns code generation off, so nothing the
+file writes runs. The goals are declared by the guard's `#minilab_vacuity`
+command, compiled when the guard is built; the witness reaches it as data.
 
 **Contradictory hypotheses.** A Lean meta-program declares
 `MinilabContraGoal_<tag>`, the statement `∀ binders, False`, and the linter tries
@@ -60,9 +60,9 @@ from minilab.encoding.api import Instance, to_fraction
 from minilab.formalise.formaliser import (
     DEFAULT_LEAN_TIMEOUT_S,
     STANDARD_AXIOMS,
-    THEOREM,
     FormalOutput,
     checked_source,
+    lean_string_literal,
     marker_messages,
     new_nonce,
 )
@@ -201,89 +201,17 @@ def witness_terms(
     return terms, notes
 
 
-def _lean_string(text: str) -> str:
-    return json.dumps(text, ensure_ascii=False)
-
-
 def _program(terms: list[tuple[str, str, bool]], nonce: str, arity: int) -> str:
-    """The meta-program that declares the goals; see the module docstring."""
-    witness = ", ".join(
-        f"({_lean_string(n)}, {_lean_string(t)}, {'true' if i else 'false'})" for n, t, i in terms
+    """The guard's `#minilab_vacuity` command, which declares the goals.
+
+    The command is compiled when the guard is built
+    (`lean/Minilab/Guard.lean`); the witness reaches it as a JSON string of
+    `[name, Lean text, integral]` triples, never as Lean code.
+    """
+    witness = json.dumps([[n, t, i] for n, t, i in terms], ensure_ascii=False)
+    return (
+        f"\n#minilab_vacuity {lean_string_literal(nonce)} {arity} {lean_string_literal(witness)}\n"
     )
-    m = f"{VACUITY_MARKER}{nonce}_"
-    return f"""
-open Lean Meta Elab Command in
-#eval show CommandElabM Unit from do
-  let env ← getEnv
-  let some info := env.find? `{THEOREM} | throwError "no {THEOREM}"
-  let witness : Array (String × String × Bool) := #[{witness}]
-  let say : String → Json → TermElabM Unit := fun tag j =>
-    logInfo (MessageData.ofFormat (Std.Format.text ("{m}" ++ tag ++ " " ++ j.compress)))
-  let scalar : Expr → Bool := fun t =>
-    t.isConstOf ``Real || t.isConstOf ``Rat || t.isConstOf ``Nat || t.isConstOf ``Int
-  let integral : Expr → Bool := fun t => t.isConstOf ``Nat || t.isConstOf ``Int
-  let define : Name → Expr → TermElabM Unit := fun name value => do
-    let ps := (collectLevelParams {{}} value).params.toList
-    let dv : DefinitionVal := {{ name := name, levelParams := ps, type := mkSort Level.zero,
-                                 value := value, hints := ReducibilityHints.abbrev,
-                                 safety := DefinitionSafety.safe }}
-    addDecl (Declaration.defnDecl dv)
-  liftTermElabM do
-    forallBoundedTelescope info.type (some {arity}) fun xs _ => do
-      if xs.size != {arity} then throwError "`{THEOREM}` has fewer binders than its header"
-      define `MinilabContraGoal_{nonce} (← mkForallFVars xs (mkConst ``False))
-      let mut fromV : Array Expr := #[]
-      let mut toV : Array Expr := #[]
-      for i in [0:xs.size] do
-        let x := xs[i]!
-        let d ← x.fvarId!.getDecl
-        let raw ← instantiateMVars d.type
-        let ty := raw.replaceFVars fromV toV
-        let closed := !ty.hasFVar && !ty.hasMVar
-        if ← isProp raw then
-          define (Name.mkSimple s!"MinilabWitness_{nonce}_{{i}}")
-            (if closed then ty else mkConst ``True)
-          say "PROP" (Json.mkObj [("index", toJson i), ("instantiated", toJson closed)])
-        else if d.binderInfo.isInstImplicit then
-          if closed then
-            match ← trySynthInstance ty with
-            | LOption.some e =>
-              fromV := fromV.push x
-              toV := toV.push e
-              say "SUBST" (Json.mkObj [("index", toJson i), ("ok", toJson true)])
-            | _ => pure ()
-        else
-          let key := d.userName.eraseMacroScopes.toString
-          match witness.find? (fun w => w.1 == key) with
-          | none => pure ()
-          | some (_, text, isInt) =>
-            let codomain := if ty.isForall && !ty.bindingBody!.hasLooseBVars
-              && ty.bindingDomain!.isAppOfArity ``Fin 1 then ty.bindingBody! else ty
-            if !(closed && scalar codomain) then
-              say "SUBST" (Json.mkObj [("index", toJson i), ("ok", toJson false),
-                ("detail", toJson "its type is not ℕ, ℤ, ℚ, ℝ, or a vector of one of them")])
-            else if !isInt && integral codomain then
-              say "SUBST" (Json.mkObj [("index", toJson i), ("ok", toJson false),
-                ("detail", toJson "the value is a fraction and the variable's type is ℕ or ℤ")])
-            else
-              match Parser.runParserCategory (← getEnv) `term text with
-              | Except.error e =>
-                say "SUBST" (Json.mkObj [("index", toJson i), ("ok", toJson false),
-                  ("detail", toJson e)])
-              | Except.ok stx =>
-                try
-                  let e ← Term.elabTermEnsuringType stx ty
-                  Term.synthesizeSyntheticMVarsNoPostponing
-                  let e ← instantiateMVars e
-                  if e.hasMVar || e.hasFVar then throwError "the value did not elaborate fully"
-                  fromV := fromV.push x
-                  toV := toV.push e
-                  say "SUBST" (Json.mkObj [("index", toJson i), ("ok", toJson true)])
-                catch ex =>
-                  say "SUBST" (Json.mkObj [("index", toJson i), ("ok", toJson false),
-                    ("detail", toJson ((← ex.toMessageData.toString).take 300))])
-      say "READY" Json.null
-"""
 
 
 _IDENT = re.compile(r"^[^\W\d][\w'.!?]*$")

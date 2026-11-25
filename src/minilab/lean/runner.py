@@ -4,21 +4,30 @@
 project and runs `lake env lean --json` on it. It reads Lean's messages back
 and gives a `LeanResult`.
 
-Axioms are not found from the source text. The runner puts `import Lean`
-before the source and appends one Lean command that walks every constant the
-file declares and prints the axioms of each. So a theorem in any form, an
-`axiom` declaration, and a definition all count. If that command gives no
-result (for example after `#exit`), the result is not `ok`: a missing axiom
-check never reads as "no axioms".
+No code in the source runs. The runner puts `import Minilab.Guard` before
+the source (`lean/Minilab/Guard.lean`, built once per process with
+`lake build`). Importing it turns Lean's code generation off for the whole
+file, and Lean runs code only through compiled code, so `#eval`, `eval%`,
+`decide +native`, an Aesop rule, or any elaborator that evaluates a term
+cannot run anything the source wrote. Lean's and Mathlib's own compiled
+tactics still run. This matters because code that runs could print a forged
+result, read the run's markers from the file, or exit early.
+
+Axioms are not found from the source text. The runner appends the guard's
+`#minilab_axioms` command, which walks every constant the file declares and
+prints the axioms of each. So a theorem in any form, an `axiom` declaration,
+and a definition all count. If that command gives no result (for example
+after `#exit`), the result is not `ok`: a missing axiom check never reads as
+"no axioms".
 
 The runner uses `lake env lean` and not the installed `lean-beam` tools.
 lean-beam keeps a Lean server running, but each check is a new file, so the
 server imports mathlib again every time; on this machine that took about 12
 seconds a check, against about 5 for `lake env lean` (bead minilab-335f82).
 
-Lean source may come from a model, and `#eval` can run IO. So Lean runs under
-bwrap: no network, a read-only view of the system, of the Lean toolchain, and
-of the `lean/` project, none of the user's other files, and a private /tmp.
+Lean still runs under bwrap, a second guard in case code does run: no
+network, a read-only view of the system, of the Lean toolchain, and of the
+`lean/` project, none of the user's other files, and a private /tmp.
 The whole process group is killed at the time limit.
 
 A time-out, or a missing toolchain, is never a verdict. A time-out gives
@@ -26,6 +35,7 @@ A time-out, or a missing toolchain, is never a verdict. A time-out gives
 `LeanUnavailable`.
 """
 
+import fcntl
 import json
 import os
 import shutil
@@ -40,6 +50,9 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 import minilab
 
 DEFAULT_TIMEOUT_S = 300.0
+
+# The longest the guard module may take to build, in seconds.
+GUARD_BUILD_TIMEOUT_S = 600.0
 
 # The most output read back from Lean, in bytes.
 MAX_OUTPUT = 16 * 1024**2
@@ -216,36 +229,24 @@ def _severity(raw: str) -> Severity:
     return "information"
 
 
-# The line put before the source, so the axiom check can use Lean's meta API.
-# Mathlib imports Lean already, so for Mathlib sources this costs nothing.
-IMPORT_LEAN = "import Lean\n"
+# The line put before the source. Importing the guard turns code generation
+# off for the whole file, so nothing the source writes can run, and defines
+# the axiom check (`lean/Minilab/Guard.lean`). It imports only Lean, so a
+# source without Mathlib stays cheap.
+IMPORT_GUARD = "import Minilab.Guard\n"
+
+# The guard's module name, and where its source is in the `lean/` project.
+GUARD_MODULE = "Minilab.Guard"
+GUARD_SOURCE = Path("Minilab") / "Guard.lean"
 
 # The axiom check prints one information message that starts with this.
 AXIOM_MARKER = "MINILAB_AXIOMS "
 
-# Appended after the source. It walks every constant the file declares (not
-# the imported ones) and prints, for each, its name with any private prefix
-# removed, whether it is a theorem, whether the name is internal, and the
-# axioms it depends on. Names are written in full so that the source's own
-# `open`s and namespaces do not change what they mean.
-AXIOM_CHECK = """
-#eval show Lean.Elab.Command.CommandElabM Unit from do
-  let env ← Lean.getEnv
-  let mut out : Array Lean.Json := #[]
-  for (name, info) in env.constants.map₂.toList do
-    let found ← Lean.collectAxioms name
-    let user := (Lean.privateToUserName? name).getD name
-    let isTheorem := match info with
-      | Lean.ConstantInfo.thmInfo _ => true
-      | _ => false
-    out := out.push (Lean.Json.mkObj [
-      ("name", Lean.toJson user.toString),
-      ("theorem", Lean.toJson isTheorem),
-      ("internal", Lean.toJson user.isInternal),
-      ("axioms", Lean.toJson (found.map Lean.Name.toString))])
-  Lean.logInfo (Lean.MessageData.ofFormat
-    (Std.Format.text ("MINILAB_AXIOMS " ++ (Lean.Json.arr out).compress)))
-"""
+# Appended after the source: the guard's command that walks every constant
+# the file declares (not the imported ones) and prints, for each, its name
+# with any private prefix removed, whether it is a theorem, whether the name
+# is internal, and the axioms it depends on.
+AXIOM_CHECK = "\n#minilab_axioms\n"
 
 _AXIOM_CHECK_LABEL = "(axiom check)"
 
@@ -255,7 +256,7 @@ def _parse(
 ) -> tuple[list[LeanMessage], list[str], list[list[_Constant]]]:
     """Lean's JSON messages, any other lines it printed, and the axiom check results.
 
-    Message lines are moved back by the one line of `IMPORT_LEAN`. Only an
+    Message lines are moved back by the one line of `IMPORT_GUARD`. Only an
     information message from the appended lines counts as an axiom check
     result, so the source cannot print one of its own.
     """
@@ -301,6 +302,43 @@ def _error_text(message: LeanMessage) -> str:
     return f"{message.line}:{message.column}: {message.text}"
 
 
+_guard_built: set[Path] = set()
+
+
+def _build_guard(project: Path, lake: Path) -> None:
+    """Build the guard module once per process, so its compiled code is current.
+
+    This runs our own Lean, not the source being checked, so it needs no
+    sandbox. Lake rebuilds only if the guard's source changed. Raise
+    LeanUnavailable if the build fails: a check never runs without the guard.
+    """
+    if project in _guard_built:
+        return
+    if not (project / GUARD_SOURCE).exists():
+        raise LeanUnavailable(f"the guard {project / GUARD_SOURCE} is missing")
+    lock_path = project / ".lake" / "minilab-guard.lock"
+    with open(lock_path, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            done = subprocess.run(
+                [str(lake), "build", GUARD_MODULE],
+                cwd=project,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                env=_env(lake),
+                timeout=GUARD_BUILD_TIMEOUT_S,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise LeanUnavailable(f"building {GUARD_MODULE} timed out") from exc
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+    if done.returncode != 0:
+        detail = (done.stdout + done.stderr).decode("utf-8", "replace")[-2000:]
+        raise LeanUnavailable(f"building {GUARD_MODULE} failed: {detail}")
+    _guard_built.add(project)
+
+
 def check_lean(
     source: str, timeout_s: float = DEFAULT_TIMEOUT_S, *, project: Path | None = None
 ) -> LeanResult:
@@ -314,10 +352,11 @@ def check_lean(
     if not (project / ".lake").exists():
         raise LeanUnavailable(f"{project / '.lake'} is missing; run `lake exe cache get`")
     lake = _lake()
+    _build_guard(project, lake)
 
     body = source if source.endswith("\n") else source + "\n"
     source_lines = body.count("\n")
-    text = IMPORT_LEAN + body + AXIOM_CHECK
+    text = IMPORT_GUARD + body + AXIOM_CHECK
 
     handle, path_text = tempfile.mkstemp(prefix=CHECK_PREFIX, suffix=".lean", dir=project)
     source_file = Path(path_text)

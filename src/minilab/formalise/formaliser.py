@@ -8,18 +8,26 @@ top-level theorem named `conjecture` whose proof is `sorry`. Each assumption
 and the domain of validity are named hypotheses of that theorem.
 
 Model code must never run while Lean compiles the file: code that runs can
-write the markers the checks read. Two gates come before any compile.
-`source_problems` reads the text and refuses imports other than Mathlib, a
-list of dangerous words, any name with `minilab` in it (the checks add
-declarations with that prefix), and any number of `sorry`s other than one.
-Comments and string literals do not count, and `«…»` names are opaque.
-Then `command_check` has Lean parse the file, held only as a string, and
-refuses every top-level command outside an allowlist (`open`, `namespace`,
-`section`, `end`, `universe`, and `def`, `abbrev`, `theorem`, `lemma`,
-`structure`, `inductive` declarations), any attribute, `instance`,
-`variable`, `unsafe`, `partial`, `set_option`, `native_decide`, and any
-`do` block (which `run_tac`, `by_elab` and their kin need). The allowlist is
-the guard; the word list is a cheap first pass.
+print a forged result, read the run's marker from the file, or exit early.
+The Lean runner imports the guard (`lean/Minilab/Guard.lean`) into every
+file it checks. The guard turns code generation off, so no declaration in
+the file gets code and nothing it writes can run: not `#eval`, `eval%`,
+`decide +native`, an Aesop rule, nor any elaborator that evaluates a term.
+Our checks are the guard's own commands, compiled when it is built, given
+their inputs as literals.
+
+Two text gates come before the compile, as a second guard and to give the
+model reasons it can act on. `source_problems` reads the text and refuses
+imports other than Mathlib, a list of dangerous words, any name with
+`minilab` in it (the checks add declarations with that prefix), and any
+number of `sorry`s other than one. Comments and string literals do not
+count, and `«…»` names are opaque. Then `command_check` has Lean parse the
+file, held only as a string, and refuses every top-level command outside an
+allowlist (`open`, `namespace`, `section`, `end`, `universe`, and `def`,
+`abbrev`, `theorem`, `lemma`, `structure`, `inductive` declarations), any
+attribute, `instance`, `variable`, `unsafe`, `partial`, `set_option`,
+`native_decide`, `eval%`, `plausible`, Aesop rule clauses, `decide` with a
+configuration, and any `do` block.
 
 `formal_from_source` then compiles the file once, with a probe appended. The
 probe finds `conjecture` in Lean's environment and prints each binder written
@@ -59,8 +67,9 @@ SORRY_AXIOM = "sorryAx"
 STANDARD_AXIOMS: frozenset[str] = frozenset({"propext", "Classical.choice", "Quot.sound"})
 """The axioms a file may use, besides `sorryAx` in `conjecture` itself."""
 
-# The longest binder or conclusion type the probe prints, in characters. The
-# Lean runner keeps at most 4000 characters of a message.
+# The longest binder or conclusion type the probe prints, in characters: the
+# guard's `maxTypeChars`. The Lean runner keeps at most 4000 characters of a
+# message.
 MAX_TYPE_CHARS = 1500
 
 
@@ -393,153 +402,20 @@ def lean_string_literal(text: str) -> str:
     return '"' + "".join(out) + '"'
 
 
-ALLOWED_COMMANDS: tuple[str, ...] = (
-    "Lean.Parser.Command.open",
-    "Lean.Parser.Command.namespace",
-    "Lean.Parser.Command.section",
-    "Lean.Parser.Command.end",
-    "Lean.Parser.Command.universe",
-    "Lean.Parser.Command.declaration",
-    "lemma",
-)
-"""The top-level commands a formalisation may use. `open … in` is allowed
-around an allowed command."""
-
-ALLOWED_DECLARATIONS: tuple[str, ...] = (
-    "Lean.Parser.Command.definition",
-    "Lean.Parser.Command.theorem",
-    "Lean.Parser.Command.abbrev",
-    "Lean.Parser.Command.structure",
-    "Lean.Parser.Command.inductive",
-    "Lean.Parser.Command.classInductive",
-)
-"""The kinds of `declaration` a formalisation may use: no `instance`,
-`axiom`, `opaque`, or `example`."""
-
-DENIED_KINDS: tuple[str, ...] = (
-    "Lean.Parser.Term.attributes",
-    "Lean.Parser.Command.unsafe",
-    "Lean.Parser.Command.partial",
-    "Lean.Parser.Tactic.runTac",
-    "Lean.Parser.Term.byElab",
-    "Lean.Parser.Tactic.nativeDecide",
-)
-"""Syntax that may appear nowhere in a formalisation. Besides these, any
-`do` block (a syntax kind whose last part starts with `doSeq`) and any
-`set_option` are refused: `run_tac`, `by_elab` and their kin take a `do`
-block and run it while the file compiles."""
-
-
-def _lean_names(kinds: tuple[str, ...]) -> str:
-    return "[" + ", ".join(f"`{k}" for k in kinds) + "]"
-
-
 def _command_check(source: str, marker: str) -> str:
     """A Lean file that parses `source` without running it and lists what it may not use.
 
-    The model's text is only a string literal here: Lean parses it with
-    Mathlib's syntax, and elaborates only its `open`, `namespace`, `section`
-    and `end` commands (so scoped notation parses). It prints `PROBLEM` for
-    each refusal, then `ARITY` (how many binders `conjecture` has before its
-    colon, or null), then `DONE`.
+    The model's text is only a string literal here, given to the guard's
+    `#minilab_command_check` (`lean/Minilab/Guard.lean`, which holds the
+    allowlist). Lean parses it with Mathlib's syntax and elaborates only its
+    `open`, `namespace`, `section` and `end` commands (so scoped notation
+    parses). It prints `PROBLEM` for each refusal, then `ARITY` (how many
+    binders `conjecture` has before its colon, or null), then `DONE`.
     """
-    return f"""import Mathlib
-
-open Lean Parser Elab Command
-
-partial def minilabCheckKinds (s : Syntax) (acc : Array (SyntaxNodeKind × Syntax)) :
-    Array (SyntaxNodeKind × Syntax) :=
-  match s with
-  | .node _ k args => args.foldl (fun a c => minilabCheckKinds c a) (acc.push (k, s))
-  | _ => acc
-
-def minilabCheckArity (sig : Syntax) : Nat :=
-  sig[0].getArgs.foldl (fun n b =>
-    let k := b.getKind
-    if k == ``Lean.Parser.Term.explicitBinder || k == ``Lean.Parser.Term.implicitBinder
-        || k == ``Lean.Parser.Term.strictImplicitBinder then n + b[1].getNumArgs
-    else n + 1) 0
-
-#eval show CommandElabM Unit from do
-  let src : String := {lean_string_literal(source)}
-  let say : String → Json → CommandElabM Unit := fun tag j =>
-    logInfo (MessageData.ofFormat (Std.Format.text ("{marker}" ++ tag ++ " " ++ j.compress)))
-  let allowedCmds : List Name := {_lean_names(ALLOWED_COMMANDS)}
-  let allowedDecls : List Name := {_lean_names(ALLOWED_DECLARATIONS)}
-  let denied : List Name := {_lean_names(DENIED_KINDS)}
-  let inputCtx := Parser.mkInputContext src "<formalisation>"
-  let (_, mps, msgs) ← Parser.parseHeader inputCtx
-  let mut mps := mps
-  let mut msgs := msgs
-  let mut problems : Array String := #[]
-  let mut depth : Int := 0
-  let mut arity : Option Nat := none
-  let lineOf : Syntax → Nat := fun s => (inputCtx.fileMap.toPosition (s.getPos?.getD 0)).line
-  repeat
-    let scope ← getScope
-    let pmctx : Parser.ParserModuleContext :=
-      {{ env := ← getEnv, options := scope.opts, currNamespace := scope.currNamespace,
-         openDecls := scope.openDecls }}
-    let (cmd, mps', msgs') := Parser.parseCommand inputCtx pmctx mps msgs
-    mps := mps'
-    msgs := msgs'
-    if Parser.isTerminalCommand cmd then break
-    let line := lineOf cmd
-    -- `open … in` around a command: check the `open`, then the command.
-    let mut inner := cmd
-    let mut opens : Array Syntax := #[]
-    while inner.getKind == ``Lean.Parser.Command.in do
-      opens := opens.push inner[0]
-      inner := inner[2]
-    let k := inner.getKind
-    let mut fine := true
-    for o in opens do
-      if o.getKind != ``Lean.Parser.Command.open then
-        problems := problems.push s!"line {{line}}: only `open … in` may wrap a command"
-        fine := false
-    if !allowedCmds.contains k then
-      problems := problems.push s!"line {{line}}: the command `{{k}}` is not allowed"
-      fine := false
-    else if k == ``Lean.Parser.Command.declaration && !allowedDecls.contains inner[1].getKind then
-      let dk := inner[1].getKind
-      problems := problems.push s!"line {{line}}: the declaration kind `{{dk}}` is not allowed"
-      fine := false
-    for (kind, node) in minilabCheckKinds cmd #[] do
-      let last := match kind with
-        | .str _ s => s
-        | _ => ""
-      let what := if last.startsWith "doSeq" then some "a `do` block"
-        else if denied.contains kind || last == "set_option" then some s!"`{{kind}}`"
-        else none
-      if let some w := what then
-        let ln := if last.startsWith "doSeq" then line else lineOf node
-        let p := s!"line {{ln}}: {{w}} is not allowed"
-        if !problems.contains p then problems := problems.push p
-        fine := false
-      if kind == ``Lean.Parser.Command.declId && depth == 0 && node[0].getId == `{THEOREM} then
-        let sig := (minilabCheckKinds cmd #[]).find? (fun p => p.1 == ``Lean.Parser.Command.declSig)
-        match sig with
-        | some (_, s) => arity := some (minilabCheckArity s)
-        | none => pure ()
-    if fine && opens.isEmpty then
-      if k == ``Lean.Parser.Command.namespace || k == ``Lean.Parser.Command.section then
-        depth := depth + 1
-      if k == ``Lean.Parser.Command.end then
-        depth := depth - 1
-      if k == ``Lean.Parser.Command.open || k == ``Lean.Parser.Command.namespace
-          || k == ``Lean.Parser.Command.section || k == ``Lean.Parser.Command.end then
-        try elabCommand cmd
-        catch e => problems := problems.push s!"line {{line}}: {{← e.toMessageData.toString}}"
-  for m in msgs.toList do
-    if m.severity == .error then
-      problems := problems.push s!"Lean could not parse the file: {{(← m.toString).take 300}}"
-  if depth != 0 then
-    problems := problems.push "every `namespace` and `section` must be closed with `end`"
-  for p in problems.toList.take 20 do
-    say "PROBLEM" (toJson (p.take 300))
-  say "ARITY" (toJson arity)
-  say "DONE" Json.null
-"""
+    return (
+        "import Mathlib\n\n"
+        f"#minilab_command_check {lean_string_literal(marker)} {lean_string_literal(source)}\n"
+    )
 
 
 def command_check(
@@ -548,10 +424,13 @@ def command_check(
     """What the file may not use, and how many binders `conjecture` has before its colon.
 
     Lean parses the file without running any of it (`_command_check`). Only
-    the commands in `ALLOWED_COMMANDS` and declarations in
-    `ALLOWED_DECLARATIONS` may appear, and none of `DENIED_KINDS`, a `do`
-    block, or `set_option`. This is the guard against model code running
-    while the file compiles. Raise LeanTimeout if Lean hits `timeout_s`.
+    the commands and declaration kinds on the guard's allowlist may appear,
+    and none of its denied syntax: attributes, `unsafe`, `partial`,
+    `run_tac`, `by_elab`, `native_decide`, `eval%`, `plausible`, Aesop rule
+    clauses, `decide` with a configuration, a `do` block, or `set_option`.
+    No model code runs in any Lean check, since the guard turns code
+    generation off; the allowlist is a second guard that gives the model a
+    reason it can act on. Raise LeanTimeout if Lean hits `timeout_s`.
     """
     marker = f"MINILAB_CMD_{secrets.token_hex(8)}_"
     result = check_lean(_command_check(strip_comments(source), marker), timeout_s)
@@ -581,7 +460,8 @@ def command_check(
 
 PROBE_PREFIX = "MINILAB_PROBE_"
 
-# The most file definitions one binder, the conclusion, or a definition lists.
+# The most file definitions one binder, the conclusion, or a definition
+# lists: the guard's `maxDefsListed`.
 MAX_DEFS_LISTED = 50
 
 
@@ -591,69 +471,14 @@ def new_nonce() -> str:
 
 
 def probe(marker: str, arity: int) -> str:
-    """The Lean command appended after the model's source; see `formal_from_source`."""
-    return f"""
-open Lean Meta Elab Command in
-#eval show CommandElabM Unit from do
-  let say : String → Json → CommandElabM Unit := fun tag j =>
-    logInfo (MessageData.ofFormat (Std.Format.text ("{marker}" ++ tag ++ " " ++ j.compress)))
-  let env ← getEnv
-  let mut fileDefs : Array Name := #[]
-  for (name, ci) in env.constants.map₂.toList do
-    let user := (privateToUserName? name).getD name
-    if user.isInternal || user.isInternalDetail then continue
-    if isAuxRecursor env name || isNoConfusion env name || isMatcherCore env name
-        || (env.isProjectionFn name) || isInstanceCore env name then continue
-    -- Lean records where each declaration the source wrote is; the ones it
-    -- generates (`noConfusionType`, `ctorIdx`, deriving helpers) have no range.
-    if (← findDeclarationRanges? name).isNone then continue
-    match ci with
-    | ConstantInfo.defnInfo _ => fileDefs := fileDefs.push name
-    | _ => pure ()
-  let userName : Name → String := fun n => ((privateToUserName? n).getD n).toString
-  let mentions : Expr → Json := fun e =>
-    toJson ((fileDefs.filter (fun n => e.containsConst (· == n))).toList.take {MAX_DEFS_LISTED}
-      |>.map userName)
-  for name in fileDefs do
-    let some ci := env.find? name | continue
-    let ax ← collectAxioms name
-    say "DEF" (Json.mkObj [("name", toJson (userName name)),
-      ("sorry", toJson (ax.contains ``sorryAx)), ("uses", mentions (ci.value?.getD ci.type))])
-  match env.find? `{THEOREM} with
-  | none => say "NONE" Json.null
-  | some info =>
-    let isThm := match info with
-      | ConstantInfo.thmInfo _ => true
-      | _ => false
-    liftTermElabM do
-      forallBoundedTelescope info.type (some {arity}) fun xs body => do
-        if xs.size != {arity} then
-          throwError "`{THEOREM}` has fewer binders than its header"
-        for i in [0:xs.size] do
-          let d ← xs[i]!.fvarId!.getDecl
-          let ty ← instantiateMVars d.type
-          let mut deps : Array Nat := #[]
-          for j in [0:i] do
-            if ty.containsFVar xs[j]!.fvarId! then deps := deps.push j
-          let isP ← Meta.isProp ty
-          let s := toString (← ppExpr ty)
-          logInfo (MessageData.ofFormat (Std.Format.text ("{marker}BINDER " ++
-            (Json.mkObj [("index", toJson i),
-              ("name", toJson d.userName.eraseMacroScopes.toString),
-              ("prop", toJson isP), ("instance", toJson d.binderInfo.isInstImplicit),
-              ("deps", toJson deps), ("defs", mentions ty),
-              ("type", toJson (s.take {MAX_TYPE_CHARS})),
-              ("truncated", toJson (decide (s.length > {MAX_TYPE_CHARS})))]).compress)))
-        let b ← instantiateMVars body
-        let mut deps : Array Nat := #[]
-        for j in [0:xs.size] do
-          if b.containsFVar xs[j]!.fvarId! then deps := deps.push j
-        let s := toString (← ppExpr b)
-        logInfo (MessageData.ofFormat (Std.Format.text ("{marker}BODY " ++
-          (Json.mkObj [("theorem", toJson isThm), ("deps", toJson deps), ("defs", mentions b),
-            ("type", toJson (s.take {MAX_TYPE_CHARS})),
-            ("truncated", toJson (decide (s.length > {MAX_TYPE_CHARS})))]).compress)))
-"""
+    """The command appended after the model's source; see `formal_from_source`.
+
+    The probe is the guard's `#minilab_probe` (`lean/Minilab/Guard.lean`),
+    compiled when the guard is built. It finds `conjecture` in Lean's
+    environment and prints each of its first `arity` binders, its
+    conclusion, and the file's definitions.
+    """
+    return f"\n#minilab_probe {lean_string_literal(marker)} {arity}\n"
 
 
 class _RawBinder(BaseModel):
