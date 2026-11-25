@@ -38,10 +38,13 @@ from minilab.models.adapter import (
 )
 from minilab.models.backends import (
     MAX_ARG_BYTES,
+    STDERR_KEEP_BYTES,
     ClaudeBackend,
     CodexBackend,
     GeminiBackend,
     LocalBackend,
+    OutputTooLarge,
+    _exchange,  # pyright: ignore[reportPrivateUsage]
     estimate_tokens,
     parse_agy,
     parse_claude,
@@ -191,7 +194,7 @@ def test_adapter_failure_leaves_record_unchanged(store: RecordStore, ledger: Led
     [charge] = ledger.charges()
     assert charge.estimated
     assert charge.family is Family.codex
-    assert charge.tokens_out == 0
+    assert charge.tokens_out == Budget(tokens_per_pair=1).reserve_output_tokens
     assert charge.tokens_in == estimate_tokens("prompt")
 
 
@@ -470,7 +473,42 @@ def test_failed_call_input_is_at_least_the_prompt_estimate(ledger: Ledger) -> No
     with pytest.raises(ModelUnavailable):
         _call(ledger, FakeBackend(Family.codex, error=error))
     [charge] = ledger.charges()
-    assert (charge.tokens_in, charge.tokens_out) == (estimate_tokens("prompt"), 0)
+    assert charge.tokens_in == estimate_tokens("prompt")
+
+
+def test_failed_call_with_no_reported_output_is_charged_its_allowance(ledger: Ledger) -> None:
+    # A timeout reports nothing; the call may well have written output, so the charge keeps
+    # the output allowance it reserved rather than freeing it for other calls.
+    error = ModelUnavailable("claude: timed out after 900 s")
+    with pytest.raises(ModelUnavailable):
+        call(Family.claude, Role.encode, "prompt", record_id=None, pair=PAIR, ledger=ledger,
+             budget=Budget(tokens_per_pair=100, reserve_output_tokens=77),
+             backends={Family.claude: FakeBackend(Family.claude, error=error)})
+    [charge] = ledger.charges()
+    assert (charge.tokens_in, charge.tokens_out) == (estimate_tokens("prompt"), 77)
+
+
+def test_failed_call_with_reported_zero_output_is_charged_zero(ledger: Ledger) -> None:
+    error = ModelUnavailable("claude: usage limit", tokens_in=3, tokens_out=0)
+    with pytest.raises(ModelUnavailable):
+        _call(ledger, FakeBackend(Family.claude, error=error))
+    [charge] = ledger.charges()
+    assert charge.tokens_out == 0
+
+
+def test_charge_failing_after_a_good_call_leaves_the_reservation_open(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken_charge(**_: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ledger, "charge", broken_charge)
+    with pytest.raises(OSError, match="disk full"):
+        call(Family.claude, Role.encode, "prompt", record_id=None, pair=PAIR, ledger=ledger,
+             budget=Budget(tokens_per_pair=100, reserve_output_tokens=9),
+             backends={Family.claude: FakeBackend(Family.claude)})
+    [held] = ledger.open_reservations()
+    assert ledger.pair_spend(PAIR) == held.tokens == estimate_tokens("prompt") + 9
 
 
 def test_not_started_call_is_not_charged(ledger: Ledger) -> None:
@@ -624,8 +662,9 @@ def test_pair_lock_lets_only_the_budget_through(
     ]
     lines = [proc.communicate(timeout=60)[0].split() for proc in procs]
     outcomes = sorted(line[-1] for line in lines)
-    # Each call reserves 1 (the prompt) + 59 tokens, so two fit under 100 and the rest wait
-    # for no one: they are refused at once.
+    # Each call reserves estimate_tokens("p") == 1 plus an output allowance of 59 = 60 tokens.
+    # The first two see spend 0 and 60, both under 100, so both run at once; the last two
+    # see 120 and are refused without waiting.
     assert outcomes == ["ok", "ok", "refused", "refused"]
     assert ledger.pair_spend(PAIR) == 120
     assert ledger.open_reservations() == []
@@ -1150,7 +1189,7 @@ def test_budget_default_output_allowance() -> None:
 def test_run_command_fails_past_the_output_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(backends_module, "MAX_OUTPUT_BYTES", 1 << 20, raising=False)
+    monkeypatch.setattr(backends_module, "MAX_OUTPUT_BYTES", 1 << 20)
     pid_file = tmp_path / "pid"
     tool = _tool(tmp_path, "tool", f"""
 import os, sys, time
@@ -1162,9 +1201,11 @@ sys.stdout.flush()
 time.sleep(60)
 """)
     started = time.monotonic()
-    with pytest.raises(ModelUnavailable, match="more than 1048576 bytes"):
+    with pytest.raises(OutputTooLarge, match="more than 1048576 bytes") as caught:
         run_command([tool], stdin="", cwd=tmp_path, env=scrubbed_env(), timeout_s=20)
     assert time.monotonic() - started < 15
+    assert caught.value.tokens_out is not None
+    assert caught.value.tokens_out > (1 << 20) // 4
     pid = int(pid_file.read_text())
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
@@ -1178,10 +1219,8 @@ time.sleep(60)
         pytest.fail("the tool outlived an oversized call")
 
 
-def test_run_command_keeps_only_the_end_of_a_flood_of_stderr(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(backends_module, "MAX_OUTPUT_BYTES", 1 << 20, raising=False)
+def test_run_command_reports_the_end_of_a_flood_of_stderr(tmp_path: Path) -> None:
+    # Guards the stderr tail in the error message; the cap itself is tested below.
     tool = _tool(tmp_path, "tool", """
 import sys
 for _ in range(160):
@@ -1204,3 +1243,47 @@ sys.stdout.buffer.write(data[::-1])
     prompt = "ab" * (1 << 20)
     out = run_command([tool], stdin=prompt, cwd=tmp_path, env=scrubbed_env(), timeout_s=20)
     assert out == prompt[::-1]
+
+
+def test_exchange_keeps_only_the_tail_of_stderr(tmp_path: Path) -> None:
+    tool = _tool(tmp_path, "tool", """
+import sys
+for _ in range(160):
+    sys.stderr.write("e" * 65536)
+sys.stderr.write("THE END")
+""")
+    proc = subprocess.Popen([tool], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    out, err = _exchange(proc, b"", timeout_s=20, max_out=1 << 20)
+    assert out == b""
+    assert len(err) == STDERR_KEEP_BYTES
+    assert err.endswith(b"THE END")
+
+
+def test_oversized_output_is_charged_as_output(
+    ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(backends_module, "MAX_OUTPUT_BYTES", 1 << 16)
+    tool = _tool(tmp_path, "tool", """
+import sys, time
+sys.stderr.write("flooding")
+sys.stderr.flush()
+time.sleep(0.3)
+sys.stdout.write("x" * (1 << 20))
+""")
+
+    class Flood:
+        family = Family.claude
+
+        def run(
+            self, prompt: str, *, cwd: Path, env: Mapping[str, str], timeout_s: float
+        ) -> ModelReply:
+            run_command([tool], stdin=prompt, cwd=cwd, env=env, timeout_s=timeout_s)
+            raise AssertionError("unreachable")
+
+    with pytest.raises(OutputTooLarge, match="flooding"):
+        call(Family.claude, Role.encode, "prompt", record_id=None, pair=PAIR, ledger=ledger,
+             budget=Budget(tokens_per_pair=100, reserve_output_tokens=5),
+             backends={Family.claude: Flood()})
+    [charge] = ledger.charges()
+    assert charge.tokens_out > (1 << 16) // 4

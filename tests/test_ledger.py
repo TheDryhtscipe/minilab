@@ -761,7 +761,43 @@ def test_settling_charge_must_match_the_reservation(store: RecordStore) -> None:
             pair=PAIR, stage=Stage.encoding, family=Family.codex, tokens_in=1,
             tokens_out=0, seconds=0.0, estimated=False, reservation=reservation,
         )
+    with pytest.raises(ValueError, match="stage"):
+        ledger.charge(
+            pair=PAIR, stage=Stage.prover, family=Family.claude, tokens_in=1,
+            tokens_out=0, seconds=0.0, estimated=False, reservation=reservation,
+        )
     assert ledger.pair_spend(PAIR) == 50
+
+
+def test_settling_charge_must_name_the_reserved_record(store: RecordStore) -> None:
+    store.create(_record("a"))
+    store.create(_record("b"))
+    ledger = _ledger(store)
+    reservation = _reserve(ledger, 50, record_id="run-1.a")
+    for record_id in ("run-1.b", None):
+        with pytest.raises(ValueError, match="record"):
+            ledger.charge(
+                pair=PAIR, stage=Stage.encoding, family=Family.claude, tokens_in=1,
+                tokens_out=0, seconds=0.0, estimated=False, record_id=record_id,
+                reservation=reservation,
+            )
+    assert ledger.pair_spend(PAIR) == 50
+
+
+def test_reservation_logged_twice_on_disk_is_corrupt(store: RecordStore, tmp_path: Path) -> None:
+    ledger = _ledger(store)
+    _reserve(ledger, 5)
+    path = tmp_path / "runs" / RUN / "ledger.jsonl"
+    path.write_bytes(path.read_bytes() * 2)
+    with pytest.raises(CorruptLedger, match="line 2: reservation .* logged twice"):
+        ledger.entries()
+
+
+def test_open_reservation_adds_no_stage_seconds(store: RecordStore) -> None:
+    store.create(_record("a"))
+    ledger = _ledger(store)
+    _reserve(ledger, 5, record_id="run-1.a")
+    assert ledger.costs("run-1.a").seconds == {}
 
 
 def test_reserve_refuses_what_charge_refuses(store: RecordStore) -> None:
