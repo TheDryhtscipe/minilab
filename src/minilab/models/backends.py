@@ -72,9 +72,6 @@ SYSTEM_PROMPT = (
 _CLAUDE_LIMIT = re.compile(r"^\s*Claude AI usage limit reached")
 """Claude has printed this usage limit message as a result that is not marked an error."""
 
-MAX_ARG_BYTES = 120_000
-"""Largest prompt agy can take: Linux caps one argument at 128 KiB."""
-
 
 class ModelUnavailable(Exception):
     """The tool failed, timed out, or hit a usage limit. No reply exists.
@@ -705,17 +702,20 @@ class GeminiBackend:
         self.model = model
         self.binary = binary or str(Path.home() / ".local" / "bin" / "agy")
 
-    def argv(self, prompt: str = "") -> list[str]:
-        """agy reads its prompt only from the command line (`--print=<prompt>`), not stdin."""
+    def argv(self) -> list[str]:
+        """The prompt goes on stdin (`--input-format stream-json`), not on the command
+        line, so it has no 128 KiB argument limit and other local users cannot read it
+        in the process list."""
         argv = [
             self.binary,
+            "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--disable-slash-commands",
             "--settings", json.dumps(AGY_SETTINGS),
         ]
         if self.model is not None:
             argv += ["--model", self.model]
-        return argv + [f"--print={prompt}"]
+        return argv
 
     def run(
         self, prompt: str, *, cwd: Path, env: Mapping[str, str], timeout_s: float
@@ -727,17 +727,19 @@ class GeminiBackend:
         makes an empty home folder, `cwd/.home`, for `HOME` and the XDG folders. So
         agy loads none of the user's rules, memories, skills, hooks, plugins, or
         MCP servers, and keeps no record of the call; it still finds the user's
-        login in the OS keyring over D-Bus. It raises `ModelNotStarted` for a
-        prompt over `MAX_ARG_BYTES`, one with a NUL character or that is not valid
-        text (see `run_command`), a `cwd` inside a repository, or a hook or home
-        folder that cannot be written.
+        login in the OS keyring over D-Bus. The prompt goes to agy on stdin as
+        one stream-json user message. It raises `ModelNotStarted` for an empty or
+        blank prompt, one that is not valid text, a `cwd` inside a repository, or a
+        hook or home folder that cannot be written.
         """
-        size = len(prompt.encode("utf-8", errors="replace"))
-        if size > MAX_ARG_BYTES:
-            raise ModelNotStarted(
-                f"agy: prompt is {size} bytes; the limit for one "
-                f"command-line argument is {MAX_ARG_BYTES}"
-            )
+        if not prompt.strip():
+            raise ModelNotStarted("agy: the prompt is empty")
+        try:
+            prompt.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ModelNotStarted(f"agy: the prompt is not valid text: {exc}") from exc
+        # One user message on one line: json.dumps escapes every line break.
+        message = json.dumps({"event": "user", "message": {"content": prompt}}) + "\n"
         here = cwd.resolve()
         for folder in (here, *here.parents):
             for marker in _AGY_REPOSITORY_MARKERS:
@@ -764,9 +766,9 @@ class GeminiBackend:
         }
         model = self.model or "agy-default"
         return _run_and_parse(
-            self.argv(prompt),
+            self.argv(),
             lambda out: parse_agy(out, model=model, nonce=nonce, prompt=prompt),
-            stdin="", cwd=cwd, env=own_env, timeout_s=timeout_s,
+            stdin=message, cwd=cwd, env=own_env, timeout_s=timeout_s,
         )
 
 

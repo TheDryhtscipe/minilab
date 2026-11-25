@@ -36,7 +36,6 @@ from minilab.models.adapter import (
     scrubbed_env,
 )
 from minilab.models.backends import (
-    MAX_ARG_BYTES,
     ClaudeBackend,
     CodexBackend,
     GeminiBackend,
@@ -576,8 +575,10 @@ def test_backend_command_lines_carry_isolation_flags() -> None:
     for feature in ("shell_tool", "unified_exec", "browser_use", "computer_use", "apps",
                     "plugins"):
         assert feature in codex
-    agy = GeminiBackend().argv("-starts with a dash")
-    assert agy[-1] == "--print=-starts with a dash"
+    agy = GeminiBackend().argv()
+    assert agy[agy.index("--input-format") + 1] == "stream-json"
+    assert agy[agy.index("--output-format") + 1] == "stream-json"
+    assert not any(a.startswith(("-p", "--print", "--prompt")) for a in agy)
     settings = json.loads(agy[agy.index("--settings") + 1])
     assert settings["allowNonWorkspaceAccess"] is False
     assert settings["useG1Credits"] is False
@@ -1076,7 +1077,17 @@ if not os.path.isfile(".agents/hooks.json"):
 home = os.path.join(os.getcwd(), ".home")
 if os.environ["HOME"] != home or not os.environ["XDG_CONFIG_HOME"].startswith(home + "/"):
     sys.exit("not the call's own home: " + os.environ["HOME"])
-[prompt] = [a[len("--print="):] for a in sys.argv if a.startswith("--print=")]
+# The prompt comes as one stream-json user message on stdin, never on the command line.
+if "--input-format" not in sys.argv or any(a.startswith(("-p", "--print", "--prompt"))
+                                            for a in sys.argv):
+    sys.exit("not reading the prompt from stdin: " + repr(sys.argv))
+[line] = sys.stdin.read().splitlines()
+message = json.loads(line)
+if message["event"] != "user" or set(message) != {"event", "message"}:
+    sys.exit("not a user message: " + line[:200])
+prompt = message["message"]["content"]
+if any(prompt in a for a in sys.argv):
+    sys.exit("the prompt is on the command line")
 # Run the hook as agy does, and report a denied tool with its reason.
 [named] = json.load(open(".agents/hooks.json")).values()
 command = named["PreToolUse"][0]["hooks"][0]["command"]
@@ -1136,6 +1147,19 @@ def test_gemini_backend_end_to_end(tmp_path: Path) -> None:
     fail = GeminiBackend(binary=_tool(tmp_path, "agy_fail", _AGY_FAIL))
     with pytest.raises(ModelUnavailable, match="quota exceeded"):
         fail.run("hi", cwd=tmp_path, env=env, timeout_s=10)
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    ["/help", "two\nlines\r\nand \"quotes\" \\ and \u2028 separators", "@notes.txt é \0 nul",
+     "x" * 400_000],
+    ids=["slash", "newlines", "at-and-nul", "large"],
+)
+def test_gemini_backend_sends_the_prompt_on_stdin_intact(tmp_path: Path, prompt: str) -> None:
+    # Over stdin the prompt has no command-line size limit, and it reaches agy unchanged.
+    backend = GeminiBackend(binary=_tool(tmp_path, "agy_ok", _AGY_OK))
+    reply = backend.run(prompt, cwd=tmp_path, env=scrubbed_env(), timeout_s=30)
+    assert reply.text == "got " + prompt
 
 
 def test_gemini_backend_fails_a_call_in_which_a_tool_ran(tmp_path: Path) -> None:
@@ -1211,13 +1235,11 @@ def test_failed_tool_charged_with_its_reported_usage(ledger: Ledger, tmp_path: P
     assert (charge.tokens_in, charge.tokens_out, charge.estimated) == (500, 60, True)
 
 
-@pytest.mark.parametrize(
-    "prompt", ["x" * (MAX_ARG_BYTES + 1000), "a\0b", "bad \ud800"], ids=["size", "nul", "text"]
-)
+@pytest.mark.parametrize("prompt", ["bad \ud800", "", "  \n"], ids=["text", "empty", "blank"])
 def test_agy_refusals_not_started_and_not_charged(
     ledger: Ledger, tmp_path: Path, prompt: str
 ) -> None:
-    # MAX_ARG_BYTES + 1000 still fits in one Linux argument, so only the size check stops it.
+    # json.dumps would escape a lone surrogate, so the backend must refuse it itself.
     marker = tmp_path / "ran"
     tool = _tool(tmp_path, "agy", f"open({str(marker)!r}, 'w').write('x')\n" + _AGY_OK)
     backend = GeminiBackend(binary=tool)
