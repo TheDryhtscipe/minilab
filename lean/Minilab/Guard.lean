@@ -599,7 +599,10 @@ def probe (marker : String) (arity : Nat) (opens : Array Name) : CommandElabM Un
 
 /-- Run `probe`. Lean prints the types of `fun`, `∃` and other inner
 binders (`pp.funBinderTypes`): `∃ y, …` hides whether `y` is an integer or
-a real. -/
+a real. It also prints the type of every numeral (`pp.numericTypes`): with
+no type, `x ^ (1 / 2)` has a natural-number exponent, 0, and prints the same
+as the square root `x ^ ((1 : ℝ) / 2)`; `∃ ε > 0, …` hides whether `ε` is a
+natural number. -/
 @[command_elab probeCmd] def elabProbe : CommandElab := fun stx => do
   let some marker := stx[1].isStrLit? | throwError "expected the marker"
   let some arity := stx[2].isNatLit? | throwError "expected the arity"
@@ -609,8 +612,9 @@ a real. -/
       | .ok t => pure t.toName
       | .error e => throwError "the opens could not be read: {e}"
     | .error e => throwError "the opens could not be read: {e}"
-  withScope (fun sc => { sc with opts := sc.opts.setBool `pp.funBinderTypes true })
-    (probe marker arity opens)
+  let printing : Options → Options := fun o =>
+    (o.setBool `pp.funBinderTypes true).setBool `pp.numericTypes true
+  withScope (fun sc => { sc with opts := printing sc.opts }) (probe marker arity opens)
 
 -- ## The vacuity goals
 

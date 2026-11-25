@@ -31,6 +31,7 @@ from minilab.formalise.formaliser import (
     formalise,
     formaliser_family,
     lean_statement,
+    lean_view,
     source_problems,
     strip_comments,
 )
@@ -430,7 +431,9 @@ def test_audit_weakening_is_stated_not_rejected(store: RecordStore) -> None:
 
 def test_script_matches_stated_text_and_checker_skips_it(store: RecordStore) -> None:
     ledger = make_ledger(store)
-    record = make_record(assumptions=["0 ≤ x"])
+    # Lean prints every numeral with its type (eighth review), so the
+    # script matches only text written the same way.
+    record = make_record(assumptions=["(0 : ℝ) ≤ x"])
     store.create(record)
     formal = probed(SIMPLE)
     assert script_matches(record, formal) == {"hx": "assumption 1"}
@@ -517,7 +520,7 @@ def test_stage_writes_roundtrip_and_audit(store: RecordStore) -> None:
         {
             "formalise": [lean_block(SIMPLE)],
             "roundtrip": ["For x ≥ 0, x³ ≥ 0."],
-            "audit": [audit_reply({})],
+            "audit": [audit_reply({"hx": ("matches", "assumption 1")})],
         }
     )
     run_formaliser_stage(
@@ -667,7 +670,7 @@ def test_ordinary_file_passes_and_only_header_binders_count() -> None:
     assert [b.name for b in formal.binders] == ["m", "x", "y", "", "z", "h"]
     # The unnamed instance binder has no name (Lean's `inst✝` is not one).
     assert formal.binders[3].label == "#3"
-    assert formal.conclusion.startswith("∀ ε > 0")
+    assert formal.conclusion.startswith("∀ ε > (0 : ℝ)"), formal.conclusion
     # Only the definitions the source wrote: no matchers, no deriving helpers.
     assert sorted(formal.definitions) == ["Foo.g", "S", "f"]
     assert next(b for b in formal.binders if b.name == "h").defs == ["Foo.g"]
@@ -815,11 +818,11 @@ theorem conjecture (n : ℕ) (hn : 2 ≤ n) : 0 < n := by
         (
             "import Mathlib\ntheorem conjecture (x : {t : ℝ // 1 < t}) (n : ℕ+) :\n"
             "    (1 : ℝ) < (x : ℝ) ^ (n : ℕ) := sorry\n",
-            "1 < t",
+            "(1 : ℝ) < t",
         ),
         (
             "import Mathlib\ntheorem conjecture (x : ℝ) : (0 < x → x ^ 3 > 0) ∧ True := sorry\n",
-            "0 < x →",
+            "(0 : ℝ) < x →",
         ),
     ],
 )
@@ -945,15 +948,15 @@ def _past_the_allowlist(monkeypatch: pytest.MonkeyPatch, name: str) -> FormalOut
 def test_model_code_cannot_forge_the_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     formal = _past_the_allowlist(monkeypatch, "forge_probe.lean")
     # The forged probe claims `(h : 0 ≤ n)` and `n + 0 = n`; Lean has `n < 0` and `n = 5`.
-    assert [b.type for b in formal.binders] == ["ℕ", "n < 0"], formal
-    assert formal.conclusion == "n = 5"
+    assert [b.type for b in formal.binders] == ["ℕ", "n < (0 : ℕ)"], formal
+    assert formal.conclusion == "n = (5 : ℕ)", formal.conclusion
     assert not formal.ok
     assert any("aesop" in p for p in formal.problems), formal.problems
 
 
 def test_model_code_cannot_forge_the_vacuity_check(monkeypatch: pytest.MonkeyPatch) -> None:
     formal = _past_the_allowlist(monkeypatch, "forge_vacuity.lean")
-    assert [b.type for b in formal.binders] == ["ℕ", "n < 0"], formal
+    assert [b.type for b in formal.binders] == ["ℕ", "n < (0 : ℕ)"], formal
     # Forced through, as if every earlier guard had passed it.
     forced = formal.model_copy(update={"ok": True, "problems": []})
     witness = Instance(values={"n": "3"}, precision_digits=30)
@@ -1116,8 +1119,10 @@ def test_the_statement_is_what_lean_read_as_conjecture() -> None:
     formal = probed(source)
     assert formal.ok, formal.problems
     # Built from what Lean printed: the `letI` is already unfolded.
-    assert formal.lean_statement.startswith("theorem conjecture (n : ℕ) (h : n < 3) :")
-    assert formal.lean_statement.endswith("n < 5 + 0 ∧ n = 7"), formal.lean_statement
+    assert formal.lean_statement.startswith("theorem conjecture (n : ℕ) (h : n < (3 : ℕ)) :")
+    assert formal.lean_statement.endswith("n < (5 : ℕ) + (0 : ℕ) ∧ n = (7 : ℕ)"), (
+        formal.lean_statement
+    )
 
 
 OPEN_LEAK = """import Mathlib
@@ -1415,7 +1420,7 @@ def test_the_probe_prints_each_definitions_body() -> None:
     )
     assert formal.ok, formal.problems
     shown: dict[str, str] = getattr(formal, "definition_text", {})
-    assert "x < 0" in shown.get("Below", ""), shown
+    assert "x < (0 : ℝ)" in shown.get("Below", ""), shown
     assert "IsTame.intro" in shown.get("IsTame", ""), shown
     assert "side" in shown.get("Box", ""), shown
 
@@ -1480,7 +1485,7 @@ theorem conjecture (x : ℝ) (h1 : 0 < x) : cos x ≤ 1 := sorry
 def test_the_statement_names_what_an_open_brought_in() -> None:
     formal = probed(OPEN_STATEMENT)
     assert formal.ok, formal.problems
-    assert "Trick.cos x ≤ 1" in formal.lean_statement, formal.lean_statement
+    assert "Trick.cos x ≤ (1 : ℝ)" in formal.lean_statement, formal.lean_statement
 
 
 # --- instances in definitions, literals, binder types, and cut text (seventh review) ---
@@ -1633,3 +1638,36 @@ def test_a_definition_cut_by_the_probe_is_refused() -> None:
 def test_only_mathlib_itself_may_be_imported() -> None:
     source = SIMPLE.replace("import Mathlib", "import Mathlib.Data.Real.Basic")
     assert any("only `import Mathlib`" in p for p in source_problems(source))
+
+
+# --- numeral types (eighth review) ---
+
+
+def test_a_natural_number_exponent_prints_differently_from_a_real_one() -> None:
+    # `1 / 2` with no type is a natural number, 0, so `x ^ (1 / 2)` is 1.
+    head = "import Mathlib\n\ntheorem conjecture (x : ℝ) (h1 : 0 < x) : "
+    nat = probed(head + "x ^ (1 / 2) ≤ 1 + x / 2 := sorry\n")
+    real = probed(head + "x ^ ((1 : ℝ) / 2) ≤ 1 + x / 2 := sorry\n")
+    assert nat.ok and real.ok, (nat.problems, real.problems)
+    assert lean_view(nat) != lean_view(real)
+    assert "ℕ" in nat.conclusion, nat.conclusion
+
+
+def test_script_never_matches_a_natural_number_exponent(store: RecordStore) -> None:
+    formal = probed(
+        "import Mathlib\n\ntheorem conjecture (v g : ℝ) (h1 : 0 < v) "
+        "(h2 : |g| ≤ (v + 1) ^ (1 / 2)) :\n    g ^ 2 ≤ v + 1 := sorry\n"
+    )
+    assert formal.ok, formal.problems
+    record = make_record(assumptions=["0 < v", "|g| ≤ (v + 1) ^ (1 / 2)"])
+    assert "h2" not in script_matches(record, formal)
+
+
+def test_a_binder_predicate_shows_its_variables_type() -> None:
+    formal = probed(
+        "import Mathlib\n\ntheorem conjecture (x C : ℝ) (h1 : 0 < x) "
+        "(h2 : ∃ ε > 0, x ^ ε ≤ C) : x ≤ C + 1 := sorry\n"
+    )
+    assert formal.ok, formal.problems
+    h2 = next(b for b in formal.binders if b.name == "h2")
+    assert "ℕ" in h2.type, h2.type
