@@ -73,6 +73,11 @@ Method = Literal[
     "exact_margin",
     "margin_ball",
     "primal_dual",
+    # A falsifier reformulation's maps and a mechanism's predicate
+    # (minilab.falsify). They take a point, like the encoding methods.
+    "there",
+    "back",
+    "predicate",
 ]
 
 # Limits on the child process tree.
