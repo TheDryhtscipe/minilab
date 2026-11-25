@@ -379,21 +379,45 @@ def test_parse_codex_failure_and_missing_usage() -> None:
     assert (reply.tokens_in, reply.tokens_out) == (10, 5)
 
 
-def _step(step_type: str, state: str, tool: str | None = None) -> dict[str, object]:
-    step: dict[str, object] = {"conversation_id": "c", "step_index": 1, "state": state,
+NONCE = "f00dfeedf00dfeed"
+
+
+def _step(
+    step_type: str,
+    state: str,
+    tool: str | None = None,
+    *,
+    index: int | None = 1,
+    error: str | None = None,
+    conversation: str = "c",
+) -> dict[str, object]:
+    step: dict[str, object] = {"conversation_id": conversation, "state": state,
                                "step_type": step_type}
+    if index is not None:
+        step["step_index"] = index
     if tool is not None:
         step["tool_name"] = tool
+    if error is not None:
+        step["tool_info"] = {"name": tool, "error": {"type": "TOOL_ERROR", "message": error}}
     return {"event": "step_update", "step_update": step}
+
+
+_HOOK_DENIAL = f"tool call denied by pre-tool hook: This session has no tools. {NONCE}"
+
+
+def _denied(tool: str, index: int) -> tuple[dict[str, object], dict[str, object]]:
+    """A tool step as agy 1.5.16 reports one the hook denied."""
+    return (_step("tool", "ACTIVE", tool, index=index),
+            _step("tool", "ERROR", tool, index=index, error=_HOOK_DENIAL))
 
 
 def _agy(result: Mapping[str, object], *steps: Mapping[str, object]) -> str:
     """agy 1.5.16 `--output-format stream-json` output: init, the steps, then the result."""
     events: list[Mapping[str, object]] = [
         {"event": "init", "conversation_id": "c", "init": {"tools": ["search_web"]}},
-        _step("user_input", "DONE"),
+        _step("user_input", "DONE", index=0),
         *steps,
-        _step("agent_response", "DONE"),
+        _step("agent_response", "DONE", index=99),
         {"event": "result", "result": result},
     ]
     return "\n".join(json.dumps(event) for event in events) + "\n"
@@ -403,39 +427,91 @@ _AGY_DONE = {"status": "SUCCESS", "response": "answer",
              "usage": {"input_tokens": 40, "output_tokens": 6, "total_tokens": 46}}
 
 
-def test_parse_agy_accepts_tools_that_were_blocked() -> None:
-    denied = (_step("tool", "ACTIVE", "search_web"), _step("tool", "ERROR", "search_web"))
-    assert parse_agy(_agy(_AGY_DONE, *denied), model="m").text == "answer"
+def test_parse_agy_accepts_tools_the_hook_denied() -> None:
+    steps = (*_denied("search_web", 2), _step("system_message", "DONE", index=3),
+             _step("subagent", "ACTIVE", "invoke_subagent", index=4),
+             _step("subagent", "ERROR", "invoke_subagent", index=4), *_denied("read_file", 5))
+    reply = parse_agy(_agy(_AGY_DONE, *steps), model="m", nonce=NONCE)
+    assert (reply.text, reply.tools_denied) == ("answer", 2)
+    assert parse_agy(_agy(_AGY_DONE), model="m", nonce=NONCE).tools_denied == 0
 
 
-@pytest.mark.parametrize("state", ["DONE", "CANCELED", ""])
+@pytest.mark.parametrize("state", ["DONE", "CANCELED", "ACTIVE", ""])
 def test_parse_agy_rejects_a_tool_that_was_not_blocked(state: str) -> None:
-    ran = (_step("tool", "ACTIVE", "search_web"), _step("tool", state, "search_web"))
+    ran = (_step("tool", "ACTIVE", "search_web", index=2),
+           _step("tool", state, "search_web", index=2, error=_HOOK_DENIAL))
+    if state == "ACTIVE":
+        ran = ran[:1]  # A stream that stops while the tool runs.
     with pytest.raises(ModelUnavailable, match="search_web") as caught:
-        parse_agy(_agy(_AGY_DONE, *ran), model="m")
+        parse_agy(_agy(_AGY_DONE, *ran), model="m", nonce=NONCE)
     # The call still used tokens, so the adapter can charge them.
     assert (caught.value.tokens_in, caught.value.tokens_out) == (40, 6)
 
 
-def test_parse_agy_rejects_unknown_step_types() -> None:
-    with pytest.raises(ModelUnavailable, match="browser_subagent"):
-        parse_agy(_agy(_AGY_DONE, _step("browser_subagent", "DONE")), model="m")
+def test_parse_agy_rejects_a_tool_that_ran_before_one_that_was_denied() -> None:
+    ran = (_step("tool", "ACTIVE", "search_web", index=2),
+           _step("tool", "DONE", "search_web", index=2))
+    with pytest.raises(ModelUnavailable, match=r"search_web \(DONE\)"):
+        parse_agy(_agy(_AGY_DONE, *ran, *_denied("read_file", 3)), model="m", nonce=NONCE)
+    # The same tool, run at one step and denied at a later one.
+    with pytest.raises(ModelUnavailable, match=r"search_web \(DONE\)"):
+        parse_agy(_agy(_AGY_DONE, *ran, *_denied("search_web", 3)), model="m", nonce=NONCE)
+    # The last update of a step counts: a denial reported first does not hide a later run.
+    flipped = (*_denied("search_web", 2), _step("tool", "DONE", "search_web", index=2))
+    with pytest.raises(ModelUnavailable, match="search_web"):
+        parse_agy(_agy(_AGY_DONE, *flipped), model="m", nonce=NONCE)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [None, "network unreachable",
+     "tool call denied by pre-tool hook: This session has no tools. 0123456789abcdef",
+     f"exit status 1: {NONCE}"],
+    ids=["no-error", "other-error", "other-nonce", "nonce-not-hook"],
+)
+def test_parse_agy_rejects_a_tool_error_that_is_not_this_calls_denial(error: str | None) -> None:
+    steps = (_step("tool", "ACTIVE", "run_command", index=2),
+             _step("tool", "ERROR", "run_command", index=2, error=error))
+    with pytest.raises(ModelUnavailable, match="not this call's hook denial"):
+        parse_agy(_agy(_AGY_DONE, *steps), model="m", nonce=NONCE)
+
+
+def test_parse_agy_rejects_steps_it_cannot_place() -> None:
+    no_index = (_step("tool", "ERROR", "search_web", index=None, error=_HOOK_DENIAL),)
+    with pytest.raises(ModelUnavailable, match="no step index"):
+        parse_agy(_agy(_AGY_DONE, *no_index), model="m", nonce=NONCE)
+    # A child conversation that reuses step 2: its run must not be hidden by our denial.
+    child = (_step("tool", "DONE", "search_web", index=2, conversation="child"),
+             *_denied("search_web", 2))
+    with pytest.raises(ModelUnavailable, match="another conversation"):
+        parse_agy(_agy(_AGY_DONE, *child), model="m", nonce=NONCE)
+    with pytest.raises(ModelUnavailable, match="invoke_subagent"):
+        parse_agy(_agy(_AGY_DONE, _step("subagent", "DONE", "invoke_subagent", index=2)),
+                  model="m", nonce=NONCE)
+    with pytest.raises(ModelUnavailable, match="unknown step type 'browser_subagent'"):
+        parse_agy(_agy(_AGY_DONE, _step("browser_subagent", "DONE")), model="m", nonce=NONCE)
 
 
 def test_parse_agy_rejects_broken_streams() -> None:
     whole = _agy(_AGY_DONE)
-    without_result = "".join(whole.splitlines(keepends=True)[:-1])
+    lines = whole.splitlines(keepends=True)
     with pytest.raises(ModelUnavailable, match="no result"):
-        parse_agy(without_result, model="m")
+        parse_agy("".join(lines[:-1]), model="m", nonce=NONCE)
     with pytest.raises(ModelUnavailable, match="more than one result"):
-        parse_agy(whole + whole.splitlines(keepends=True)[-1], model="m")
+        parse_agy(whole + lines[-1], model="m", nonce=NONCE)
+    with pytest.raises(ModelUnavailable, match="no init event"):
+        parse_agy("".join(lines[1:]), model="m", nonce=NONCE)
+    with pytest.raises(ModelUnavailable, match="more than one init"):
+        parse_agy(lines[0] + whole, model="m", nonce=NONCE)
     with pytest.raises(ModelUnavailable, match="not JSON"):
-        parse_agy("Loaded settings.\n" + whole, model="m")
+        parse_agy("Loaded settings.\n" + whole, model="m", nonce=NONCE)
     with pytest.raises(ModelUnavailable, match="not JSON"):
-        parse_agy(json.dumps({"status": "SUCCESS", "response": "answer"}) + "x", model="m")
+        parse_agy(json.dumps({"status": "SUCCESS", "response": "answer"}) + "x", model="m",
+                  nonce=NONCE)
     # The single JSON object of `--output-format json` has no step events to check.
     with pytest.raises(ModelUnavailable, match="unexpected event"):
-        parse_agy(json.dumps({"status": "SUCCESS", "response": "answer"}), model="m")
+        parse_agy(json.dumps({"status": "SUCCESS", "response": "answer"}), model="m",
+                  nonce=NONCE)
 
 
 def test_parse_agy() -> None:
@@ -446,15 +522,15 @@ def test_parse_agy() -> None:
         "usage": {"input_tokens": 12072, "output_tokens": 47, "thinking_tokens": 37,
                   "cache_read_tokens": 0, "total_tokens": 12119},
     }
-    reply = parse_agy(_agy(ok), model="gemini-x")
+    reply = parse_agy(_agy(ok), model="gemini-x", nonce=NONCE)
     assert reply == ModelReply(text="answer", tokens_in=12072, tokens_out=47, estimated=False,
                                model="gemini-x")
     # Tokens in the total that neither count covers are charged as input.
     ok["usage"] = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 20}
-    assert parse_agy(_agy(ok), model="gemini-x").tokens_in == 15
+    assert parse_agy(_agy(ok), model="gemini-x", nonce=NONCE).tokens_in == 15
     failed = {"status": "ERROR", "error": "quota exceeded"}
     with pytest.raises(ModelUnavailable):
-        parse_agy(_agy(failed), model="gemini-x")
+        parse_agy(_agy(failed), model="gemini-x", nonce=NONCE)
 
 
 def test_estimate_tokens_four_chars() -> None:
@@ -751,7 +827,7 @@ def test_short_maths_answers_are_replies(answer: str) -> None:
     message = {"type": "item.completed", "item": {"type": "agent_message", "text": answer}}
     assert parse_codex(_codex(message, _DONE), model="m").text == answer
     agy = {"status": "SUCCESS", "response": answer}
-    assert parse_agy(_agy(agy), model="m").text == answer
+    assert parse_agy(_agy(agy), model="m", nonce=NONCE).text == answer
 
 
 def test_parse_claude_subtype_must_be_success() -> None:
@@ -857,15 +933,15 @@ def test_parse_codex_counts() -> None:
 
 def test_parse_agy_empty_response_and_counts() -> None:
     with pytest.raises(ModelUnavailable, match="no reply text"):
-        parse_agy(_agy({"status": "SUCCESS", "response": ""}), model="m")
+        parse_agy(_agy({"status": "SUCCESS", "response": ""}), model="m", nonce=NONCE)
     failed = {"status": "ERROR", "error": "quota", "usage": {"input_tokens": 7,
                                                              "output_tokens": 1}}
     with pytest.raises(ModelUnavailable) as caught:
-        parse_agy(_agy(failed), model="m")
+        parse_agy(_agy(failed), model="m", nonce=NONCE)
     assert (caught.value.tokens_in, caught.value.tokens_out) == (7, 1)
     ok = {"status": "SUCCESS", "response": "answer",
           "usage": {"input_tokens": 1.2e4, "output_tokens": False}}
-    reply = parse_agy(_agy(ok), model="m")
+    reply = parse_agy(_agy(ok), model="m", nonce=NONCE)
     assert (reply.tokens_in, reply.tokens_out, reply.estimated) == (12000, 2, True)
 
 
@@ -994,18 +1070,31 @@ sys.exit(1)
 """
 
 _AGY_OK = """
-import json, os, sys
+import json, os, subprocess, sys
 if not os.path.isfile(".agents/hooks.json"):
     sys.exit("no hooks.json in the working directory")
+home = os.path.join(os.getcwd(), ".home")
+if os.environ["HOME"] != home or not os.environ["XDG_CONFIG_HOME"].startswith(home + "/"):
+    sys.exit("not the call's own home: " + os.environ["HOME"])
 [prompt] = [a[len("--print="):] for a in sys.argv if a.startswith("--print=")]
-steps = [{"step_index": 2, "step_type": "tool", "tool_name": "search_web", "state": state}
-         for state in json.loads(os.environ.get("FAKE_AGY_TOOL_STATES", "[]"))]
-for step in [{"step_type": "user_input", "state": "DONE"}, *steps,
-             {"step_type": "agent_response", "state": "DONE"}]:
-    print(json.dumps({"event": "step_update", "step_update": step}))
+# Run the hook as agy does, and report a denied tool with its reason.
+[named] = json.load(open(".agents/hooks.json")).values()
+command = named["PreToolUse"][0]["hooks"][0]["command"]
+decision = json.loads(subprocess.run(["sh", "-c", command], cwd=".agents", input="{}",
+                                     capture_output=True, text=True, check=True).stdout)
+denial = "tool call denied by pre-tool hook: " + decision["reason"]
+def step(**fields):
+    print(json.dumps({"event": "step_update", "step_update": {"conversation_id": "c", **fields}}))
+print(json.dumps({"event": "init", "conversation_id": "c", "init": {"tools": []}}))
+step(step_index=0, step_type="user_input", state="DONE")
+for state in json.loads(os.environ.get("FAKE_AGY_TOOL_STATES", "[]")):
+    error = {"error": {"message": denial}} if state == "ERROR" else {}
+    step(step_index=2, step_type="tool", tool_name="search_web", state=state, tool_info=error)
+step(step_index=3, step_type="agent_response", state="DONE")
 print(json.dumps({"event": "result", "result": {
     "status": "SUCCESS", "response": "got " + prompt,
     "usage": {"input_tokens": 12, "output_tokens": 5, "total_tokens": 17}}}))
+sys.exit(int(os.environ.get("FAKE_AGY_EXIT", "0")))
 """
 
 _AGY_FAIL = """
@@ -1057,6 +1146,32 @@ def test_gemini_backend_fails_a_call_in_which_a_tool_ran(tmp_path: Path) -> None
     with pytest.raises(ModelUnavailable, match="search_web") as caught:
         backend.run("hi", cwd=tmp_path, env=env, timeout_s=10)
     assert (caught.value.tokens_in, caught.value.tokens_out) == (12, 5)
+    # On a non-zero exit the error keeps the parser's reason as well as the exit.
+    env["FAKE_AGY_EXIT"] = "1"
+    with pytest.raises(ModelUnavailable, match=r"(?s)exit 1.*search_web \(DONE\)") as caught:
+        backend.run("hi", cwd=tmp_path, env=env, timeout_s=10)
+    assert (caught.value.tokens_in, caught.value.tokens_out) == (12, 5)
+
+
+def test_gemini_backend_counts_denied_tools_with_a_fresh_nonce(tmp_path: Path) -> None:
+    backend = GeminiBackend(binary=_tool(tmp_path, "agy_ok", _AGY_OK))
+    env = {**scrubbed_env(), "FAKE_AGY_TOOL_STATES": json.dumps(["ACTIVE", "ERROR"])}
+    assert backend.run("hi", cwd=tmp_path, env=env, timeout_s=10).tools_denied == 1
+    first = (tmp_path / ".agents" / "hooks.json").read_text()
+    backend.run("hi", cwd=tmp_path, env=env, timeout_s=10)
+    assert (tmp_path / ".agents" / "hooks.json").read_text() != first
+
+
+@pytest.mark.parametrize("marker", [".git", ".jj", ".hg"])
+def test_gemini_backend_will_not_run_inside_a_repository(tmp_path: Path, marker: str) -> None:
+    (tmp_path / marker).mkdir()
+    call_dir = tmp_path / "call"
+    call_dir.mkdir()
+    ran = tmp_path / "ran"
+    tool = _tool(tmp_path, "agy", f"open({str(ran)!r}, 'w').write('x')\n" + _AGY_OK)
+    with pytest.raises(ModelNotStarted, match="repository"):
+        GeminiBackend(binary=tool).run("hi", cwd=call_dir, env=scrubbed_env(), timeout_s=10)
+    assert not ran.exists()
 
 
 def test_gemini_backend_hook_denies_every_tool(tmp_path: Path) -> None:

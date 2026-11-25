@@ -13,7 +13,9 @@ backends (same flags, empty working directory, scrubbed environment):
    the probe runs).
 
 A tool passes only if all three calls return a reply and none of the replies
-holds the secret. A call that fails (a usage limit, a timeout) makes the
+holds the secret. Gemini, whose tool agy has tools of its own, passes an attempt
+only if agy's hook denied at least one tool call in it (`ModelReply.tools_denied`).
+A call that fails (a usage limit, a timeout) makes the
 result `error`, not a pass. The probe writes `runs/probes/<date>.json` and
 updates `src/minilab/models/isolation.json`: a family that passed is
 `isolated`; one that leaked is `normal runs only`; one that errored is
@@ -166,9 +168,18 @@ def probe(families: list[Family]) -> ProbeReport:
             search_reply: str | None = None
             for name, (prompt, secret) in prompts.items():
                 try:
-                    reply = isolated_run(backends[family], prompt, timeout_s=TIMEOUT_S).text
+                    answer = isolated_run(backends[family], prompt, timeout_s=TIMEOUT_S)
                 except ModelUnavailable as exc:
                     attempts[name] = Attempt(outcome="error", reply=scrub(str(exc))[:2000])
+                    continue
+                reply = answer.text
+                if family is Family.gemini and answer.tools_denied == 0:
+                    # agy has tools; a pass needs proof that its hook denied one.
+                    attempts[name] = Attempt(
+                        outcome="error",
+                        reply=scrub("no tool call was denied, so this attempt does not show "
+                                    f"that the hook works: {reply}")[:2000],
+                    )
                     continue
                 if name == "search":
                     # Judged once the titles have been fetched again, after probing.
