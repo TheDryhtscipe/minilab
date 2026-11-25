@@ -1,10 +1,11 @@
 """Tests for dual encodings and their agreement (build plan doc-5wh, Task 7, second half).
 
 Two families each write an encoding from the record alone. Both run in the
-sandbox on the same samples; margins and predicates must agree. Disagreement
-makes the record `ambiguous` and asks the generator family for a sharper
-statement, which becomes a child record. A record that is still ambiguous after
-two sharpenings is `abandoned` (minilab-e47de8).
+sandbox on the same samples; margins and predicates must agree. A broken
+encoding is asked for once more. Disagreement makes the record `ambiguous` and
+asks the generator family for a sharper statement, which becomes a child
+record. A record that is still ambiguous after two sharpenings is `abandoned`
+(minilab-e47de8).
 
 Every model here is a fake backend. The encodings really run in the sandbox.
 """
@@ -16,34 +17,53 @@ from pathlib import Path
 
 import pytest
 
+import minilab.encoding.sandbox as sandbox_module
 from minilab.encoding.agree import (
     Agreement,
+    SandboxUnavailable,
     agree,
+    child_id,
     encode_twice,
+    make_child,
     run_encoding_stage,
-    sharpen,
 )
 from minilab.encoding.prompts import encoding_prompt, extract_source, parse_statement
-from minilab.encoding.sandbox import Sandboxed
 from minilab.ledger import Ledger
 from minilab.models.adapter import Budget, ModelReply
-from minilab.records import Family, Provenance, Record, RecordStore, Stage, Status
+from minilab.records import (
+    Family,
+    Provenance,
+    Record,
+    RecordExists,
+    RecordStore,
+    Stage,
+    Status,
+)
 from minilab.run import MemoryPolicy, RunManifest, save_manifest
 
 RUN = "run-1"
 PAIR = ("information-theory", "optimisation")
 
 
-def toy(margin: str, *, key: str = "t", name: str = "Toy", capability: bool = True) -> str:
+def toy(
+    margin: str,
+    *,
+    key: str = "t",
+    name: str = "Toy",
+    capability: bool = True,
+    exact: str | None = None,
+    sample: str = "rng.randint(0, 9)",
+) -> str:
     """An encoding over one integer parameter `key` in 0..9 whose margin is `margin`.
 
-    `margin` is an expression in the Fraction `t`.
+    `margin` and `exact` (the exact_margin, by default the same) are expressions
+    in the Fraction `t`. `sample` draws the parameter.
     """
-    exact = (
+    exact_method = (
         f"""
     def exact_margin(self, x: Instance) -> Fraction:
         t = to_fraction(x.values["{key}"])
-        return {margin}
+        return {exact or margin}
 """
         if capability
         else ""
@@ -74,8 +94,8 @@ class {name}:
         return False
 
     def sample(self, rng: random.Random) -> Instance:
-        return Instance(values={{"{key}": str(rng.randint(0, 9))}}, precision_digits=30)
-{exact}
+        return Instance(values={{"{key}": str({sample})}}, precision_digits=30)
+{exact_method}
 
 ENCODING = {name}
 """
@@ -84,6 +104,7 @@ ENCODING = {name}
 GOOD = toy("1 - t / 10")
 OFF = toy("2 - t / 10", name="Off")
 RENAMED = toy("1 - t / 10", key="s", name="Renamed")
+BROKEN = "import os\n" + GOOD
 
 
 def fenced(source: str) -> str:
@@ -123,13 +144,30 @@ def is_encoding_prompt(prompt: str) -> bool:
     return "ENCODING" in prompt
 
 
+def in_turn(*sources: str) -> Callable[[], str]:
+    """Each call gives the next source; the last one repeats."""
+    queue = list(sources)
+
+    def next_source() -> str:
+        return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    return next_source
+
+
 def backends(
-    claude: str, codex: str, sharper: str = json.dumps(SHARPER)
+    claude: str | Callable[[], str],
+    codex: str | Callable[[], str],
+    sharper: str = json.dumps(SHARPER),
 ) -> dict[Family, FakeBackend]:
     """Claude and Codex encode with the given sources; any family answers a sharpen call."""
 
-    def answer(source: str) -> Reply:
-        return lambda prompt: fenced(source) if is_encoding_prompt(prompt) else sharper
+    def answer(source: str | Callable[[], str]) -> Reply:
+        def reply(prompt: str) -> str:
+            if not is_encoding_prompt(prompt):
+                return sharper
+            return fenced(source if isinstance(source, str) else source())
+
+        return reply
 
     return {
         Family.claude: FakeBackend(Family.claude, answer(claude)),
@@ -191,39 +229,69 @@ def test_agreeing_encodings_pass() -> None:
 
 def test_disagreeing_margins_do_not_agree() -> None:
     result = agree(GOOD, OFF, n=20, assumptions=1)
+    assert not result.agreed and result.broken is None
+    assert result.reason is not None and "margin differs" in result.reason
+
+
+def test_tiny_margins_of_opposite_sign_do_not_agree() -> None:
+    small = toy("Fraction(1, 10**40) * (1 - t / 10)", name="Small")
+    flipped = toy("-Fraction(1, 10**40) * (1 - t / 10)", name="Flipped")
+    result = agree(small, flipped, n=20, assumptions=1)
     assert not result.agreed
-    assert result.reason is not None and "margin" in result.reason
+    assert result.reason is not None and "margin differs" in result.reason
+
+
+def test_margins_are_compared_beyond_double_precision() -> None:
+    # A gap of 1e-17 relative is below a double's resolution; at 30 digits it shows.
+    nudged = toy("1 - t / 10 + Fraction(1, 10**17)", name="Nudged")
+    assert agree(GOOD, nudged, n=20, rtol=1e-9, assumptions=1).agreed
+    result = agree(GOOD, nudged, n=20, rtol=1e-20, assumptions=1)
+    assert not result.agreed
+    assert result.reason is not None and "margin differs" in result.reason
 
 
 def test_parameter_names_must_match() -> None:
     result = agree(GOOD, RENAMED, n=20, assumptions=1)
-    assert not result.agreed
+    assert not result.agreed and result.broken is None
     assert result.reason is not None and "parameter names" in result.reason
 
 
 def test_disagreeing_predicates_do_not_agree() -> None:
-    wider = GOOD.replace("0 <= t <= 9", "0 <= t <= 5").replace("class Toy", "class Narrow")
-    wider = wider.replace("ENCODING = Toy", "ENCODING = Narrow")
-    result = agree(GOOD, wider, n=40, assumptions=1)
+    narrow = toy("1 - t / 10", name="Narrow").replace("0 <= t <= 9", "0 <= t <= 5")
+    result = agree(GOOD, narrow, n=40, assumptions=1)
     assert not result.agreed
     assert result.reason is not None and "in_domain" in result.reason
 
 
 def test_assumption_count_must_match_the_record() -> None:
     result = agree(GOOD, GOOD, n=10, assumptions=2)
-    assert not result.agreed
+    assert not result.agreed and result.broken == "a"
     assert result.reason is not None and "assumptions" in result.reason
 
 
 def test_encoding_needs_a_certificate_capability() -> None:
     result = agree(GOOD, toy("1 - t / 10", name="Bare", capability=False), n=10, assumptions=1)
-    assert not result.agreed
+    assert not result.agreed and result.broken == "b"
     assert result.reason is not None and "exact_margin" in result.reason
 
 
-def test_failing_encoding_does_not_agree() -> None:
-    result = agree(GOOD, "import os\n" + GOOD, n=10, assumptions=1)
-    assert not result.agreed
+def test_certificate_method_must_match_its_margin() -> None:
+    liar = toy("1 - t / 10", name="Liar", exact="Fraction(-1000)")
+    result = agree(GOOD, liar, n=10, assumptions=1)
+    assert not result.agreed and result.broken == "b"
+    assert result.reason is not None and "contradicts its margin" in result.reason
+
+
+def test_constant_sampler_is_broken() -> None:
+    stuck = toy("1 - t / 5", name="Stuck", sample="0")
+    result = agree(stuck, toy("1 - t / 10", name="Also", sample="0"), n=20, assumptions=1)
+    assert not result.agreed and result.broken == "a"
+    assert result.reason is not None and "same point" in result.reason
+
+
+def test_failing_encoding_is_broken() -> None:
+    result = agree(GOOD, BROKEN, n=10, assumptions=1)
+    assert not result.agreed and result.broken == "b"
     assert result.reason is not None and "forbidden import" in result.reason
 
 
@@ -231,7 +299,13 @@ def test_out_of_domain_samples_do_not_count_as_agreement() -> None:
     outside = GOOD.replace("rng.randint(0, 9)", "rng.randint(20, 29)")
     result = agree(outside, outside, n=10, assumptions=1)
     assert not result.agreed
-    assert result.reason is not None and "domain" in result.reason
+    assert result.reason is not None and "in the domain" in result.reason
+
+
+def test_broken_sandbox_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sandbox_module, "_command", lambda: ["false"])
+    with pytest.raises(SandboxUnavailable):
+        agree(GOOD, GOOD, n=10, assumptions=1)
 
 
 # --- prompts ---
@@ -252,7 +326,7 @@ def test_extract_source_takes_the_fenced_block() -> None:
 
 @pytest.mark.parametrize(
     "text",
-    ["not json", json.dumps({**SHARPER, "statement": ""}), json.dumps(["a"]), "{}"],
+    ["not json", json.dumps({**SHARPER, "statement": " "}), json.dumps(["a"]), "{}"],
 )
 def test_parse_statement_refuses_bad_replies(text: str) -> None:
     with pytest.raises(ValueError):
@@ -305,8 +379,28 @@ def test_agreed_record_keeps_its_status_and_stores_both_encodings(
     ]
     for path in output.evidence:
         assert (store.root / "runs" / RUN / path).read_text().strip() == GOOD.strip()
-    encoders = [Sandboxed(source=s, family=f) for f, s in result.sources.items()]
-    assert {e.family for e in encoders} == {Family.claude, Family.codex}
+    assert set(result.sources) == {Family.claude, Family.codex}
+
+
+def test_broken_encoding_is_asked_for_once_more(store: RecordStore, ledger: Ledger) -> None:
+    store.create(make_record())
+    fakes = backends(GOOD, in_turn(BROKEN, GOOD))
+    result = run_encoding_stage(f"{RUN}.a", ledger=ledger, budget=BUDGET, backends=fakes, n=10)
+    assert result.agreement.agreed
+    assert store.load(f"{RUN}.a").stages[Stage.encoding].data["reasked"] == ["codex"]
+    retry = fakes[Family.codex].prompts[1]
+    assert "failed a check" in retry and "forbidden import" in retry
+    assert len(fakes[Family.claude].prompts) == 1
+    assert fakes[Family.gemini].prompts == []
+
+
+def test_encoding_broken_twice_gives_ambiguous(store: RecordStore, ledger: Ledger) -> None:
+    store.create(make_record())
+    fakes = backends(GOOD, BROKEN)
+    result = run_encoding_stage(f"{RUN}.a", ledger=ledger, budget=BUDGET, backends=fakes, n=10)
+    assert result.status is Status.ambiguous
+    assert len(fakes[Family.codex].prompts) == 2
+    assert result.child is not None
 
 
 def test_disagreeing_encodings_give_ambiguous(store: RecordStore, ledger: Ledger) -> None:
@@ -315,9 +409,11 @@ def test_disagreeing_encodings_give_ambiguous(store: RecordStore, ledger: Ledger
     result = run_encoding_stage(f"{RUN}.a", ledger=ledger, budget=BUDGET, backends=fakes, n=10)
     assert not result.agreement.agreed
     assert store.load(f"{RUN}.a").status is Status.ambiguous
+    # A disagreement is not a broken encoding: no family is asked again.
+    assert len(fakes[Family.codex].prompts) == 1
     # The generator family (Gemini here) was asked for a sharper statement.
     assert len(fakes[Family.gemini].prompts) == 1
-    assert result.child is not None
+    assert result.child is not None and result.child == child_id(make_record())
     child = store.load(result.child)
     assert child.provenance.parents == [f"{RUN}.a"]
     assert child.provenance.family is Family.gemini
@@ -331,7 +427,7 @@ def test_ambiguous_rounds_end_in_abandoned(store: RecordStore, ledger: Ledger) -
     fakes = backends(GOOD, OFF)
     record_id = f"{RUN}.a"
     statuses: list[Status] = []
-    for _ in range(3):
+    for _ in range(4):
         result = run_encoding_stage(record_id, ledger=ledger, budget=BUDGET, backends=fakes, n=10)
         statuses.append(store.load(record_id).status)
         if result.child is None:
@@ -342,22 +438,49 @@ def test_ambiguous_rounds_end_in_abandoned(store: RecordStore, ledger: Ledger) -
     assert len(fakes[Family.gemini].prompts) == 2
 
 
-def test_unparseable_sharpening_leaves_the_record_ambiguous(
+def test_unreadable_sharpening_is_abandoned_after_two_attempts(
     store: RecordStore, ledger: Ledger
 ) -> None:
     store.create(make_record())
     fakes = backends(GOOD, OFF, sharper="no json here")
     result = run_encoding_stage(f"{RUN}.a", ledger=ledger, budget=BUDGET, backends=fakes, n=10)
     assert result.child is None
-    assert store.load(f"{RUN}.a").status is Status.ambiguous
-    # Resume: a later sharpen call with a good reply makes the child.
-    good = backends(GOOD, OFF)
-    child = sharpen(f"{RUN}.a", ledger=ledger, budget=BUDGET, backends=good)
-    assert child is not None
-    assert store.load(child).provenance.parents == [f"{RUN}.a"]
-    # And sharpening again returns the same child, with no new call.
-    assert sharpen(f"{RUN}.a", ledger=ledger, budget=BUDGET, backends=good) == child
-    assert len(good[Family.gemini].prompts) == 1
+    assert result.status is Status.abandoned
+    assert store.load(f"{RUN}.a").status is Status.abandoned
+    assert len(fakes[Family.gemini].prompts) == 2
+
+
+def test_make_child_is_safe_to_repeat(store: RecordStore, ledger: Ledger) -> None:
+    store.create(make_record())
+    result = run_encoding_stage(
+        f"{RUN}.a", ledger=ledger, budget=BUDGET, backends=backends(GOOD, OFF), n=10
+    )
+    assert result.child is not None
+    assert make_child(store, f"{RUN}.a") == result.child
+    assert {r.id for r in store.list(RUN)} == {f"{RUN}.a", result.child}
+
+
+def test_child_id_held_by_another_record_is_refused(store: RecordStore, ledger: Ledger) -> None:
+    store.create(make_record())
+    squatter = make_record(local=child_id(make_record()).split(".", 1)[1])
+    store.create(squatter)
+    with pytest.raises(RecordExists):
+        run_encoding_stage(
+            f"{RUN}.a", ledger=ledger, budget=BUDGET, backends=backends(GOOD, OFF), n=10
+        )
+
+
+def test_broken_sandbox_leaves_the_record_unchanged(
+    store: RecordStore, ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store.create(make_record())
+    monkeypatch.setattr(sandbox_module, "_command", lambda: ["false"])
+    fakes = backends(GOOD, GOOD)
+    with pytest.raises(SandboxUnavailable):
+        run_encoding_stage(f"{RUN}.a", ledger=ledger, budget=BUDGET, backends=fakes, n=10)
+    record = store.load(f"{RUN}.a")
+    assert record.status is Status.proposed and Stage.encoding not in record.stages
+    assert fakes[Family.gemini].prompts == []
 
 
 def test_stage_refuses_a_record_that_is_not_proposed(store: RecordStore, ledger: Ledger) -> None:

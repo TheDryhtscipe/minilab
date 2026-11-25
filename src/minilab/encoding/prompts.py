@@ -8,7 +8,9 @@ Two prompts:
   instance family: both encoders must use those names, and a mismatch makes
   the record ambiguous (user decision, 25 Nov 2026).
 - `sharpen_prompt` asks the generator family for a sharper statement after the
-  encodings disagreed. `parse_statement` reads its JSON reply. Task 15's
+  encodings disagreed. `parse_statement` reads its JSON reply.
+- `retry_prompt` asks a family once more for an encoding that failed a check,
+  showing it only its own failure. Task 15's
   generator may reuse or replace this reader.
 """
 
@@ -78,6 +80,20 @@ Import only these modules: {allowed}. `minilab.encoding.api` gives
 change the working precision. Do not read files, use the network, or print.
 
 Reply with the module only, in one ```python block."""
+
+
+def retry_prompt(record: Record, failure: str) -> str:
+    """The encoding prompt again, with what was wrong with this family's own last attempt.
+
+    It shows nothing of the other family's encoding.
+    """
+    return (
+        encoding_prompt(record)
+        + f"""
+
+Your previous encoding of this conjecture failed a check: {failure}
+Write the whole module again, fixed."""
+    )
 
 
 def extract_source(text: str) -> str:
