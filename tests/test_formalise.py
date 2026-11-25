@@ -22,6 +22,7 @@ from pydantic import JsonValue
 from minilab.encoding.api import Instance
 from minilab.formalise.audit import AuditResult, audit, script_matches
 from minilab.formalise.formaliser import (
+    CommandCheck,
     FormalOutput,
     LeanTimeout,
     NoFormaliser,
@@ -634,9 +635,9 @@ def test_command_allowlist_refuses_before_compiling(bad: str, problem: str) -> N
 
 ORDINARY = """import Mathlib
 
-open Real
-
 noncomputable section
+
+open Real
 
 namespace Foo
 def g (x : ℝ) : ℝ := π * x
@@ -936,8 +937,8 @@ def _past_the_allowlist(monkeypatch: pytest.MonkeyPatch, name: str) -> FormalOut
     source = (ADVERSARIAL / name).read_text(encoding="utf-8")
     assert source_problems(source) == []
 
-    def no_problems(_source: str, *, timeout_s: float) -> tuple[list[str], int | None]:
-        return [], 2
+    def no_problems(_source: str, *, timeout_s: float) -> CommandCheck:
+        return CommandCheck([], 2, None)
 
     monkeypatch.setattr(formaliser, "command_check", no_problems)
     return formal_from_source(source, Family.claude, "m", timeout_s=LEAN_TIMEOUT)
@@ -1039,13 +1040,13 @@ theorem _lem : (1 : ℕ) = 2 := sorryAx _ false
 
 theorem conjecture (n : ℕ) (h : n < 3) : n < 5 := sorry
 """
-    problems, _arity = command_check(source, timeout_s=LEAN_TIMEOUT)
+    problems, _arity, _statement = command_check(source, timeout_s=LEAN_TIMEOUT)
     assert sum("`_c`" in p or "`_lem`" in p for p in problems) == 2, problems
     # Past the text gate and the allowlist, Lean's probe still names both.
     import minilab.formalise.formaliser as formaliser
 
-    def allowed(_source: str, *, timeout_s: float) -> tuple[list[str], int | None]:
-        return [], 2
+    def allowed(_source: str, *, timeout_s: float) -> CommandCheck:
+        return CommandCheck([], 2, None)
 
     monkeypatch.setattr(formaliser, "command_check", allowed)
     formal = _past_the_text_gate(monkeypatch, source)
@@ -1066,13 +1067,13 @@ def test_interpolated_strings_are_refused(note: str) -> None:
     source = SIMPLE.replace(
         "theorem conjecture", f"def note : String := toString {note}\n\ntheorem conjecture"
     )
-    problems, _arity = command_check(source, timeout_s=LEAN_TIMEOUT)
+    problems, _arity, _statement = command_check(source, timeout_s=LEAN_TIMEOUT)
     assert any("interpolated string" in p for p in problems), problems
 
 
 def test_open_in_cannot_wrap_a_scope_command() -> None:
     source = "import Mathlib\n\nopen Real in section\n\n" + SIMPLE.split("\n", 2)[2]
-    problems, _arity = command_check(source, timeout_s=LEAN_TIMEOUT)
+    problems, _arity, _statement = command_check(source, timeout_s=LEAN_TIMEOUT)
     assert any("open … in" in p for p in problems), problems
 
 
@@ -1083,8 +1084,98 @@ def test_conjecture_inside_a_section_is_top_level() -> None:
     assert [b.name for b in formal.binders] == ["x", "hx"]
 
 
-def test_conjecture_inside_a_namespace_is_not_top_level() -> None:
+def test_conjecture_inside_a_namespace_is_refused() -> None:
     source = "import Mathlib\n\nnamespace Foo\n\n" + SIMPLE.split("\n", 2)[2] + "\nend Foo\n"
-    problems, arity = command_check(source, timeout_s=LEAN_TIMEOUT)
-    assert problems == []
+    problems, arity, _statement = command_check(source, timeout_s=LEAN_TIMEOUT)
+    assert any("Foo.conjecture" in p for p in problems), problems
     assert arity is None
+
+
+# --- statements and names Lean and the text read differently (fourth adversarial review) ---
+
+DECOY = """import Mathlib
+
+namespace Shown
+theorem conjecture (n : ℕ) (h : n < 3) : n < 5 := by omega
+end Shown
+
+theorem «conjecture» (n : ℕ) (h : n < 3) : n < 2 := sorry
+"""
+
+
+def test_a_conjecture_outside_the_root_namespace_is_refused() -> None:
+    problems, _arity, _statement = command_check(DECOY, timeout_s=LEAN_TIMEOUT)
+    assert any("Shown.conjecture" in p for p in problems), problems
+    formal = formal_from_source(DECOY, Family.claude, "m", timeout_s=LEAN_TIMEOUT)
+    assert not formal.ok
+
+
+def test_the_statement_is_the_text_lean_read_as_conjecture() -> None:
+    source = (
+        "import Mathlib\n\ntheorem conjecture (n : ℕ) (h : n < 3) : "
+        "letI k : ℕ := 0; n < 5 + k ∧ n = 7 := sorry\n"
+    )
+    formal = probed(source)
+    assert formal.ok, formal.problems
+    assert formal.lean_statement == (
+        "theorem conjecture (n : ℕ) (h : n < 3) : letI k : ℕ := 0; n < 5 + k ∧ n = 7"
+    )
+
+
+OPEN_LEAK = """import Mathlib
+
+def bad (x : ℝ) : Prop := x < x
+
+theorem conjecture (x : ℝ) (hx : bad x) : x = 5 := sorry
+
+namespace Other
+def bad : ℕ := 0
+theorem Fin.sum_univ_succ : True := trivial
+end Other
+
+open Other
+"""
+
+
+def test_a_top_level_open_is_refused() -> None:
+    problems, _arity, _statement = command_check(OPEN_LEAK, timeout_s=LEAN_TIMEOUT)
+    assert any("top-level `open`" in p for p in problems), problems
+
+
+def test_open_inside_a_section_or_with_in_is_allowed() -> None:
+    source = """import Mathlib
+
+section
+open Real
+def g (x : ℝ) : ℝ := π * x
+end
+
+open Finset in
+theorem conjecture (x : ℝ) (h : 0 < g x) : 0 < x := sorry
+"""
+    problems, arity, _statement = command_check(source, timeout_s=LEAN_TIMEOUT)
+    assert problems == []
+    assert arity == 2
+
+
+@pytest.mark.parametrize("name", ["proof_1", "match_2", "eq_1", "omega_3", "Foo._x"])
+def test_names_lean_treats_as_internal_are_refused(name: str) -> None:
+    source = f"""import Mathlib
+
+def {name} (x : ℝ) : Prop := x < x
+
+theorem conjecture (x : ℝ) (hx : {name} x) : x = 5 := sorry
+"""
+    problems, _arity, _statement = command_check(source, timeout_s=LEAN_TIMEOUT)
+    assert any(f"`{name}`" in p and "internal" in p for p in problems), problems
+
+
+def test_a_cut_binder_type_is_marked_in_the_audit_prompt(store: RecordStore) -> None:
+    from minilab.formalise.audit import audit_prompt
+
+    formal = probed(SIMPLE)
+    cut = [b.model_copy(update={"truncated": True}) for b in formal.binders]
+    prompt = audit_prompt(
+        survived_record(store), formal.model_copy(update={"binders": cut}), cut[1:], set()
+    )
+    assert prompt.count("…(cut)") == 2, prompt

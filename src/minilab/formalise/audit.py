@@ -135,17 +135,22 @@ def script_matches(record: Record, formal: FormalOutput) -> dict[str, str]:
     return found
 
 
+def _shown(binder: Binder) -> str:
+    """The binder's type, marked if the probe cut it."""
+    return binder.type + (" …(cut)" if binder.truncated else "")
+
+
 def audit_prompt(
     record: Record, formal: FormalOutput, asked: list[Binder], failing: set[str]
 ) -> str:
     assumptions = "\n".join(f"  {i}. {a}" for i, a in enumerate(record.assumptions, 1))
     listed = "\n".join(
-        f"- {b.label} : {b.type}"
+        f"- {b.label} : {_shown(b)}"
         + ("  (this hypothesis fails at the falsifier's witness)" if b.label in failing else "")
         for b in asked
     )
     variables = "\n".join(
-        f"- {b.label} : {b.type}" + ("  (instance binder)" if b.instance else "")
+        f"- {b.label} : {_shown(b)}" + ("  (instance binder)" if b.instance else "")
         for b in formal.binders
         if not b.prop
     )

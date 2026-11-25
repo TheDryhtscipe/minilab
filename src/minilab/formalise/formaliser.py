@@ -28,7 +28,11 @@ parse the file, held only as a string, and refuses every top-level command
 outside an allowlist (`open`, `namespace`, `section`, `end`, `universe`, and
 `def`, `abbrev`, `theorem`, `lemma`, `structure`, `inductive`
 declarations), `open … in` around a command that opens or closes a scope,
-any declaration name with a part that starts with `_`, any attribute,
+an `open` outside any `section` or `namespace` (it would stay in force for
+the checks appended after the file), any declaration Lean would treat as
+internal (a part that starts with `_`, or a last part like `proof_1`), any
+declaration other than the root one whose name ends in `conjecture`, any
+attribute,
 `instance`, `variable`, `unsafe`, `partial`, `set_option`, `native_decide`,
 `eval%`, `plausible`, Aesop rule clauses, `decide` with a configuration, an
 interpolated string, and any `do` block. Every `namespace` and `section`
@@ -42,7 +46,10 @@ whether it is an instance binder, which earlier binders its type mentions,
 and which file definitions. It also prints the conclusion (which keeps any
 `∀` or `→` after the colon) and the definitions the file wrote. These come
 from Lean's own elaborated statement, not from reading the text, so the
-vacuity linter and the hypothesis audit work on what Lean will prove. Each
+vacuity linter and the hypothesis audit work on what Lean will prove. The
+linter treats only the propositions before the colon as hypotheses: a
+condition inside a variable's type (a subtype, a set, a structure's field)
+or a premise after the colon is not one of them. Each
 run's markers carry a random tag.
 
 The file is `ok` when Lean reports no error, `conjecture` is a theorem whose
@@ -57,6 +64,7 @@ import json
 import re
 import secrets
 from collections.abc import Iterable, Mapping
+from typing import NamedTuple
 
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
@@ -114,7 +122,9 @@ class Binder(BaseModel):
 class FormalOutput(BaseModel):
     """One formalisation: the Lean source and what the probe found in it.
 
-    `lean_statement` is the text of `conjecture` without its proof.
+    `lean_statement` is the text of `conjecture` without its proof, as Lean
+    parsed it (`command_check`); the text reading `lean_statement` only when
+    Lean did not find it.
     `binders` are the binders before the colon; `conclusion` is the rest.
     `definition_uses` maps each file definition to the file definitions its
     value mentions. `problems` says why the file is not `ok`. `attempts`
@@ -378,7 +388,12 @@ def checked_source(source: str) -> str:
 
 
 def lean_statement(source: str) -> str:
-    """The text of `conjecture` without its proof or comments; empty if not found."""
+    """The text after the first `theorem conjecture` header, up to its `:=`; empty if none.
+
+    This reads the text only, so it is a fallback for a file Lean never
+    parsed. `FormalOutput.lean_statement` comes from Lean (`command_check`)
+    whenever Lean found the root `conjecture`.
+    """
     stripped, code = _scan(source)
     span = _statement_span(code)
     if span is None:
@@ -426,32 +441,51 @@ def _command_check(source: str, marker: str) -> str:
     )
 
 
-def command_check(
-    source: str, *, timeout_s: float = DEFAULT_LEAN_TIMEOUT_S
-) -> tuple[list[str], int | None]:
-    """What the file may not use, and how many binders `conjecture` has before its colon.
+_SPAN: TypeAdapter[tuple[int, int]] = TypeAdapter(tuple[int, int])
+
+
+class CommandCheck(NamedTuple):
+    """What `command_check` found.
+
+    `problems` are its refusals. `arity` is how many binders `conjecture` has
+    before its colon, or None if Lean found no `conjecture` at the root.
+    `statement` is the text Lean parsed as `conjecture`, from its first token
+    to the end of its type, or None.
+    """
+
+    problems: list[str]
+    arity: int | None
+    statement: str | None
+
+
+def command_check(source: str, *, timeout_s: float = DEFAULT_LEAN_TIMEOUT_S) -> CommandCheck:
+    """What the file may not use, how many binders `conjecture` has, and its statement.
 
     Lean parses the file without running any of it (`_command_check`). Only
     the commands and declaration kinds on the guard's allowlist may appear,
     and none of its denied syntax: attributes, `unsafe`, `partial`,
     `run_tac`, `by_elab`, `native_decide`, `eval%`, `plausible`, Aesop rule
     clauses, `decide` with a configuration, an interpolated string, a `do`
-    block, or `set_option`. `open … in` may not wrap a scope command, no
-    declaration name may have a part that starts with `_`, and every
-    `namespace` and `section` must be closed. `conjecture` counts inside a
-    `section` but not inside a `namespace`.
+    block, or `set_option`. `open … in` may not wrap a scope command, an
+    `open` must be inside a `section` or `namespace`, no declaration may
+    have a name Lean treats as internal, and every `namespace` and `section`
+    must be closed. Only the root `conjecture` may have that last name; one
+    inside a `section` counts. The statement is the text Lean parsed as
+    `conjecture`, from its first token to the end of its type.
     No model code runs in any Lean check, since the guard turns code
     generation off; the allowlist is a second guard that gives the model a
     reason it can act on. Raise LeanTimeout if Lean hits `timeout_s`.
     """
+    text = checked_source(source).encode("utf-8")
     marker = f"MINILAB_CMD_{secrets.token_hex(8)}_"
     result = check_lean(
-        _command_check(checked_source(source), marker), timeout_s, options=CHECK_OPTIONS
+        _command_check(text.decode("utf-8"), marker), timeout_s, options=CHECK_OPTIONS
     )
     if result.timed_out:
         raise LeanTimeout(f"Lean did not finish the command check in {timeout_s} s")
     problems: list[str] = []
     arity: int | None = None
+    statement: str | None = None
     done = 0
     for tag, payload in marker_messages(result, 0, marker):
         try:
@@ -463,11 +497,19 @@ def command_check(
             problems.append(value)
         elif tag == "ARITY" and (value is None or (isinstance(value, int) and value >= 0)):
             arity = value
+        elif tag == "STATEMENT" and value is not None:
+            try:
+                start, end = _SPAN.validate_python(value)
+            except ValidationError:
+                problems.append("the command check's statement range could not be read")
+                continue
+            if 0 <= start <= end <= len(text):
+                statement = text[start:end].decode("utf-8", "replace").strip()
         elif tag == "DONE":
             done += 1
     if done != 1:
         problems.append("the command check did not finish: " + "; ".join(result.errors)[:1000])
-    return problems, arity
+    return CommandCheck(problems, arity, statement)
 
 
 # --- the probe ---
@@ -627,7 +669,9 @@ def formal_from_source(
     problems = source_problems(source)
     if problems:
         return refused(problems)
-    problems, arity = command_check(source, timeout_s=timeout_s)
+    problems, arity, parsed = command_check(source, timeout_s=timeout_s)
+    if parsed is not None:
+        statement = parsed
     if not problems and arity is None:
         problems.append(f"there is no top-level theorem named `{THEOREM}`")
     if problems or arity is None:
@@ -756,6 +800,8 @@ Rules for the file:
   hypothesis of the theorem (`(h1 : ...)`). Add no hypothesis that the
   conjecture does not state.
 - Name the variables after the parameters of the instance family.
+- Write `open` only as `open … in` before a declaration, or inside a
+  `section … end`. Do not put the theorem in a `namespace`.
 - Write no comments. Use no `axiom`, `set_option`, `macro`, `notation`, or
   `#eval`, and no name containing "minilab".
 

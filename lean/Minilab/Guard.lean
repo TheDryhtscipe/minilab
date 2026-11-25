@@ -147,19 +147,30 @@ def scopeCommands : List Name :=
   [``Lean.Parser.Command.open, ``Lean.Parser.Command.namespace,
    ``Lean.Parser.Command.section, ``Lean.Parser.Command.end]
 
-/-- Whether a part of `n` starts with `_`: Lean treats such a name as
-internal, and some checks skip internal names. -/
-def underscored (n : Name) : Bool :=
-  n.components.any fun c => match c with
+/-- Whether Lean treats `n` as internal: a part starts with `_`, or the last
+part is `eq_N`, `match_N`, `proof_N` or `omega_N` (`Name.isInternalDetail`).
+The probe skips such names, so a formalisation may not declare them. -/
+def internalName (n : Name) : Bool :=
+  n.isInternal || n.isInternalDetail || n.components.any fun c => match c with
     | .str _ s => s.startsWith "_"
     | _ => false
 
+/-- Whether the last part of `n` is `conjecture`. -/
+def endsInConjecture (n : Name) : Bool :=
+  match n with
+  | .str _ s => s == "conjecture"
+  | _ => false
+
 /-- Parse `source` with the environment's syntax, without elaborating it
 (only its `open`, `namespace`, `section` and `end` commands, so scoped
-notation parses). `conjecture` counts only where the current namespace is
-the root: inside a `section` it does, inside a `namespace` it does not.
+notation parses). `conjecture` counts only where its full name is
+`conjecture`: inside a `section` it does; inside a `namespace`, or written
+`Foo.conjecture`, it is refused. An `open` must not outlast the file: it
+must be `open … in` or inside a `section` or `namespace`.
 Print `PROBLEM` for each refusal, then `ARITY` (how many binders
-`conjecture` has before its colon, or null), then `DONE`. The scopes the
+`conjecture` has before its colon, or null), `STATEMENT` (the UTF-8 byte
+range of `conjecture` from its first token to the end of its type, or
+null), then `DONE`. The scopes the
 source opened are closed again before the command ends. -/
 @[command_elab commandCheckCmd] def elabCommandCheck : CommandElab := fun stx => do
   let some marker := stx[1].isStrLit? | throwError "expected the marker"
@@ -171,6 +182,7 @@ source opened are closed again before the command ends. -/
   let mut problems : Array String := #[]
   let saved ← getScopes
   let mut arity : Option Nat := none
+  let mut statement : Option (Nat × Nat) := none
   let lineOf : Syntax → Nat := fun s => (inputCtx.fileMap.toPosition (s.getPos?.getD 0)).line
   repeat
     let scope ← getScope
@@ -212,20 +224,34 @@ source opened are closed again before the command ends. -/
         let p := s!"line {ln}: {w} is not allowed"
         if !problems.contains p then problems := problems.push p
         fine := false
-      if kind == ``Lean.Parser.Command.declId && underscored node[0].getId then
-        let p := s!"line {lineOf node}: the name `{node[0].getId}` starts with `_`, which \
-          Lean treats as internal"
+      let full := (← getCurrNamespace) ++ node[0].getId
+      if kind == ``Lean.Parser.Command.declId && internalName node[0].getId then
+        let p := s!"line {lineOf node}: the name `{node[0].getId}` is one Lean treats as \
+          internal (a part starts with `_`, or ends `eq_N`, `match_N`, `proof_N`, `omega_N`)"
         if !problems.contains p then problems := problems.push p
         fine := false
-      if kind == ``Lean.Parser.Command.declId && node[0].getId == `conjecture
-          && (← getCurrNamespace) == .anonymous then
+      if kind == ``Lean.Parser.Command.declId && endsInConjecture full && full != `conjecture then
+        let p := s!"line {lineOf node}: `{full}`: only the theorem at the root may be named \
+          `conjecture`"
+        if !problems.contains p then problems := problems.push p
+        fine := false
+      if kind == ``Lean.Parser.Command.declId && full == `conjecture then
         let sig := (kinds cmd #[]).find? (fun p => p.1 == ``Lean.Parser.Command.declSig)
         match sig with
-        | some (_, s) => arity := some (arityOf s)
+        | some (_, s) =>
+          arity := some (arityOf s)
+          match inner.getPos?, s.getTailPos? with
+          | some a, some b => statement := some (a.byteIdx, b.byteIdx)
+          | _, _ => pure ()
         | none => pure ()
+    if fine && k == ``Lean.Parser.Command.open && (← getScopes).length == saved.length then
+      problems := problems.push s!"line {line}: a top-level `open` stays in force for the \
+        checks after the file; use `open … in`, or put the `open` inside a `section`"
+      fine := false
+    -- Lean logs, not throws, an error in these commands (an unknown
+    -- namespace); the compile reports it.
     if fine && scopeCommands.contains k then
-      try elabCommand cmd
-      catch e => problems := problems.push s!"line {line}: {← e.toMessageData.toString}"
+      elabCommand cmd
   for m in msgs.toList do
     if m.severity == .error then
       problems := problems.push s!"Lean could not parse the file: {(← m.toString).take 300}"
@@ -235,6 +261,9 @@ source opened are closed again before the command ends. -/
   for p in problems.toList.take 20 do
     say marker "PROBLEM" (toJson (p.take 300))
   say marker "ARITY" (toJson arity)
+  say marker "STATEMENT" (match statement with
+    | some (a, b) => Json.arr #[toJson a, toJson b]
+    | none => Json.null)
   say marker "DONE" Json.null
 
 -- ## The probe
