@@ -17,6 +17,7 @@ from fractions import Fraction
 from pathlib import Path
 
 import pytest
+from pydantic import JsonValue
 
 from minilab.encoding.api import Instance
 from minilab.formalise.audit import AuditResult, audit, script_matches
@@ -127,7 +128,9 @@ def lean_block(source: str) -> str:
     return f"Here it is.\n\n```lean\n{source}```\n"
 
 
-def audit_reply(kinds: Mapping[str, tuple[str, str | None]], hidden: list[str] | None = None) -> str:
+def audit_reply(
+    kinds: Mapping[str, tuple[str, str | None]], hidden: list[str] | None = None
+) -> str:
     return json.dumps(
         {
             "hypotheses": [
@@ -225,7 +228,7 @@ def test_probe_lists_binders_and_conclusion() -> None:
     ("bad", "problem"),
     [
         ("axiom cheat : False\n", "axiom"),
-        ("macro \"easy\" : tactic => `(tactic| sorry)\n", "macro"),
+        ('macro "easy" : tactic => `(tactic| sorry)\n', "macro"),
         ("set_option maxHeartbeats 0\n", "set_option"),
         ("theorem minilab_contra : True := trivial\n", "minilab"),
         ("theorem helper : 1 = 1 := by sorry\n", "sorry"),
@@ -239,7 +242,7 @@ def test_forbidden_constructs_refused(bad: str, problem: str) -> None:
 
 def test_comments_and_strings_do_not_count_as_constructs() -> None:
     source = SIMPLE.replace(
-        "theorem conjecture", '/-- an axiom in a comment -/\n-- macro here\ntheorem conjecture'
+        "theorem conjecture", "/-- an axiom in a comment -/\n-- macro here\ntheorem conjecture"
     )
     assert source_problems(source) == []
     assert "axiom" not in strip_comments(source)
@@ -378,7 +381,9 @@ def test_audit_fails_closed_when_checker_skips_a_hypothesis(store: RecordStore) 
     # The checker says nothing about hKKT: it stays listed, unjudged, and the
     # formalisation is rejected.
     reply = audit_reply({"hW": ("matches", "assumption 1"), "hp": ("matches", "assumption 2")})
-    result = audit(record, probed(S8), ledger=ledger, budget=BUDGET, backends=fakes({"audit": [reply]}))
+    result = audit(
+        record, probed(S8), ledger=ledger, budget=BUDGET, backends=fakes({"audit": [reply]})
+    )
     assert result.extra == ["hKKT"]
     assert result.rejected
     kkt = next(h for h in result.hypotheses if h.label == "hKKT")
@@ -477,7 +482,7 @@ def survived_record(store: RecordStore, local: str = "a") -> Record:
     record = make_record(local, assumptions=["0 ≤ x"])
     store.create(record)
     now = datetime(2026, 11, 25, 13, 0, tzinfo=UTC)
-    coverage = {
+    coverage: dict[str, JsonValue] = {
         "space": "x in [0, 10]",
         "dimensions": 1,
         "starts": 4,
