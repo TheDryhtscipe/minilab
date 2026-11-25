@@ -20,6 +20,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+import minilab.models.backends as backends_module
 from minilab.ledger import Ledger
 from minilab.models.adapter import (
     ROLE_STAGE,
@@ -36,11 +37,13 @@ from minilab.models.adapter import (
     scrubbed_env,
 )
 from minilab.models.backends import (
-    MAX_ARG_BYTES,
+    STDERR_KEEP_BYTES,
     ClaudeBackend,
     CodexBackend,
     GeminiBackend,
     LocalBackend,
+    OutputTooLarge,
+    _exchange,  # pyright: ignore[reportPrivateUsage]
     estimate_tokens,
     parse_agy,
     parse_claude,
@@ -190,7 +193,7 @@ def test_adapter_failure_leaves_record_unchanged(store: RecordStore, ledger: Led
     [charge] = ledger.charges()
     assert charge.estimated
     assert charge.family is Family.codex
-    assert charge.tokens_out == 0
+    assert charge.tokens_out == Budget(tokens_per_pair=1).reserve_output_tokens
     assert charge.tokens_in == estimate_tokens("prompt")
 
 
@@ -379,6 +382,141 @@ def test_parse_codex_failure_and_missing_usage() -> None:
     assert (reply.tokens_in, reply.tokens_out) == (10, 5)
 
 
+NONCE = "f00dfeedf00dfeed"
+
+
+def _step(
+    step_type: str,
+    state: str,
+    tool: str | None = None,
+    *,
+    index: int | None = 1,
+    error: str | None = None,
+    conversation: str = "c",
+) -> dict[str, object]:
+    step: dict[str, object] = {"conversation_id": conversation, "state": state,
+                               "step_type": step_type}
+    if index is not None:
+        step["step_index"] = index
+    if tool is not None:
+        step["tool_name"] = tool
+    if error is not None:
+        step["tool_info"] = {"name": tool, "error": {"type": "TOOL_ERROR", "message": error}}
+    return {"event": "step_update", "step_update": step}
+
+
+_HOOK_DENIAL = f"tool call denied by pre-tool hook: This session has no tools. {NONCE}"
+
+
+def _denied(tool: str, index: int) -> tuple[dict[str, object], dict[str, object]]:
+    """A tool step as agy 1.5.16 reports one the hook denied."""
+    return (_step("tool", "ACTIVE", tool, index=index),
+            _step("tool", "ERROR", tool, index=index, error=_HOOK_DENIAL))
+
+
+def _agy(result: Mapping[str, object], *steps: Mapping[str, object]) -> str:
+    """agy 1.5.16 `--output-format stream-json` output: init, the steps, then the result."""
+    events: list[Mapping[str, object]] = [
+        {"event": "init", "conversation_id": "c", "init": {"tools": ["search_web"]}},
+        _step("user_input", "DONE", index=0),
+        *steps,
+        _step("agent_response", "DONE", index=99),
+        {"event": "result", "result": result},
+    ]
+    return "\n".join(json.dumps(event) for event in events) + "\n"
+
+
+_AGY_DONE = {"status": "SUCCESS", "response": "answer",
+             "usage": {"input_tokens": 40, "output_tokens": 6, "total_tokens": 46}}
+
+
+def test_parse_agy_accepts_tools_the_hook_denied() -> None:
+    steps = (*_denied("search_web", 2), _step("system_message", "DONE", index=3),
+             _step("subagent", "ACTIVE", "invoke_subagent", index=4),
+             _step("subagent", "ERROR", "invoke_subagent", index=4), *_denied("read_file", 5))
+    reply = parse_agy(_agy(_AGY_DONE, *steps), model="m", nonce=NONCE)
+    assert (reply.text, reply.tools_denied) == ("answer", 2)
+    assert parse_agy(_agy(_AGY_DONE), model="m", nonce=NONCE).tools_denied == 0
+
+
+@pytest.mark.parametrize("state", ["DONE", "CANCELED", "ACTIVE", ""])
+def test_parse_agy_rejects_a_tool_that_was_not_blocked(state: str) -> None:
+    ran = (_step("tool", "ACTIVE", "search_web", index=2),
+           _step("tool", state, "search_web", index=2, error=_HOOK_DENIAL))
+    if state == "ACTIVE":
+        ran = ran[:1]  # A stream that stops while the tool runs.
+    with pytest.raises(ModelUnavailable, match="search_web") as caught:
+        parse_agy(_agy(_AGY_DONE, *ran), model="m", nonce=NONCE)
+    # The call still used tokens, so the adapter can charge them.
+    assert (caught.value.tokens_in, caught.value.tokens_out) == (40, 6)
+
+
+def test_parse_agy_rejects_a_tool_that_ran_before_one_that_was_denied() -> None:
+    ran = (_step("tool", "ACTIVE", "search_web", index=2),
+           _step("tool", "DONE", "search_web", index=2))
+    with pytest.raises(ModelUnavailable, match=r"search_web \(DONE\)"):
+        parse_agy(_agy(_AGY_DONE, *ran, *_denied("read_file", 3)), model="m", nonce=NONCE)
+    # The same tool, run at one step and denied at a later one.
+    with pytest.raises(ModelUnavailable, match=r"search_web \(DONE\)"):
+        parse_agy(_agy(_AGY_DONE, *ran, *_denied("search_web", 3)), model="m", nonce=NONCE)
+    # The last update of a step counts: a denial reported first does not hide a later run.
+    flipped = (*_denied("search_web", 2), _step("tool", "DONE", "search_web", index=2))
+    with pytest.raises(ModelUnavailable, match="search_web"):
+        parse_agy(_agy(_AGY_DONE, *flipped), model="m", nonce=NONCE)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [None, "network unreachable",
+     "tool call denied by pre-tool hook: This session has no tools. 0123456789abcdef",
+     f"exit status 1: {NONCE}"],
+    ids=["no-error", "other-error", "other-nonce", "nonce-not-hook"],
+)
+def test_parse_agy_rejects_a_tool_error_that_is_not_this_calls_denial(error: str | None) -> None:
+    steps = (_step("tool", "ACTIVE", "run_command", index=2),
+             _step("tool", "ERROR", "run_command", index=2, error=error))
+    with pytest.raises(ModelUnavailable, match="not this call's hook denial"):
+        parse_agy(_agy(_AGY_DONE, *steps), model="m", nonce=NONCE)
+
+
+def test_parse_agy_rejects_steps_it_cannot_place() -> None:
+    no_index = (_step("tool", "ERROR", "search_web", index=None, error=_HOOK_DENIAL),)
+    with pytest.raises(ModelUnavailable, match="no step index"):
+        parse_agy(_agy(_AGY_DONE, *no_index), model="m", nonce=NONCE)
+    # A child conversation that reuses step 2: its run must not be hidden by our denial.
+    child = (_step("tool", "DONE", "search_web", index=2, conversation="child"),
+             *_denied("search_web", 2))
+    with pytest.raises(ModelUnavailable, match="another conversation"):
+        parse_agy(_agy(_AGY_DONE, *child), model="m", nonce=NONCE)
+    with pytest.raises(ModelUnavailable, match="invoke_subagent"):
+        parse_agy(_agy(_AGY_DONE, _step("subagent", "DONE", "invoke_subagent", index=2)),
+                  model="m", nonce=NONCE)
+    with pytest.raises(ModelUnavailable, match="unknown step type 'browser_subagent'"):
+        parse_agy(_agy(_AGY_DONE, _step("browser_subagent", "DONE")), model="m", nonce=NONCE)
+
+
+def test_parse_agy_rejects_broken_streams() -> None:
+    whole = _agy(_AGY_DONE)
+    lines = whole.splitlines(keepends=True)
+    with pytest.raises(ModelUnavailable, match="no result"):
+        parse_agy("".join(lines[:-1]), model="m", nonce=NONCE)
+    with pytest.raises(ModelUnavailable, match="more than one result"):
+        parse_agy(whole + lines[-1], model="m", nonce=NONCE)
+    with pytest.raises(ModelUnavailable, match="no init event"):
+        parse_agy("".join(lines[1:]), model="m", nonce=NONCE)
+    with pytest.raises(ModelUnavailable, match="more than one init"):
+        parse_agy(lines[0] + whole, model="m", nonce=NONCE)
+    with pytest.raises(ModelUnavailable, match="not JSON"):
+        parse_agy("Loaded settings.\n" + whole, model="m", nonce=NONCE)
+    with pytest.raises(ModelUnavailable, match="not JSON"):
+        parse_agy(json.dumps({"status": "SUCCESS", "response": "answer"}) + "x", model="m",
+                  nonce=NONCE)
+    # The single JSON object of `--output-format json` has no step events to check.
+    with pytest.raises(ModelUnavailable, match="unexpected event"):
+        parse_agy(json.dumps({"status": "SUCCESS", "response": "answer"}), model="m",
+                  nonce=NONCE)
+
+
 def test_parse_agy() -> None:
     ok = {
         "status": "SUCCESS",
@@ -387,15 +525,15 @@ def test_parse_agy() -> None:
         "usage": {"input_tokens": 12072, "output_tokens": 47, "thinking_tokens": 37,
                   "cache_read_tokens": 0, "total_tokens": 12119},
     }
-    reply = parse_agy(json.dumps(ok), model="gemini-x")
+    reply = parse_agy(_agy(ok), model="gemini-x", nonce=NONCE)
     assert reply == ModelReply(text="answer", tokens_in=12072, tokens_out=47, estimated=False,
                                model="gemini-x")
     # Tokens in the total that neither count covers are charged as input.
     ok["usage"] = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 20}
-    assert parse_agy(json.dumps(ok), model="gemini-x").tokens_in == 15
+    assert parse_agy(_agy(ok), model="gemini-x", nonce=NONCE).tokens_in == 15
     failed = {"status": "ERROR", "error": "quota exceeded"}
     with pytest.raises(ModelUnavailable):
-        parse_agy(json.dumps(failed), model="gemini-x")
+        parse_agy(_agy(failed), model="gemini-x", nonce=NONCE)
 
 
 def test_estimate_tokens_four_chars() -> None:
@@ -441,8 +579,10 @@ def test_backend_command_lines_carry_isolation_flags() -> None:
     for feature in ("shell_tool", "unified_exec", "browser_use", "computer_use", "apps",
                     "plugins"):
         assert feature in codex
-    agy = GeminiBackend().argv("-starts with a dash")
-    assert agy[-1] == "--print=-starts with a dash"
+    agy = GeminiBackend().argv()
+    assert agy[agy.index("--input-format") + 1] == "stream-json"
+    assert agy[agy.index("--output-format") + 1] == "stream-json"
+    assert not any(a.startswith(("-p", "--print", "--prompt")) for a in agy)
     settings = json.loads(agy[agy.index("--settings") + 1])
     assert settings["allowNonWorkspaceAccess"] is False
     assert settings["useG1Credits"] is False
@@ -450,6 +590,7 @@ def test_backend_command_lines_carry_isolation_flags() -> None:
                    "command", "mcp"):
         assert f"{action}(*)" in settings["permissions"]["deny"]
     assert "--dangerously-skip-permissions" not in agy
+    assert agy[agy.index("--output-format") + 1] == "stream-json"
     assert LocalBackend().model == "qwen3.5:4b"
 
 
@@ -469,7 +610,42 @@ def test_failed_call_input_is_at_least_the_prompt_estimate(ledger: Ledger) -> No
     with pytest.raises(ModelUnavailable):
         _call(ledger, FakeBackend(Family.codex, error=error))
     [charge] = ledger.charges()
-    assert (charge.tokens_in, charge.tokens_out) == (estimate_tokens("prompt"), 0)
+    assert charge.tokens_in == estimate_tokens("prompt")
+
+
+def test_failed_call_with_no_reported_output_is_charged_its_allowance(ledger: Ledger) -> None:
+    # A timeout reports nothing; the call may well have written output, so the charge keeps
+    # the output allowance it reserved rather than freeing it for other calls.
+    error = ModelUnavailable("claude: timed out after 900 s")
+    with pytest.raises(ModelUnavailable):
+        call(Family.claude, Role.encode, "prompt", record_id=None, pair=PAIR, ledger=ledger,
+             budget=Budget(tokens_per_pair=100, reserve_output_tokens=77),
+             backends={Family.claude: FakeBackend(Family.claude, error=error)})
+    [charge] = ledger.charges()
+    assert (charge.tokens_in, charge.tokens_out) == (estimate_tokens("prompt"), 77)
+
+
+def test_failed_call_with_reported_zero_output_is_charged_zero(ledger: Ledger) -> None:
+    error = ModelUnavailable("claude: usage limit", tokens_in=3, tokens_out=0)
+    with pytest.raises(ModelUnavailable):
+        _call(ledger, FakeBackend(Family.claude, error=error))
+    [charge] = ledger.charges()
+    assert charge.tokens_out == 0
+
+
+def test_charge_failing_after_a_good_call_leaves_the_reservation_open(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken_charge(**_: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ledger, "charge", broken_charge)
+    with pytest.raises(OSError, match="disk full"):
+        call(Family.claude, Role.encode, "prompt", record_id=None, pair=PAIR, ledger=ledger,
+             budget=Budget(tokens_per_pair=100, reserve_output_tokens=9),
+             backends={Family.claude: FakeBackend(Family.claude)})
+    [held] = ledger.open_reservations()
+    assert ledger.pair_spend(PAIR) == held.tokens == estimate_tokens("prompt") + 9
 
 
 def test_not_started_call_is_not_charged(ledger: Ledger) -> None:
@@ -589,7 +765,9 @@ from minilab.models.adapter import Budget, BudgetExceeded, ModelReply, Role, cal
 class Slow:
     family = Family.claude
     def run(self, prompt, *, cwd, env, timeout_s):
-        time.sleep(0.5)
+        began = time.time()
+        time.sleep(1.0)
+        print(f"ran {began} {time.time()}")
         return ModelReply(text="x", tokens_in=60, tokens_out=0, estimated=False, model="m")
 
 ledger = Ledger(RecordStore(Path(sys.argv[1])), "run-1")
@@ -598,7 +776,8 @@ while time.time() < start_at:
     time.sleep(0.005)
 try:
     call(Family.claude, Role.encode, "p", record_id=None, pair=("information-theory",
-         "optimisation"), ledger=ledger, budget=Budget(tokens_per_pair=100),
+         "optimisation"), ledger=ledger,
+         budget=Budget(tokens_per_pair=100, reserve_output_tokens=59),
          backends={Family.claude: Slow()})
     print("ok")
 except BudgetExceeded:
@@ -618,9 +797,18 @@ def test_pair_lock_lets_only_the_budget_through(
                          stdout=subprocess.PIPE, text=True, env=env)
         for _ in range(4)
     ]
-    outcomes = sorted(proc.communicate(timeout=60)[0].strip() for proc in procs)
+    lines = [proc.communicate(timeout=60)[0].split() for proc in procs]
+    outcomes = sorted(line[-1] for line in lines)
+    # Each call reserves estimate_tokens("p") == 1 plus an output allowance of 59 = 60 tokens.
+    # The first two see spend 0 and 60, both under 100, so both run at once; the last two
+    # see 120 and are refused without waiting.
     assert outcomes == ["ok", "ok", "refused", "refused"]
     assert ledger.pair_spend(PAIR) == 120
+    assert ledger.open_reservations() == []
+    spans = [(float(line[1]), float(line[2])) for line in lines if line[0] == "ran"]
+    assert len(spans) == 2
+    (a0, a1), (b0, b1) = spans
+    assert a0 < b1 and b0 < a1, f"the two calls on one pair did not overlap: {spans}"
 
 
 # --- Temporary directory -------------------------------------------------------------------
@@ -691,7 +879,7 @@ def test_short_maths_answers_are_replies(answer: str) -> None:
     message = {"type": "item.completed", "item": {"type": "agent_message", "text": answer}}
     assert parse_codex(_codex(message, _DONE), model="m").text == answer
     agy = {"status": "SUCCESS", "response": answer}
-    assert parse_agy(json.dumps(agy), model="m").text == answer
+    assert parse_agy(_agy(agy), model="m", nonce=NONCE).text == answer
 
 
 def test_parse_claude_subtype_must_be_success() -> None:
@@ -797,15 +985,15 @@ def test_parse_codex_counts() -> None:
 
 def test_parse_agy_empty_response_and_counts() -> None:
     with pytest.raises(ModelUnavailable, match="no reply text"):
-        parse_agy(json.dumps({"status": "SUCCESS", "response": ""}), model="m")
+        parse_agy(_agy({"status": "SUCCESS", "response": ""}), model="m", nonce=NONCE)
     failed = {"status": "ERROR", "error": "quota", "usage": {"input_tokens": 7,
                                                              "output_tokens": 1}}
     with pytest.raises(ModelUnavailable) as caught:
-        parse_agy(json.dumps(failed), model="m")
+        parse_agy(_agy(failed), model="m", nonce=NONCE)
     assert (caught.value.tokens_in, caught.value.tokens_out) == (7, 1)
     ok = {"status": "SUCCESS", "response": "answer",
           "usage": {"input_tokens": 1.2e4, "output_tokens": False}}
-    reply = parse_agy(json.dumps(ok), model="m")
+    reply = parse_agy(_agy(ok), model="m", nonce=NONCE)
     assert (reply.tokens_in, reply.tokens_out, reply.estimated) == (12000, 2, True)
 
 
@@ -934,15 +1122,46 @@ sys.exit(1)
 """
 
 _AGY_OK = """
-import json, sys
-[prompt] = [a[len("--print="):] for a in sys.argv if a.startswith("--print=")]
-print(json.dumps({"status": "SUCCESS", "response": "got " + prompt,
-                  "usage": {"input_tokens": 12, "output_tokens": 5, "total_tokens": 17}}))
+import json, os, subprocess, sys
+if not os.path.isfile(".agents/hooks.json"):
+    sys.exit("no hooks.json in the working directory")
+home = os.path.join(os.getcwd(), ".home")
+if os.environ["HOME"] != home or not os.environ["XDG_CONFIG_HOME"].startswith(home + "/"):
+    sys.exit("not the call's own home: " + os.environ["HOME"])
+# The prompt comes as one stream-json user message on stdin, never on the command line.
+if "--input-format" not in sys.argv or any(a.startswith(("-p", "--print", "--prompt"))
+                                            for a in sys.argv):
+    sys.exit("not reading the prompt from stdin: " + repr(sys.argv))
+[line] = sys.stdin.read().splitlines()
+message = json.loads(line)
+if message["event"] != "user" or set(message) != {"event", "message"}:
+    sys.exit("not a user message: " + line[:200])
+prompt = message["message"]["content"]
+if any(prompt in a for a in sys.argv):
+    sys.exit("the prompt is on the command line")
+# Run the hook as agy does, and report a denied tool with its reason.
+[named] = json.load(open(".agents/hooks.json")).values()
+command = named["PreToolUse"][0]["hooks"][0]["command"]
+decision = json.loads(subprocess.run(["sh", "-c", command], cwd=".agents", input="{}",
+                                     capture_output=True, text=True, check=True).stdout)
+denial = "tool call denied by pre-tool hook: " + decision["reason"]
+def step(**fields):
+    print(json.dumps({"event": "step_update", "step_update": {"conversation_id": "c", **fields}}))
+print(json.dumps({"event": "init", "conversation_id": "c", "init": {"tools": []}}))
+step(step_index=0, step_type="user_input", state="DONE")
+for state in json.loads(os.environ.get("FAKE_AGY_TOOL_STATES", "[]")):
+    error = {"error": {"message": denial}} if state == "ERROR" else {}
+    step(step_index=2, step_type="tool", tool_name="search_web", state=state, tool_info=error)
+step(step_index=3, step_type="agent_response", state="DONE")
+print(json.dumps({"event": "result", "result": {
+    "status": "SUCCESS", "response": "got " + prompt,
+    "usage": {"input_tokens": 12, "output_tokens": 5, "total_tokens": 17}}}))
+sys.exit(int(os.environ.get("FAKE_AGY_EXIT", "0")))
 """
 
 _AGY_FAIL = """
 import json, sys
-print(json.dumps({"status": "ERROR", "error": "quota exceeded"}))
+print(json.dumps({"event": "result", "result": {"status": "ERROR", "error": "quota exceeded"}}))
 sys.exit(1)
 """
 
@@ -981,6 +1200,83 @@ def test_gemini_backend_end_to_end(tmp_path: Path) -> None:
         fail.run("hi", cwd=tmp_path, env=env, timeout_s=10)
 
 
+@pytest.mark.parametrize(
+    "prompt",
+    ["/help", "two\nlines\r\nand \"quotes\" \\ and \u2028 separators", "@notes.txt é \0 nul",
+     "x" * 400_000],
+    ids=["slash", "newlines", "at-and-nul", "large"],
+)
+def test_gemini_backend_sends_the_prompt_on_stdin_intact(tmp_path: Path, prompt: str) -> None:
+    # Over stdin the prompt has no command-line size limit, and it reaches agy unchanged.
+    backend = GeminiBackend(binary=_tool(tmp_path, "agy_ok", _AGY_OK))
+    reply = backend.run(prompt, cwd=tmp_path, env=scrubbed_env(), timeout_s=30)
+    assert reply.text == "got " + prompt
+
+
+def test_gemini_backend_fails_a_call_in_which_a_tool_ran(tmp_path: Path) -> None:
+    backend = GeminiBackend(binary=_tool(tmp_path, "agy_ok", _AGY_OK))
+    env = {**scrubbed_env(), "FAKE_AGY_TOOL_STATES": json.dumps(["ACTIVE", "ERROR"])}
+    assert backend.run("hi", cwd=tmp_path, env=env, timeout_s=10).text == "got hi"
+    env["FAKE_AGY_TOOL_STATES"] = json.dumps(["ACTIVE", "DONE"])
+    with pytest.raises(ModelUnavailable, match="search_web") as caught:
+        backend.run("hi", cwd=tmp_path, env=env, timeout_s=10)
+    assert (caught.value.tokens_in, caught.value.tokens_out) == (12, 5)
+    # On a non-zero exit the error keeps the parser's reason as well as the exit.
+    env["FAKE_AGY_EXIT"] = "1"
+    with pytest.raises(ModelUnavailable, match=r"(?s)exit 1.*search_web \(DONE\)") as caught:
+        backend.run("hi", cwd=tmp_path, env=env, timeout_s=10)
+    assert (caught.value.tokens_in, caught.value.tokens_out) == (12, 5)
+
+
+def test_gemini_backend_counts_denied_tools_with_a_fresh_nonce(tmp_path: Path) -> None:
+    backend = GeminiBackend(binary=_tool(tmp_path, "agy_ok", _AGY_OK))
+    env = {**scrubbed_env(), "FAKE_AGY_TOOL_STATES": json.dumps(["ACTIVE", "ERROR"])}
+    assert backend.run("hi", cwd=tmp_path, env=env, timeout_s=10).tools_denied == 1
+    first = (tmp_path / ".agents" / "hooks.json").read_text()
+    backend.run("hi", cwd=tmp_path, env=env, timeout_s=10)
+    assert (tmp_path / ".agents" / "hooks.json").read_text() != first
+
+
+@pytest.mark.parametrize("marker", [".git", ".jj", ".hg"])
+def test_gemini_backend_will_not_run_inside_a_repository(tmp_path: Path, marker: str) -> None:
+    (tmp_path / marker).mkdir()
+    call_dir = tmp_path / "call"
+    call_dir.mkdir()
+    ran = tmp_path / "ran"
+    tool = _tool(tmp_path, "agy", f"open({str(ran)!r}, 'w').write('x')\n" + _AGY_OK)
+    with pytest.raises(ModelNotStarted, match="repository"):
+        GeminiBackend(binary=tool).run("hi", cwd=call_dir, env=scrubbed_env(), timeout_s=10)
+    assert not ran.exists()
+
+
+def test_gemini_backend_hook_denies_every_tool(tmp_path: Path) -> None:
+    backend = GeminiBackend(binary=_tool(tmp_path, "agy_ok", _AGY_OK))
+    backend.run("hi", cwd=tmp_path, env=scrubbed_env(), timeout_s=10)
+    hooks = json.loads((tmp_path / ".agents" / "hooks.json").read_text())
+    [named] = hooks.values()
+    assert set(named) == {"PreToolUse"}
+    [group] = named["PreToolUse"]
+    assert group["matcher"] == "*"
+    [handler] = group["hooks"]
+    # Run the hook as agy does: `sh -c`, in the folder that holds hooks.json, JSON on stdin.
+    payload = {"hookEventName": "PreToolUse", "toolCall": {"id": "t", "name": "search_web",
+                                                           "args": {"query": "arXiv"}}}
+    done = subprocess.run(["sh", "-c", handler["command"]], input=json.dumps(payload),
+                          capture_output=True, text=True, cwd=tmp_path / ".agents",
+                          env=scrubbed_env(), timeout=10, check=True)
+    assert json.loads(done.stdout)["decision"] == "deny"
+
+
+def test_gemini_backend_will_not_start_without_its_hook(tmp_path: Path) -> None:
+    # A file where the `.agents` folder must go: the hook cannot be written.
+    (tmp_path / ".agents").write_text("")
+    marker = tmp_path / "ran"
+    tool = _tool(tmp_path, "agy", f"open({str(marker)!r}, 'w').write('x')\n" + _AGY_OK)
+    with pytest.raises(ModelNotStarted, match="hook"):
+        GeminiBackend(binary=tool).run("hi", cwd=tmp_path, env=scrubbed_env(), timeout_s=10)
+    assert not marker.exists()
+
+
 def test_failed_tool_charged_with_its_reported_usage(ledger: Ledger, tmp_path: Path) -> None:
     backend = ClaudeBackend(binary=_tool(tmp_path, "claude_fail", _CLAUDE_FAIL))
     with pytest.raises(ModelUnavailable):
@@ -990,13 +1286,11 @@ def test_failed_tool_charged_with_its_reported_usage(ledger: Ledger, tmp_path: P
     assert (charge.tokens_in, charge.tokens_out, charge.estimated) == (500, 60, True)
 
 
-@pytest.mark.parametrize(
-    "prompt", ["x" * (MAX_ARG_BYTES + 1000), "a\0b", "bad \ud800"], ids=["size", "nul", "text"]
-)
+@pytest.mark.parametrize("prompt", ["bad \ud800", "", "  \n"], ids=["text", "empty", "blank"])
 def test_agy_refusals_not_started_and_not_charged(
     ledger: Ledger, tmp_path: Path, prompt: str
 ) -> None:
-    # MAX_ARG_BYTES + 1000 still fits in one Linux argument, so only the size check stops it.
+    # json.dumps would escape a lone surrogate, so the backend must refuse it itself.
     marker = tmp_path / "ran"
     tool = _tool(tmp_path, "agy", f"open({str(marker)!r}, 'w').write('x')\n" + _AGY_OK)
     backend = GeminiBackend(binary=tool)
@@ -1063,3 +1357,176 @@ def test_local_backend_timeout(tmp_path: Path) -> None:
     backend = LocalBackend(transport=httpx.MockTransport(handler))
     with pytest.raises(ModelUnavailable, match="timed out"):
         backend.run("hi", cwd=tmp_path, env={}, timeout_s=0.1)
+
+
+# --- Reservations and the pair lock (minilab-294360) --------------------------------------
+
+
+def test_pair_lock_is_free_while_the_tool_runs(ledger: Ledger) -> None:
+    taken: list[bool] = []
+
+    def try_the_lock(cwd: Path) -> None:
+        def take() -> None:
+            with ledger.pair_lock(PAIR):
+                taken.append(True)
+
+        thread = threading.Thread(target=take, daemon=True)
+        thread.start()
+        thread.join(timeout=5)
+        taken.append(not thread.is_alive())
+
+    backend = FakeBackend(Family.claude, action=try_the_lock)
+    _call(ledger, backend)
+    assert taken == [True, True], "the pair lock was held during the model call"
+
+
+def test_call_reserves_then_settles(ledger: Ledger) -> None:
+    seen: list[int] = []
+    backend = FakeBackend(
+        Family.claude, tokens_in=10, tokens_out=5,
+        action=lambda cwd: seen.append(ledger.pair_spend(PAIR)),
+    )
+    call(Family.claude, Role.encode, "x" * 40, record_id=None, pair=PAIR, ledger=ledger,
+         budget=Budget(tokens_per_pair=100, reserve_output_tokens=7),
+         backends={Family.claude: backend})
+    assert seen == [10 + 7], "during the call the pair's spend is the reservation"
+    assert ledger.pair_spend(PAIR) == 15
+    assert ledger.open_reservations() == []
+
+
+def test_open_reservations_count_against_the_budget(ledger: Ledger) -> None:
+    ledger.reserve(pair=PAIR, stage=Stage.encoding, family=Family.claude, tokens=100)
+    backend = FakeBackend(Family.claude)
+    with pytest.raises(BudgetExceeded):
+        _call(ledger, backend)
+    assert backend.calls == 0
+
+
+def test_not_started_call_releases_its_reservation(ledger: Ledger) -> None:
+    backend = FakeBackend(Family.claude, error=ModelNotStarted("no binary"))
+    with pytest.raises(ModelNotStarted):
+        _call(ledger, backend)
+    assert ledger.pair_spend(PAIR) == 0
+    assert ledger.open_reservations() == []
+    assert ledger.charges() == []
+
+
+def test_failed_call_settles_its_reservation(ledger: Ledger) -> None:
+    backend = FakeBackend(Family.claude, fail=True)
+    with pytest.raises(ModelUnavailable):
+        _call(ledger, backend)
+    assert ledger.open_reservations() == []
+    [charge] = ledger.charges()
+    assert charge.estimated and charge.reservation is not None
+
+
+def test_budget_default_output_allowance() -> None:
+    assert Budget(tokens_per_pair=1).reserve_output_tokens == 32_000
+    with pytest.raises(ValueError):
+        Budget(tokens_per_pair=1, reserve_output_tokens=-1)
+
+
+# --- Tool output cap (minilab-294360) ------------------------------------------------------
+
+
+def test_run_command_fails_past_the_output_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(backends_module, "MAX_OUTPUT_BYTES", 1 << 20)
+    pid_file = tmp_path / "pid"
+    tool = _tool(tmp_path, "tool", f"""
+import os, sys, time
+open({str(pid_file)!r}, "w").write(str(os.getpid()))
+chunk = b"x" * 65536
+for _ in range(320):
+    sys.stdout.buffer.write(chunk)
+sys.stdout.flush()
+time.sleep(60)
+""")
+    started = time.monotonic()
+    with pytest.raises(OutputTooLarge, match="more than 1048576 bytes") as caught:
+        run_command([tool], stdin="", cwd=tmp_path, env=scrubbed_env(), timeout_s=20)
+    assert time.monotonic() - started < 15
+    assert caught.value.tokens_out is not None
+    assert caught.value.tokens_out > (1 << 20) // 4
+    pid = int(pid_file.read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        _kill(pid)
+        pytest.fail("the tool outlived an oversized call")
+
+
+def test_run_command_reports_the_end_of_a_flood_of_stderr(tmp_path: Path) -> None:
+    # Guards the stderr tail in the error message; the cap itself is tested below.
+    tool = _tool(tmp_path, "tool", """
+import sys
+for _ in range(160):
+    sys.stderr.write("e" * 65536)
+sys.stderr.write("THE END")
+sys.stdout.write("ok")
+sys.exit(3)
+""")
+    with pytest.raises(ModelUnavailable, match="THE END") as info:
+        run_command([tool], stdin="", cwd=tmp_path, env=scrubbed_env(), timeout_s=20)
+    assert "exit 3" in str(info.value)
+
+
+def test_run_command_large_prompt_and_reply_do_not_deadlock(tmp_path: Path) -> None:
+    tool = _tool(tmp_path, "tool", """
+import sys
+data = sys.stdin.buffer.read()
+sys.stdout.buffer.write(data[::-1])
+""")
+    prompt = "ab" * (1 << 20)
+    out = run_command([tool], stdin=prompt, cwd=tmp_path, env=scrubbed_env(), timeout_s=20)
+    assert out == prompt[::-1]
+
+
+def test_exchange_keeps_only_the_tail_of_stderr(tmp_path: Path) -> None:
+    tool = _tool(tmp_path, "tool", """
+import sys
+for _ in range(160):
+    sys.stderr.write("e" * 65536)
+sys.stderr.write("THE END")
+""")
+    proc = subprocess.Popen([tool], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    out, err = _exchange(proc, b"", timeout_s=20, max_out=1 << 20)
+    assert out == b""
+    assert len(err) == STDERR_KEEP_BYTES
+    assert err.endswith(b"THE END")
+
+
+def test_oversized_output_is_charged_as_output(
+    ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(backends_module, "MAX_OUTPUT_BYTES", 1 << 16)
+    tool = _tool(tmp_path, "tool", """
+import sys, time
+sys.stderr.write("flooding")
+sys.stderr.flush()
+time.sleep(0.3)
+sys.stdout.write("x" * (1 << 20))
+""")
+
+    class Flood:
+        family = Family.claude
+
+        def run(
+            self, prompt: str, *, cwd: Path, env: Mapping[str, str], timeout_s: float
+        ) -> ModelReply:
+            run_command([tool], stdin=prompt, cwd=cwd, env=env, timeout_s=timeout_s)
+            raise AssertionError("unreachable")
+
+    with pytest.raises(OutputTooLarge, match="flooding"):
+        call(Family.claude, Role.encode, "prompt", record_id=None, pair=PAIR, ledger=ledger,
+             budget=Budget(tokens_per_pair=100, reserve_output_tokens=5),
+             backends={Family.claude: Flood()})
+    [charge] = ledger.charges()
+    assert charge.tokens_out > (1 << 16) // 4
