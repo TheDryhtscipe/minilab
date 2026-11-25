@@ -249,6 +249,18 @@ def test_values_come_back_exact() -> None:
     assert abs(float(ball.mid()) - float(margin)) < 1e-12
 
 
+def test_negative_margin_keeps_its_sign() -> None:
+    # mpmath keeps an mpf's sign apart from its mantissa (minilab-e47de8).
+    source = minimal("return -mpmath.mpf(1) / 10**41")
+    point = Instance(values={"t": "1"}, precision_digits=30)
+    out = run_encoding(source, [Call(method="margin", point=point, digits=30)], timeout_s=30)
+    assert out.failure is None, out.failure
+    with mpmath.mp.workdps(30):
+        margin = out.results[0].rebuild()
+        assert type(margin) is mpmath.mpf
+        assert margin == -mpmath.mpf(1) / 10**41
+
+
 def test_subclassed_values_are_refused() -> None:
     sly = (
         minimal("return mpmath.mpf(-1)")
