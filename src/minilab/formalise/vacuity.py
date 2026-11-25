@@ -95,7 +95,12 @@ class VacuityResult(BaseModel):
     """What the vacuity linter found.
 
     `checked` says the Lean meta-program ran, so `contradictory` and the
-    witness checks mean something.
+    witness checks mean something. `unwitnessed` lists the variables (and
+    instance binders) the witness gave no value, when there was a witness. A
+    condition in such a variable's type (a subtype, a set, a structure's
+    field) was not checked, so `satisfied_by_witness` is False while any is
+    listed. This flags the formalisation for the audit; it does not reject
+    it (user decision, doc-xwa).
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -107,6 +112,7 @@ class VacuityResult(BaseModel):
     timed_out: bool
     notes: list[str]
     checked: bool = True
+    unwitnessed: list[str] = []
 
     @property
     def rejected(self) -> bool:
@@ -359,6 +365,16 @@ def vacuity(
         )
 
     contradictory = ready and _proved(result, contra, contra_lines)
+    unwitnessed = (
+        [b.label for b in formal.binders if not b.prop and b.index not in substituted]
+        if witness is not None
+        else []
+    )
+    if unwitnessed:
+        notes.append(
+            "no witness value reached " + ", ".join(unwitnessed) + "; any condition in "
+            "their types was not checked"
+        )
     checks: list[WitnessCheck] = []
     if witness is not None:
         for binder in formal.hypotheses:
@@ -383,12 +399,15 @@ def vacuity(
             )
     return VacuityResult(
         contradictory=contradictory,
-        satisfied_by_witness=bool(checks) and all(c.state == "holds" for c in checks),
+        satisfied_by_witness=(
+            ready and bool(checks) and not unwitnessed and all(c.state == "holds" for c in checks)
+        ),
         witness=checks,
         unused=unused,
         timed_out=False,
         notes=notes,
         checked=ready,
+        unwitnessed=unwitnessed,
     )
 
 

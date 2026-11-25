@@ -1179,3 +1179,35 @@ def test_a_cut_binder_type_is_marked_in_the_audit_prompt(store: RecordStore) -> 
         survived_record(store), formal.model_copy(update={"binders": cut}), cut[1:], set()
     )
     assert prompt.count("…(cut)") == 2, prompt
+
+
+# --- conditions in a variable's type (review 4, F4; user decision: flag for the audit) ---
+
+SUBTYPE = """import Mathlib
+
+theorem conjecture (r : {t : ℝ // t * t + 1 < t}) (x : ℝ) (hx : 0 < x) : x ≠ (r : ℝ) := sorry
+"""
+
+
+def test_a_variable_with_no_witness_value_blocks_satisfied_by_witness() -> None:
+    formal = probed(SUBTYPE)
+    assert formal.ok, formal.problems
+    witness = Instance(values={"x": "1"}, precision_digits=30)
+    result = vacuity(formal, witness, timeout_s=LEAN_TIMEOUT)
+    assert result.checked
+    assert [(c.label, c.state) for c in result.witness] == [("hx", "holds")]
+    assert result.unwitnessed == ["r"]
+    assert not result.satisfied_by_witness
+    # Flagged for the audit, not rejected.
+    assert not result.rejected
+
+
+def test_the_audit_prompt_marks_variables_with_no_witness_value(store: RecordStore) -> None:
+    from minilab.formalise.audit import audit_prompt
+
+    formal = probed(SIMPLE)
+    prompt = audit_prompt(
+        survived_record(store), formal, formal.hypotheses, set(), unwitnessed={"x"}
+    )
+    line = next(row for row in prompt.splitlines() if row.startswith("- x :"))
+    assert "no witness value" in line, prompt

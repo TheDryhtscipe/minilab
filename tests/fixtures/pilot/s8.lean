@@ -1,5 +1,7 @@
 import Mathlib
 
+section
+
 open Finset
 
 /-! S8 from the crossconj-ml pilot (information theory x convex optimisation):
@@ -44,3 +46,5 @@ theorem conjecture {m n : ℕ} (W : Matrix (Fin m) (Fin n) ℝ) (hW : IsChannel 
     (hKKT : ∃ C : ℝ, ∀ i, rowKL W (outDist W p) i ≤ C ∧ (0 < p i → rowKL W (outDist W p) i = C)) :
     ∃ p' : Fin m → ℝ, IsCapacityAchieving W p' ∧ (univ.filter (fun i => p' i ≠ 0)).card ≤ W.rank := by
   sorry
+
+end

@@ -141,7 +141,12 @@ def _shown(binder: Binder) -> str:
 
 
 def audit_prompt(
-    record: Record, formal: FormalOutput, asked: list[Binder], failing: set[str]
+    record: Record,
+    formal: FormalOutput,
+    asked: list[Binder],
+    failing: set[str],
+    *,
+    unwitnessed: set[str] | None = None,
 ) -> str:
     assumptions = "\n".join(f"  {i}. {a}" for i, a in enumerate(record.assumptions, 1))
     listed = "\n".join(
@@ -150,7 +155,14 @@ def audit_prompt(
         for b in asked
     )
     variables = "\n".join(
-        f"- {b.label} : {_shown(b)}" + ("  (instance binder)" if b.instance else "")
+        f"- {b.label} : {_shown(b)}"
+        + ("  (instance binder)" if b.instance else "")
+        + (
+            "  (no witness value reached it, so any condition its type carries was not "
+            "checked: judge that condition as a hidden hypothesis)"
+            if b.label in (unwitnessed or set())
+            else ""
+        )
         for b in formal.binders
         if not b.prop
     )
@@ -290,7 +302,13 @@ def audit(
     reply = call(
         checker,
         Role.audit,
-        audit_prompt(record, formal, asked, failing),
+        audit_prompt(
+            record,
+            formal,
+            asked,
+            failing,
+            unwitnessed=set(vacuity.unwitnessed) if vacuity is not None else None,
+        ),
         record_id=record.id,
         pair=record.pair,
         ledger=ledger,
