@@ -229,6 +229,11 @@ set_option linter.unreachableTactic false in
 """
 
 
+def _quoted(name: str) -> str:
+    """`name` with each part in `«»`, so a part that is a keyword still parses."""
+    return ".".join(f"«{part}»" for part in name.split("."))
+
+
 def _simp_set(names: list[str]) -> str:
     return f" [{', '.join(names)}]" if names else ""
 
@@ -292,7 +297,8 @@ def vacuity(
     terms: list[tuple[str, str, bool]] = []
     if witness is not None:
         terms, notes = witness_terms(formal, witness)
-    defs = [d for d in formal.definitions if _IDENT.match(d)]
+    # A type cannot be unfolded by `simp`; naming one is an error.
+    defs = [_quoted(d) for d in formal.definitions if _IDENT.match(d) and d not in formal.types]
     nonce = new_nonce()
     contra = f"{CONTRA}_{nonce}"
 
@@ -358,7 +364,19 @@ def vacuity(
             malformed += 1
     for index, detail in sorted(failed_values.items()):
         notes.append(f"the witness value for {by_index[index].label} was not used: {detail}")
-    ready = readies == 1 and malformed == 0
+    # Lean recovers from a parse error and still declares the theorem, so a
+    # theorem it could not parse would look like a proof that failed.
+    unparsed = [
+        m
+        for m in result.messages
+        if m.severity == "error" and m.line > source_lines and m.text.startswith("unexpected")
+    ]
+    ready = readies == 1 and malformed == 0 and not unparsed
+    if unparsed:
+        notes.append(
+            "Lean could not parse the linter's theorems: "
+            + "; ".join(f"line {m.line}: {m.text}" for m in unparsed)[:500]
+        )
     if not ready:
         notes.append(
             "the vacuity meta-program did not finish cleanly: " + "; ".join(result.errors)[:1000]

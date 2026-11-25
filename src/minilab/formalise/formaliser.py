@@ -126,9 +126,12 @@ class FormalOutput(BaseModel):
     parsed it (`command_check`); the text reading `lean_statement` only when
     Lean did not find it.
     `binders` are the binders before the colon; `conclusion` is the rest.
+    `definitions` are the file's `def`s and the types it declares
+    (`inductive`, `structure`, `class inductive`); `types` lists the latter.
     `definition_uses` maps each file definition to the file definitions its
-    value mentions. `problems` says why the file is not `ok`. `attempts`
-    counts the model calls that led to this file.
+    value (a type's: its constructors) mentions. `problems` says why the
+    file is not `ok`. `attempts` counts the model calls that led to this
+    file.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -144,6 +147,7 @@ class FormalOutput(BaseModel):
     conclusion_defs: list[str] = []
     conclusion_truncated: bool = False
     definitions: list[str]
+    types: list[str] = []
     definition_uses: dict[str, list[str]] = {}
     ok: bool
     problems: list[str]
@@ -546,6 +550,7 @@ class _RawBinder(BaseModel):
     instance: bool
     deps: list[int]
     defs: list[str]
+    foreign: list[str]
     type: str
     truncated: bool
 
@@ -557,6 +562,7 @@ class _RawBody(BaseModel):
     sorry: bool
     deps: list[int]
     defs: list[str]
+    foreign: list[str]
     type: str
     truncated: bool
 
@@ -568,8 +574,17 @@ class _RawDef(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
+    type: bool
     sorry: bool
     uses: list[str]
+
+
+def _foreign_problem(where: str, shown: str) -> str:
+    return (
+        f"{where} uses the instance `{shown}`, which is not the one Lean's instance search "
+        "finds there; the printed statement hides it, so write the statement with the "
+        "usual instances"
+    )
 
 
 def marker_messages(result: LeanResult, after_line: int, marker: str) -> list[tuple[str, str]]:
@@ -728,6 +743,11 @@ def formal_from_source(
     sorry_names |= {item.name for item in raw_defs if item.sorry}
     for name in sorted(sorry_names - {THEOREM}):
         problems.append(f"`{name}` depends on `sorry`")
+    for b in raw_binders:
+        for shown in b.foreign:
+            problems.append(_foreign_problem(f"the type of binder {b.index}", shown))
+    for shown in raw_body.foreign if raw_body is not None else []:
+        problems.append(_foreign_problem("the conclusion", shown))
     extra = sorted(set(result.axioms) - STANDARD_AXIOMS - {SORRY_AXIOM})
     if extra:
         problems.append(f"the file uses axioms beyond Lean's standard ones: {', '.join(extra)}")
@@ -756,7 +776,8 @@ def formal_from_source(
         conclusion_defs=raw_body.defs if raw_body is not None else [],
         conclusion_truncated=raw_body.truncated if raw_body is not None else False,
         definitions=[d.name for d in raw_defs],
-        definition_uses={d.name: d.uses for d in raw_defs},
+        types=[d.name for d in raw_defs if d.type],
+        definition_uses={d.name: [u for u in d.uses if u != d.name] for d in raw_defs},
         ok=not problems,
         problems=problems,
         attempts=attempts,
@@ -801,9 +822,13 @@ Rules for the file:
   conjecture does not state.
 - Name the variables after the parameters of the instance family.
 - Write `open` only as `open … in` before a declaration, or inside a
-  `section … end`. Do not put the theorem in a `namespace`.
-- Write no comments. Use no `axiom`, `set_option`, `macro`, `notation`, or
-  `#eval`, and no name containing "minilab".
+  `section … end`, and never with `renaming` or `hiding`. Do not put the
+  theorem in a `namespace`.
+- Use Mathlib's usual instances: build no instance in a statement
+  (`haveI`, `letI`, `⟨…⟩` or `@` in an instance argument).
+- Write no comments and no string literals. Use plain names, never `«…»`.
+  Use no `axiom`, `set_option`, `macro`, `notation`, or `#eval`, and no
+  name containing "minilab".
 
 Reply with the whole file in one ```lean code block."""
 

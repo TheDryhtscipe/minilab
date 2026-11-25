@@ -100,14 +100,27 @@ def allowedDeclarations : List Name :=
 Aesop's rule clauses (`aesop (add …)`), and `decide` with a configuration
 (`decide +native`) are refused. Interpolated strings (`s!"…{e}…"`, `m!`,
 `f!`) are refused because the text gate in Python reads them as plain
-strings, while Lean elaborates the terms inside the braces. With code generation off none of them can
+strings, while Lean elaborates the terms inside the braces. String literals
+are refused because a string reaches the audit and round-trip prompts as it
+was written, and can close the prompt's code fence. `open … renaming` and
+`open … hiding` are refused because the statement text is cut from inside
+the `open … in`, so a renaming would change what that text means. With code
+generation off none of them can
 run model code; the list is a second guard, and it gives the model a reason
 it can act on. -/
 def deniedKinds : List Name :=
   [``Lean.Parser.Term.attributes, ``Lean.Parser.Command.unsafe,
    ``Lean.Parser.Command.partial, ``Lean.Parser.Tactic.runTac,
    `Lean.Parser.Term.byElab, ``Lean.Parser.Tactic.nativeDecide,
-   `Mathlib.Meta.eval_expr, `plausibleSyntax, interpolatedStrKind]
+   `Mathlib.Meta.eval_expr, `plausibleSyntax, interpolatedStrKind, strLitKind,
+   ``Lean.Parser.Command.openRenaming, ``Lean.Parser.Command.openHiding]
+
+/-- The identifiers in `s` written with `«»`, with their lines' syntax. -/
+partial def quotedIdents (s : Syntax) (acc : Array Syntax) : Array Syntax :=
+  match s with
+  | .node _ _ args => args.foldl (fun a c => quotedIdents c a) acc
+  | .ident _ raw _ _ => if raw.toString.contains '«' then acc.push s else acc
+  | _ => acc
 
 partial def kinds (s : Syntax) (acc : Array (SyntaxNodeKind × Syntax)) :
     Array (SyntaxNodeKind × Syntax) :=
@@ -132,6 +145,9 @@ def refusal (kind : Name) (node : Syntax) : Option String :=
   let last := lastPart kind
   if last.startsWith "doSeq" then some "a `do` block"
   else if kind == interpolatedStrKind then some "an interpolated string"
+  else if kind == strLitKind then some "a string literal"
+  else if kind == ``Lean.Parser.Command.openRenaming then some "`open … renaming`"
+  else if kind == ``Lean.Parser.Command.openHiding then some "`open … hiding`"
   else if deniedKinds.contains kind || last == "set_option" then some s!"`{kind}`"
   else if kind.getRoot == `Aesop && last.startsWith "tactic_clause" then
     some "an Aesop rule clause"
@@ -244,6 +260,13 @@ source opened are closed again before the command ends. -/
           | some a, some b => statement := some (a.byteIdx, b.byteIdx)
           | _, _ => pure ()
         | none => pure ()
+    -- A name written with «» can be a keyword (`«at»`) or hold any text, so
+    -- it breaks the checks' Lean text and can carry text into the prompts.
+    for q in quotedIdents cmd #[] do
+      let p := s!"line {lineOf q}: the name `{((q.getSubstring? false false).map (·.toString)).getD ""}` \
+        is written with «»; use a plain name"
+      if !problems.contains p then problems := problems.push p
+      fine := false
     if fine && k == ``Lean.Parser.Command.open && (← getScopes).length == saved.length then
       problems := problems.push s!"line {line}: a top-level `open` stays in force for the \
         checks after the file; use `open … in`, or put the `open` inside a `section`"
@@ -276,6 +299,46 @@ def maxDefsListed : Nat := 50
 
 syntax (name := probeCmd) "#minilab_probe " str num : command
 
+/-- Classes whose instances cannot change what a statement means, because any
+two of them are equal. `open Classical` fills these with an instance that a
+search after the file does not find. -/
+def subsingletonClasses : List Name :=
+  [``Decidable, ``DecidableEq, ``DecidablePred, ``DecidableRel]
+
+/-- The instance arguments in `e` that Lean's instance search would not give
+there: a structure written in place (`haveI : LT ℝ := ⟨…⟩`), a `let`, or an
+instance of another type that unfolds to this one (`OrderDual.instLE`). The
+printed type does not show instance arguments, so such an argument changes
+the meaning of a statement without changing its text. `let` and `have` (a
+`let` that its body does not depend on) are unfolded first, so their values are checked where they are used. A local
+instance binder of the statement is what the search finds, so it passes. -/
+def foreignInstances (e : Expr) : MetaM (Array String) := do
+  let found ← IO.mkRef (#[] : Array String)
+  let pre : Expr → MetaM TransformStep := fun t => do
+    if let .letE _ _ v b _ := t then return .visit (b.instantiate1 v)
+    if t.isHeadBetaTarget then return .visit t.headBeta
+    return .continue
+  let post : Expr → MetaM TransformStep := fun t => do
+    if t.isApp then
+      let f := t.getAppFn
+      let args := t.getAppArgs
+      let info ← getFunInfoNArgs f args.size
+      for i in [0:min info.paramInfo.size args.size] do
+        if !info.paramInfo[i]!.binderInfo.isInstImplicit then continue
+        let a := args[i]!
+        let cls ← instantiateForall (← inferType f) (args.extract 0 i)
+        let cls := cls.bindingDomain!
+        if subsingletonClasses.any (cls.getAppFn.isConstOf ·) then continue
+        let fine ← withNewMCtxDepth do
+          match ← trySynthInstance cls with
+          | .some s => isDefEq a s
+          | _ => pure false
+        if !fine then
+          found.modify (·.push ((toString (← ppExpr a)).take 200).toString)
+    return .done t
+  let _ ← Meta.transform e (pre := pre) (post := post)
+  found.get
+
 /-- The most names `SORRY` lists. -/
 def maxSorryListed : Nat := 20
 
@@ -305,7 +368,7 @@ without `optParam` and `autoParam`. -/
     -- generates (`noConfusionType`, `ctorIdx`, deriving helpers) have no range.
     if (← findDeclarationRanges? name).isNone then continue
     match ci with
-    | ConstantInfo.defnInfo _ => fileDefs := fileDefs.push name
+    | ConstantInfo.defnInfo _ | ConstantInfo.inductInfo _ => fileDefs := fileDefs.push name
     | _ => pure ()
   let userName : Name → String := fun n => ((privateToUserName? n).getD n).toString
   let mentions : Expr → Json := fun e =>
@@ -314,8 +377,16 @@ without `optParam` and `autoParam`. -/
   for name in fileDefs do
     let some ci := env.find? name | continue
     let ax ← collectAxioms name
+    let uses := match ci with
+      | ConstantInfo.inductInfo v =>
+        -- A type's meaning is in its constructors.
+        v.ctors.foldl (fun e c => match env.find? c with
+          | some cc => mkApp e cc.type
+          | none => e) ci.type
+      | _ => ci.value?.getD ci.type
     say marker "DEF" (Json.mkObj [("name", toJson (userName name)),
-      ("sorry", toJson (ax.contains ``sorryAx)), ("uses", mentions (ci.value?.getD ci.type))])
+      ("type", toJson (ci matches ConstantInfo.inductInfo _)),
+      ("sorry", toJson (ax.contains ``sorryAx)), ("uses", mentions uses)])
   match env.find? `conjecture with
   | none => say marker "NONE" Json.null
   | some info =>
@@ -341,6 +412,7 @@ without `optParam` and `autoParam`. -/
               ("name", toJson (binderName d.userName)),
               ("prop", toJson isP), ("instance", toJson d.binderInfo.isInstImplicit),
               ("deps", toJson deps), ("defs", mentions ty),
+              ("foreign", toJson (← foreignInstances ty)),
               ("type", toJson (s.take maxTypeChars)),
               ("truncated", toJson (decide (s.length > maxTypeChars)))])
         let b ← instantiateMVars body
@@ -350,7 +422,8 @@ without `optParam` and `autoParam`. -/
         let s := toString (← ppExpr b)
         say marker "BODY" (Json.mkObj [("theorem", toJson isThm), ("sorry", toJson typeSorry),
             ("deps", toJson deps),
-            ("defs", mentions b), ("type", toJson (s.take maxTypeChars)),
+            ("defs", mentions b), ("foreign", toJson (← foreignInstances b)),
+            ("type", toJson (s.take maxTypeChars)),
             ("truncated", toJson (decide (s.length > maxTypeChars)))])
 
 -- ## The vacuity goals
@@ -411,8 +484,11 @@ into ℕ or ℤ. A binder with no name takes no value. -/
           say m "PROP" (Json.mkObj [("index", toJson i), ("instantiated", toJson closed)])
         else if d.binderInfo.isInstImplicit then
           if closed then
-            match ← trySynthInstance ty with
+            -- Search without the binders: inside them, the search finds this
+            -- binder itself, and an empty class would look filled.
+            match ← withLCtx {} {} (trySynthInstance ty) with
             | LOption.some e =>
+              if e.hasFVar || e.hasMVar then continue
               fromV := fromV.push x
               toV := toV.push e
               say m "SUBST" (Json.mkObj [("index", toJson i), ("ok", toJson true)])
