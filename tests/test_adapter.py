@@ -379,6 +379,65 @@ def test_parse_codex_failure_and_missing_usage() -> None:
     assert (reply.tokens_in, reply.tokens_out) == (10, 5)
 
 
+def _step(step_type: str, state: str, tool: str | None = None) -> dict[str, object]:
+    step: dict[str, object] = {"conversation_id": "c", "step_index": 1, "state": state,
+                               "step_type": step_type}
+    if tool is not None:
+        step["tool_name"] = tool
+    return {"event": "step_update", "step_update": step}
+
+
+def _agy(result: Mapping[str, object], *steps: Mapping[str, object]) -> str:
+    """agy 1.5.16 `--output-format stream-json` output: init, the steps, then the result."""
+    events: list[Mapping[str, object]] = [
+        {"event": "init", "conversation_id": "c", "init": {"tools": ["search_web"]}},
+        _step("user_input", "DONE"),
+        *steps,
+        _step("agent_response", "DONE"),
+        {"event": "result", "result": result},
+    ]
+    return "\n".join(json.dumps(event) for event in events) + "\n"
+
+
+_AGY_DONE = {"status": "SUCCESS", "response": "answer",
+             "usage": {"input_tokens": 40, "output_tokens": 6, "total_tokens": 46}}
+
+
+def test_parse_agy_accepts_tools_that_were_blocked() -> None:
+    denied = (_step("tool", "ACTIVE", "search_web"), _step("tool", "ERROR", "search_web"))
+    assert parse_agy(_agy(_AGY_DONE, *denied), model="m").text == "answer"
+
+
+@pytest.mark.parametrize("state", ["DONE", "CANCELED", ""])
+def test_parse_agy_rejects_a_tool_that_was_not_blocked(state: str) -> None:
+    ran = (_step("tool", "ACTIVE", "search_web"), _step("tool", state, "search_web"))
+    with pytest.raises(ModelUnavailable, match="search_web") as caught:
+        parse_agy(_agy(_AGY_DONE, *ran), model="m")
+    # The call still used tokens, so the adapter can charge them.
+    assert (caught.value.tokens_in, caught.value.tokens_out) == (40, 6)
+
+
+def test_parse_agy_rejects_unknown_step_types() -> None:
+    with pytest.raises(ModelUnavailable, match="browser_subagent"):
+        parse_agy(_agy(_AGY_DONE, _step("browser_subagent", "DONE")), model="m")
+
+
+def test_parse_agy_rejects_broken_streams() -> None:
+    whole = _agy(_AGY_DONE)
+    without_result = "".join(whole.splitlines(keepends=True)[:-1])
+    with pytest.raises(ModelUnavailable, match="no result"):
+        parse_agy(without_result, model="m")
+    with pytest.raises(ModelUnavailable, match="more than one result"):
+        parse_agy(whole + whole.splitlines(keepends=True)[-1], model="m")
+    with pytest.raises(ModelUnavailable, match="not JSON"):
+        parse_agy("Loaded settings.\n" + whole, model="m")
+    with pytest.raises(ModelUnavailable, match="not JSON"):
+        parse_agy(json.dumps({"status": "SUCCESS", "response": "answer"}) + "x", model="m")
+    # The single JSON object of `--output-format json` has no step events to check.
+    with pytest.raises(ModelUnavailable, match="unexpected event"):
+        parse_agy(json.dumps({"status": "SUCCESS", "response": "answer"}), model="m")
+
+
 def test_parse_agy() -> None:
     ok = {
         "status": "SUCCESS",
@@ -387,15 +446,15 @@ def test_parse_agy() -> None:
         "usage": {"input_tokens": 12072, "output_tokens": 47, "thinking_tokens": 37,
                   "cache_read_tokens": 0, "total_tokens": 12119},
     }
-    reply = parse_agy(json.dumps(ok), model="gemini-x")
+    reply = parse_agy(_agy(ok), model="gemini-x")
     assert reply == ModelReply(text="answer", tokens_in=12072, tokens_out=47, estimated=False,
                                model="gemini-x")
     # Tokens in the total that neither count covers are charged as input.
     ok["usage"] = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 20}
-    assert parse_agy(json.dumps(ok), model="gemini-x").tokens_in == 15
+    assert parse_agy(_agy(ok), model="gemini-x").tokens_in == 15
     failed = {"status": "ERROR", "error": "quota exceeded"}
     with pytest.raises(ModelUnavailable):
-        parse_agy(json.dumps(failed), model="gemini-x")
+        parse_agy(_agy(failed), model="gemini-x")
 
 
 def test_estimate_tokens_four_chars() -> None:
@@ -450,6 +509,7 @@ def test_backend_command_lines_carry_isolation_flags() -> None:
                    "command", "mcp"):
         assert f"{action}(*)" in settings["permissions"]["deny"]
     assert "--dangerously-skip-permissions" not in agy
+    assert agy[agy.index("--output-format") + 1] == "stream-json"
     assert LocalBackend().model == "qwen3.5:4b"
 
 
@@ -691,7 +751,7 @@ def test_short_maths_answers_are_replies(answer: str) -> None:
     message = {"type": "item.completed", "item": {"type": "agent_message", "text": answer}}
     assert parse_codex(_codex(message, _DONE), model="m").text == answer
     agy = {"status": "SUCCESS", "response": answer}
-    assert parse_agy(json.dumps(agy), model="m").text == answer
+    assert parse_agy(_agy(agy), model="m").text == answer
 
 
 def test_parse_claude_subtype_must_be_success() -> None:
@@ -797,15 +857,15 @@ def test_parse_codex_counts() -> None:
 
 def test_parse_agy_empty_response_and_counts() -> None:
     with pytest.raises(ModelUnavailable, match="no reply text"):
-        parse_agy(json.dumps({"status": "SUCCESS", "response": ""}), model="m")
+        parse_agy(_agy({"status": "SUCCESS", "response": ""}), model="m")
     failed = {"status": "ERROR", "error": "quota", "usage": {"input_tokens": 7,
                                                              "output_tokens": 1}}
     with pytest.raises(ModelUnavailable) as caught:
-        parse_agy(json.dumps(failed), model="m")
+        parse_agy(_agy(failed), model="m")
     assert (caught.value.tokens_in, caught.value.tokens_out) == (7, 1)
     ok = {"status": "SUCCESS", "response": "answer",
           "usage": {"input_tokens": 1.2e4, "output_tokens": False}}
-    reply = parse_agy(json.dumps(ok), model="m")
+    reply = parse_agy(_agy(ok), model="m")
     assert (reply.tokens_in, reply.tokens_out, reply.estimated) == (12000, 2, True)
 
 
@@ -934,15 +994,23 @@ sys.exit(1)
 """
 
 _AGY_OK = """
-import json, sys
+import json, os, sys
+if not os.path.isfile(".agents/hooks.json"):
+    sys.exit("no hooks.json in the working directory")
 [prompt] = [a[len("--print="):] for a in sys.argv if a.startswith("--print=")]
-print(json.dumps({"status": "SUCCESS", "response": "got " + prompt,
-                  "usage": {"input_tokens": 12, "output_tokens": 5, "total_tokens": 17}}))
+steps = [{"step_index": 2, "step_type": "tool", "tool_name": "search_web", "state": state}
+         for state in json.loads(os.environ.get("FAKE_AGY_TOOL_STATES", "[]"))]
+for step in [{"step_type": "user_input", "state": "DONE"}, *steps,
+             {"step_type": "agent_response", "state": "DONE"}]:
+    print(json.dumps({"event": "step_update", "step_update": step}))
+print(json.dumps({"event": "result", "result": {
+    "status": "SUCCESS", "response": "got " + prompt,
+    "usage": {"input_tokens": 12, "output_tokens": 5, "total_tokens": 17}}}))
 """
 
 _AGY_FAIL = """
 import json, sys
-print(json.dumps({"status": "ERROR", "error": "quota exceeded"}))
+print(json.dumps({"event": "result", "result": {"status": "ERROR", "error": "quota exceeded"}}))
 sys.exit(1)
 """
 
@@ -979,6 +1047,44 @@ def test_gemini_backend_end_to_end(tmp_path: Path) -> None:
     fail = GeminiBackend(binary=_tool(tmp_path, "agy_fail", _AGY_FAIL))
     with pytest.raises(ModelUnavailable, match="quota exceeded"):
         fail.run("hi", cwd=tmp_path, env=env, timeout_s=10)
+
+
+def test_gemini_backend_fails_a_call_in_which_a_tool_ran(tmp_path: Path) -> None:
+    backend = GeminiBackend(binary=_tool(tmp_path, "agy_ok", _AGY_OK))
+    env = {**scrubbed_env(), "FAKE_AGY_TOOL_STATES": json.dumps(["ACTIVE", "ERROR"])}
+    assert backend.run("hi", cwd=tmp_path, env=env, timeout_s=10).text == "got hi"
+    env["FAKE_AGY_TOOL_STATES"] = json.dumps(["ACTIVE", "DONE"])
+    with pytest.raises(ModelUnavailable, match="search_web") as caught:
+        backend.run("hi", cwd=tmp_path, env=env, timeout_s=10)
+    assert (caught.value.tokens_in, caught.value.tokens_out) == (12, 5)
+
+
+def test_gemini_backend_hook_denies_every_tool(tmp_path: Path) -> None:
+    backend = GeminiBackend(binary=_tool(tmp_path, "agy_ok", _AGY_OK))
+    backend.run("hi", cwd=tmp_path, env=scrubbed_env(), timeout_s=10)
+    hooks = json.loads((tmp_path / ".agents" / "hooks.json").read_text())
+    [named] = hooks.values()
+    assert set(named) == {"PreToolUse"}
+    [group] = named["PreToolUse"]
+    assert group["matcher"] == "*"
+    [handler] = group["hooks"]
+    # Run the hook as agy does: `sh -c`, in the folder that holds hooks.json, JSON on stdin.
+    payload = {"hookEventName": "PreToolUse", "toolCall": {"id": "t", "name": "search_web",
+                                                           "args": {"query": "arXiv"}}}
+    done = subprocess.run(["sh", "-c", handler["command"]], input=json.dumps(payload),
+                          capture_output=True, text=True, cwd=tmp_path / ".agents",
+                          env=scrubbed_env(), timeout=10, check=True)
+    assert json.loads(done.stdout)["decision"] == "deny"
+
+
+def test_gemini_backend_will_not_start_without_its_hook(tmp_path: Path) -> None:
+    # A file where the `.agents` folder must go: the hook cannot be written.
+    (tmp_path / ".agents").write_text("")
+    marker = tmp_path / "ran"
+    tool = _tool(tmp_path, "agy", f"open({str(marker)!r}, 'w').write('x')\n" + _AGY_OK)
+    with pytest.raises(ModelNotStarted, match="hook"):
+        GeminiBackend(binary=tool).run("hi", cwd=tmp_path, env=scrubbed_env(), timeout_s=10)
+    assert not marker.exists()
 
 
 def test_failed_tool_charged_with_its_reported_usage(ledger: Ledger, tmp_path: Path) -> None:

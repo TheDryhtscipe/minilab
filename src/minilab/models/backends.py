@@ -25,11 +25,10 @@ The isolation flags for each tool:
   feature that reaches outside the prompt turned off, including the shell.
 - Gemini (Antigravity CLI, `agy -p`): a session-only `--settings` object that
   denies file, URL, command, and MCP actions, keeps the agent inside its empty
-  workspace, and never spends paid credits. The deny list does not cover
-  agy's built-in `search_web` tool, nor its browser or subagent tools. The
-  probe of 2026-11-24 found that Gemini still searches the web, so Gemini is
-  "normal runs only" and may not be used in the benchmark (see
-  `src/minilab/models/isolation.json`; follow-up bead minilab-2be43f).
+  workspace, and never spends paid credits; a `PreToolUse` hook, written into
+  the call's empty directory, that denies every tool, `search_web` and the
+  browser and subagent tools included; and a parser that fails any call in
+  which a tool step was not blocked (bead minilab-2be43f).
 - Local (ollama HTTP API): the model has no tools. The HTTP client ignores
   proxy variables in the environment.
 
@@ -522,35 +521,117 @@ AGY_SETTINGS: dict[str, JsonValue] = {
 
 They deny file, URL, command, and MCP actions. They do not cover agy's
 built-in `search_web` tool, nor its browser or subagent tools: the probe of
-2026-11-24 found that Gemini still searches the web with these settings. So
-Gemini is "normal runs only" (see `src/minilab/models/isolation.json`;
-follow-up bead minilab-2be43f).
+2026-11-24 found that Gemini still searched the web with these settings
+alone. `AGY_HOOKS` blocks those.
 """
+
+AGY_HOOKS: dict[str, JsonValue] = {
+    "minilab-deny-all-tools": {
+        "PreToolUse": [
+            {
+                "matcher": "*",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": (
+                            "cat >/dev/null; printf '%s\\n' "
+                            "'{\"decision\":\"deny\",\"reason\":\"This session has no tools.\"}'"
+                        ),
+                        "timeout": 10,
+                    }
+                ],
+            }
+        ]
+    }
+}
+"""agy hooks that deny every tool call, written to `.agents/hooks.json` in the call's
+empty working directory.
+
+A `PreToolUse` hook with matcher `*` runs before every tool, built-in ones
+such as `search_web` and the browser and subagent tools included, and its
+`deny` stops the tool. On agy 1.5.16 a hook that fails, times out, or prints
+something that is not JSON also stops the tool, so the block fails closed.
+agy reads `.agents/` only from the working directory up to the repository
+root; a folder outside a repository reads its own `.agents/` and no parent's.
+"""
+
+_AGY_STEPS_WITHOUT_TOOLS = frozenset({"user_input", "agent_response"})
+"""Step types that run no tool. `parse_agy` rejects any step type not here or `tool`."""
+
+
+def _agy_tools_not_blocked(events: Sequence[dict[str, JsonValue]]) -> list[str]:
+    """The tool steps that did not end blocked (state `ERROR`), and any unknown step."""
+    last: dict[int, tuple[str, JsonValue]] = {}
+    problems: list[str] = []
+    for event in events:
+        step = _obj(event.get("step_update"))
+        step_type = step.get("step_type")
+        if step_type in _AGY_STEPS_WITHOUT_TOOLS:
+            continue
+        if step_type != "tool":
+            problems.append(f"step type {step_type!r}")
+            continue
+        index = _int(step.get("step_index"))
+        name = step.get("tool_name")
+        if index is None:
+            problems.append(f"{name} (no step index)")
+            continue
+        last[index] = (str(name), step.get("state"))
+    problems += [f"{name} ({state})" for name, state in last.values() if state != "ERROR"]
+    return problems
 
 
 def parse_agy(raw: str, *, model: str, prompt: str = "") -> ModelReply:
-    """Parse `agy -p --output-format json` output: one JSON object.
+    """Parse `agy -p --output-format stream-json` output: one JSON event per line.
+
+    The events are `init`, a `step_update` for each step, and one `result`.
+    A call in which any tool step did not end blocked raises
+    `ModelUnavailable`, as does a step of a type that is not known to run no
+    tool: the hook in `AGY_HOOKS` should have blocked every tool, so this
+    checks each call, not only the probe.
 
     On agy 1.5.16, `output_tokens` already includes `thinking_tokens`, and
     `total_tokens` is input plus output. Any part of the total that the
     input and output counts do not cover is charged as input, so no spend is
     lost if that changes.
     """
-    value = _obj(_load_json(raw, "agy"))
+    steps: list[dict[str, JsonValue]] = []
+    result: dict[str, JsonValue] | None = None
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        event = _obj(_load_json(line, "agy"))
+        kind = event.get("event")
+        if kind == "step_update":
+            steps.append(event)
+        elif kind == "result":
+            if result is not None:
+                raise ModelUnavailable(f"agy: more than one result event: {_tail(raw)}")
+            result = _obj(event.get("result"))
+        elif kind != "init":
+            raise ModelUnavailable(f"agy: unexpected event {kind!r}: {_tail(line)}")
+    if result is None:
+        raise ModelUnavailable(f"agy: no result event: {_tail(raw)}")
     tokens_in: int | None = None
     tokens_out: int | None = None
-    usage = value.get("usage")
+    usage = result.get("usage")
     if isinstance(usage, dict):
         tokens_in = _int(usage.get("input_tokens"))
         tokens_out = _int(usage.get("output_tokens"))
         total = _int(usage.get("total_tokens"))
         if tokens_in is not None and tokens_out is not None and total is not None:
             tokens_in += max(0, total - tokens_in - tokens_out)
-    status = value.get("status")
-    text = value.get("response")
+    not_blocked = _agy_tools_not_blocked(steps)
+    if not_blocked:
+        raise ModelUnavailable(
+            f"agy: a tool was not blocked: {', '.join(not_blocked)}",
+            tokens_in=tokens_in, tokens_out=tokens_out,
+        )
+    status = result.get("status")
+    text = result.get("response")
     if status != "SUCCESS":
         raise ModelUnavailable(
-            f"agy: status {status}: {value.get('error', _tail(raw))}",
+            f"agy: status {status}: {result.get('error', _tail(raw))}",
             tokens_in=tokens_in, tokens_out=tokens_out,
         )
     if not isinstance(text, str) or not text:
@@ -571,7 +652,7 @@ class GeminiBackend:
         """agy reads its prompt only from the command line (`--print=<prompt>`), not stdin."""
         argv = [
             self.binary,
-            "--output-format", "json",
+            "--output-format", "stream-json",
             "--disable-slash-commands",
             "--settings", json.dumps(AGY_SETTINGS),
         ]
@@ -582,14 +663,22 @@ class GeminiBackend:
     def run(
         self, prompt: str, *, cwd: Path, env: Mapping[str, str], timeout_s: float
     ) -> ModelReply:
-        """Run agy. A prompt over `MAX_ARG_BYTES` raises `ModelNotStarted`; so does a
-        prompt with a NUL character or one that is not valid text (see `run_command`)."""
+        """Run agy with `AGY_HOOKS` written into `cwd`, which must be the call's own
+        empty directory. A prompt over `MAX_ARG_BYTES` raises `ModelNotStarted`; so
+        does a prompt with a NUL character or one that is not valid text (see
+        `run_command`), and a hook that cannot be written."""
         size = len(prompt.encode("utf-8", errors="replace"))
         if size > MAX_ARG_BYTES:
             raise ModelNotStarted(
                 f"agy: prompt is {size} bytes; the limit for one "
                 f"command-line argument is {MAX_ARG_BYTES}"
             )
+        try:
+            agents = cwd / ".agents"
+            agents.mkdir(exist_ok=True)
+            (agents / "hooks.json").write_text(json.dumps(AGY_HOOKS))
+        except OSError as exc:
+            raise ModelNotStarted(f"agy: cannot write the deny-all hook: {exc}") from exc
         model = self.model or "agy-default"
         return _run_and_parse(
             self.argv(prompt), lambda out: parse_agy(out, model=model, prompt=prompt),
