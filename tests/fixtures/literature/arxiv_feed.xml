@@ -1,0 +1,76 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<feed xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/" xmlns:arxiv="http://arxiv.org/schemas/atom" xmlns="http://www.w3.org/2005/Atom">
+  <id>https://arxiv.org/api/+wITCOM5zV04Gxlt6pWcNa9Z5m8</id>
+  <title>arXiv Query: search_query=all:"rate distortion" AND all:linear AND submittedDate:"190001010000 TO 202606302359"&amp;id_list=&amp;start=0&amp;max_results=3</title>
+  <updated>2026-11-25T12:48:50Z</updated>
+  <link href="https://arxiv.org/api/query?search_query=all:%22rate+distortion%22+AND+(all:linear+AND+submittedDate:%22190001010000+TO+202606302359%22)&amp;start=0&amp;max_results=3&amp;id_list=" type="application/atom+xml"/>
+  <opensearch:itemsPerPage>4</opensearch:itemsPerPage>
+  <opensearch:totalResults>4</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+    <entry>
+    <id>http://arxiv.org/abs/2411.18494v1</id>
+    <title>Learning Optimal Linear Block Transform by Rate Distortion Minimization</title>
+    <updated>2024-11-27T16:36:56Z</updated>
+    <link href="https://arxiv.org/abs/2411.18494v1" rel="alternate" type="text/html"/>
+    <link href="https://arxiv.org/pdf/2411.18494v1" rel="related" type="application/pdf" title="pdf"/>
+    <summary>Linear block transform coding remains a fundamental component of image and video compression. Although the Discrete Cosine Transform (DCT) is widely employed in all current compression standards, its sub-optimality has sparked ongoing research into discovering more efficient alternative transforms even for fields where it represents a consolidated tool. In this paper, we introduce a novel linear block transform called the Rate Distortion Learned Transform (RDLT), a data-driven transform specifically designed to minimize the rate-distortion (RD) cost when approximating residual blocks. Our approach builds on the latest end-to-end learned compression frameworks, adopting back-propagation and stochastic gradient descent for optimization. However, unlike the nonlinear transforms used in variational autoencoder (VAE)-based methods, the goal is to create a simpler yet optimal linear block transform, ensuring practical integration into existing image and video compression standards. Differently from existing data-driven methods that design transforms based on sample covariance matrices, such as the Karhunen-Loève Transform (KLT), the proposed RDLT is directly optimized from an RD perspective. Experimental results show that this transform significantly outperforms the DCT or other existing data-driven transforms. Additionally, it is shown that when simulating the integration of our RDLT into a VVC-like image compression framework, the proposed transform brings substantial improvements. All the code used in our experiments has been made publicly available at [1].</summary>
+    <category term="eess.IV" scheme="http://arxiv.org/schemas/atom"/>
+    <published>2024-11-27T16:36:56Z</published>
+    <arxiv:comment>An abstract version of this paper has been accepted at the 2025 Data Compression Conference (DCC)</arxiv:comment>
+    <arxiv:primary_category term="eess.IV"/>
+    <author>
+      <name>Alessandro Gnutti</name>
+    </author>
+    <author>
+      <name>Chia-Hao Kao</name>
+    </author>
+    <author>
+      <name>Wen-Hsiao Peng</name>
+    </author>
+    <author>
+      <name>Riccardo Leonardi</name>
+    </author>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2306.02435v1</id>
+    <title>On the complexity of linear systems: an approach via rate distortion theory and emulating systems</title>
+    <updated>2023-06-04T18:39:19Z</updated>
+    <link href="https://arxiv.org/abs/2306.02435v1" rel="alternate" type="text/html"/>
+    <link href="https://arxiv.org/pdf/2306.02435v1" rel="related" type="application/pdf" title="pdf"/>
+    <summary>We define the complexity of a continuous-time linear system to be the minimum number of bits required to describe its forward increments to a desired level of fidelity, and compute this quantity using the rate distortion function of a Gaussian source of uncertainty in those increments. The complexity of a linear system has relevance in control-communications contexts requiring local and dynamic decision-making based on sampled data representations. We relate this notion of complexity to the design of attention-varying controllers, and demonstrate a novel methodology for constructing source codes via the endpoint maps of so-called emulating systems, with potential for non-parametric, data-based simulation and analysis of unknown dynamical systems.</summary>
+    <category term="eess.SY" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.IT" scheme="http://arxiv.org/schemas/atom"/>
+    <published>2023-06-04T18:39:19Z</published>
+    <arxiv:comment>To appear, American Controls Conference 2023, San Diego, CA</arxiv:comment>
+    <arxiv:primary_category term="eess.SY"/>
+    <author>
+      <name>Eric Wendel</name>
+    </author>
+    <author>
+      <name>John Baillieul</name>
+    </author>
+    <author>
+      <name>Joseph Hollmann</name>
+    </author>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2608.01234v1</id>
+    <title>A synthetic paper first posted after the cap</title>
+    <updated>2026-08-03T10:00:00Z</updated>
+    <link href="https://arxiv.org/abs/2608.01234v1" rel="alternate" type="text/html"/>
+    <link href="https://arxiv.org/pdf/2608.01234v1" rel="related" type="application/pdf" title="pdf"/>
+    <summary>Synthetic test entry. Its first version is dated 3 August 2026, after the cap.</summary>
+    <published>2026-08-03T10:00:00Z</published>
+    <arxiv:primary_category term="cs.IT"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2602.04321v3</id>
+    <title>A synthetic paper revised after the cap</title>
+    <updated>2026-09-10T09:00:00Z</updated>
+    <link href="https://arxiv.org/abs/2602.04321v3" rel="alternate" type="text/html"/>
+    <link href="https://arxiv.org/pdf/2602.04321v3" rel="related" type="application/pdf" title="pdf"/>
+    <summary>Synthetic test entry. This abstract belongs to version 3, posted after the cap.</summary>
+    <published>2026-02-05T09:00:00Z</published>
+    <arxiv:primary_category term="math.OC"/>
+  </entry>
+</feed>

@@ -1,0 +1,28 @@
+{
+ "items": [
+  {
+   "is_accepted": true,
+   "score": 5,
+   "last_activity_date": 1695389740,
+   "last_edit_date": 1695389740,
+   "creation_date": 1436328417,
+   "answer_id": 211054,
+   "question_id": 201736,
+   "content_license": "CC BY-SA 4.0",
+   "body": "<p>Yes, you can design a countable-alphabet quantizer for Gaussian RVs where quantization noise approaches Gaussian noise in relative entropy, as codeword length increases.</p>\n<p>'On Lattice Quantization Noise' by Zamir and Feder in Transactions on Information Theory Vol. 42 No. 4, July 1996:</p>\n<p><a href=\"http://www.eng.tau.ac.il/%7Ezamir/papers/lqn.pdf\" rel=\"nofollow noreferrer\">http://www.eng.tau.ac.il/~zamir/papers/lqn.pdf</a></p>\n<p>Maybe a better question would be whether <em>any</em> sequence of bound-achieving quantizers approach the test channel distribution in relative entropy. (I think if they don't you can get a contradiction but am not engaged enough to think this through).</p>\n"
+  },
+  {
+   "is_accepted": false,
+   "score": 0,
+   "last_activity_date": 1786000000,
+   "creation_date": 1786000000,
+   "answer_id": 999101,
+   "question_id": 201736,
+   "content_license": "CC BY-SA 4.0",
+   "body": "<p>Synthetic answer posted on 5 August 2026.</p>"
+  }
+ ],
+ "has_more": false,
+ "quota_max": 300,
+ "quota_remaining": 297
+}

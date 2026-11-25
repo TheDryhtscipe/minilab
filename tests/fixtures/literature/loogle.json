@@ -1,0 +1,25 @@
+{
+ "count": 9,
+ "header": "Found 706 declarations mentioning Real.log.\nOf these, 9 have a name containing \"entropy\".\n",
+ "heartbeats": 5,
+ "hits": [
+  {
+   "doc": null,
+   "module": "Mathlib.Analysis.SpecialFunctions.BinaryEntropy",
+   "name": "Real.binEntropy_le_log_two",
+   "type": " {p : ℝ} : Real.binEntropy p ≤ Real.log 2"
+  },
+  {
+   "doc": null,
+   "module": "Mathlib.Analysis.SpecialFunctions.BinaryEntropy",
+   "name": "Real.qaryEntropy_one",
+   "type": " (q : ℕ) : Real.qaryEntropy q 1 = Real.log ↑(↑q - 1)"
+  },
+  {
+   "doc": null,
+   "module": "Mathlib.Analysis.SpecialFunctions.BinaryEntropy",
+   "name": "Real.binEntropy_two_inv",
+   "type": " : Real.binEntropy 2⁻¹ = Real.log 2"
+  }
+ ]
+}

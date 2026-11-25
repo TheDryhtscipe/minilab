@@ -1,0 +1,96 @@
+{
+ "items": [
+  {
+   "tags": [
+    "stochastic-processes",
+    "it.information-theory",
+    "stochastic-filtering"
+   ],
+   "is_answered": false,
+   "view_count": 305,
+   "answer_count": 0,
+   "score": 5,
+   "last_activity_date": 1516024089,
+   "creation_date": 1513707057,
+   "last_edit_date": 1516024089,
+   "question_id": 288863,
+   "content_license": "CC BY-SA 3.0",
+   "link": "https://mathoverflow.net/questions/288863/a-conjecture-in-rate-distortion-theory-and-stochastic-filtering",
+   "title": "A conjecture in rate distortion theory and stochastic filtering",
+   "body": "<p>Let $(X_t)_{t\\in T}$ be a stationary random process with known and fixed law $P_X$ describing a dynamic source.\nThis source is to be encoded real-time by an encoder $e$ into an encoded message $E_t$ and passed through a noisy channel $c$, which gives a channel output $Y_t$.\nThis is then decoded, again real-time, by a decoder $d$, giving a reconstruction $\\hat X_t$ of the original message $X_t$. \nThere is noiseless feedback from the channel back to the encoder, i.e. the encoder can use the history of output, encoded in the $\\sigma$-field $\\mathcal{F}^Y_t$ of the channel to better encode the message coming from the source.</p>\n\n<p>We fix a distortion function $\\text{dist}$ and define </p>\n\n<p>$$R(D)=\\inf\\big\\{ \\mathcal{I}(X;Y)\\; | \\; e,d,c \\text{ such that } \\mathbb{E}[\\text{dist}(X_t,\\hat X_t)]\\leq D \\big\\},$$</p>\n\n<p>called the rate distortion function of the source $X$. \nHere $\\mathcal{I}(X;Y)$ denotes the mutual information rate between the processes.\nThe rate distortion function is a property of the source only (given a distortion measure).\nWe say that a triple $e,d,c$ <em>achieves</em> the rate distortion function of the source if $\\mathcal{I}(X;\\hat X)$ for that system is equal to $R(D)$ while $\\mathbb{E}[\\text{dist}(X_t,\\hat X_t)]\\leq D$.</p>\n\n<p>In this setting, here is a natural <strong>conjecture</strong>:</p>\n\n<blockquote>\n  <p>Let a channel $c$ with a capacity $C\\geq R(D)$ be given and $\\text{dist}$ be a Bregman loss function.\n   There is a deterministic function $f$ such that the rate distortion function is achieved by an encoder of the form $E_t=e(X_t,Y_0^t,t)=f(X_t-\\hat X_t)$, where $\\hat X_t=\\mathbb{E}[X_t|\\mathcal{F}^Y_t]$.</p>\n</blockquote>\n\n<p>The Bregman condition ensures that irrespective of the encoder and channel, the optimal decoder is given by the conditional expectation.</p>\n\n<p>Is this known to be true/false? </p>\n\n<p>It is trivially true for a discrete-time, i.i.d. source. Also, by [1], the capacity per unit time of a continuous-time white Gaussian channel $Y_t=\\int_0^tE_s ds+W_t$ with average-power constraint $\\mathbb{E}[E_t^2]\\leq P_0$ is $C=\\frac12 P_0$. If the source $X_t$ is an Ornstein-Uhlenbeck process $dX_t=-\\theta X_t dt+\\sigma dB_t$, by [2] its rate distortion function for mean-squared error loss function is given by $R(D)=\\frac{\\sigma^2}{2D}-\\theta$. So in this case, if $C\\geq R(D)$, it can be shown that an encoder of the form $E_t=\\alpha(X_t-\\hat X_t)$ with </p>\n\n<p>$$\\alpha=\\frac{\\sqrt{\\sigma^2-2\\theta D}}{D}$$</p>\n\n<p>achieves distortion $D$ and rate $R(D)$.</p>\n\n<p>Does this generalize to nonlinear/non-Gaussian channels/sources or are there some simple counterexamples?</p>\n\n<hr>\n\n<p>[1] Ihara, S. (1974). Coding theory in white Gaussian channel with feedback. Journal of Multivariate Analysis, 4, 74\u201387.</p>\n\n<p>[2] Bucy, R. S. (1982). Distortion Rate Theory and Filtering. IEEE Transactions on Information Theory, 28(2), 336\u2013340. </p>\n"
+  },
+  {
+   "tags": [
+    "stochastic-processes",
+    "it.information-theory"
+   ],
+   "is_answered": false,
+   "view_count": 111,
+   "answer_count": 0,
+   "score": 1,
+   "last_activity_date": 1478356361,
+   "creation_date": 1478171601,
+   "question_id": 253833,
+   "content_license": "CC BY-SA 3.0",
+   "link": "https://mathoverflow.net/questions/253833/rate-distortion-function-for-a-particular-gaussian-field",
+   "title": "Rate Distortion Function for a Particular Gaussian Field",
+   "body": "<p>I need to compute the rate distortion function for a random field $g(t,x)$ that arises in Geophysical modelling and that is defined below.</p>\n\n<p>Let $\\rho$ be zero-mean Gaussian random process with a squared exponential autocovariance function:</p>\n\n<p>$$K_{\\rho}(z_1, z_2) = e^{-\\frac{(z_2-z_1)^2}{a^2}}$$</p>\n\n<p>for some correlation length $a$.</p>\n\n<p>Let $g(t,x)$ be a random field defined for $x\\ge0$, $t\\ge0$ and given in terms of the Gaussian random process $\\rho$ and its first derivative.</p>\n\n<p>$$g(t, x) = \\frac{1}{x^2} \\left[ 4 \\pi \\rho \\left(\\frac{1}{2}(ct + x)\\right) + ct\\dot{\\rho}\\left(\\frac{1}{2}(ct + x)\\right)\\right]$$</p>\n\n<p>where $c$ is a positive constant.</p>\n\n<p>Ostensibly one would proceed by finding autocovariance of the random field $g$ given by:\n$$K_g(t_1, x_1; t_2, x_2)=\\mathbb{E}[g(t_1, x_1)g(t_2, x_2)]$$</p>\n\n<p>I understand that the one can do so after some tedious algebra/differentiation but the problem is that autocovariance function does not turn out to be stationary (or weakly stationary). This renders the usual parametric formulas (e.g., given in Tobby Berger's book Rate Distortion Theory) for the RD function inapplicable. What is a way around this? Any approximate, numerical methods?</p>\n"
+  },
+  {
+   "tags": [
+    "reference-request",
+    "st.statistics",
+    "it.information-theory"
+   ],
+   "is_answered": true,
+   "view_count": 418,
+   "accepted_answer_id": 211054,
+   "answer_count": 1,
+   "score": 5,
+   "last_activity_date": 1695389740,
+   "creation_date": 1427922221,
+   "last_edit_date": 1450337972,
+   "question_id": 201736,
+   "content_license": "CC BY-SA 3.0",
+   "link": "https://mathoverflow.net/questions/201736/rate-distortion-theory-what-is-the-distribution-of-distortion-on-an-optimal-gau",
+   "title": "Rate-Distortion theory: What is the distribution of distortion on an optimal Gaussian encoder?",
+   "body": "<p>If we wish to encode a gaussian source, $X\\sim\\mathcal{N}(0,\\sigma^2)$ at rate $R$, then decode it to create an estimate $\\hat{X}$, rate-distortion theory tells us that the lowest mean-squared-error we can achieve through the encoder-decoder is $\\sigma^2 2^{-2R}.$ That is, using an optimal encoder and decoder, we can achieve $E(X-\\hat{X})^2=\\sigma^2 2^{-2R}.$ (possibly asymptotically as we let code block lengths increase)</p>\n\n<p>What might the distribution of $\\hat{X}|_{X=x}$ be, for such encoders and decoders? That is, how is our estimate distributed around the right answer? </p>\n\n<p>For illustration, we know obviously that no choice of enc/dec could yield a deterministic $\\hat{X}|_{X=x}=x+\\sqrt{\\sigma^22^{-2R}},$ even though this distribution would give us the correct mean-squared-error. (Otherwise we could design a lossless decoder!)</p>\n\n<hr>\n\n<p>I believe that it should be possible to design some random coding scheme where, as the code block lengths get large, eventually each $i$th message in our block, $\\hat{X_i}|_{X_i=x_i}$, becomes close in distribution to $\\mathcal{N}(x_i,\\sigma^22^{-2R}).$</p>\n\n<p>Equivalently, I am trying to find a sequence of encoders and decoders where:</p>\n\n<p>$$D(p^n||q^n)\\rightarrow 0, \\text{ as }n \\uparrow \\infty$$</p>\n\n<p>where $x^n$ denotes a block of $n$ messages, $\\hat{X}^n$ is the decoded estimate of all these $n$ messages, $p^n$ is the distribution of ${\\hat{X}^n|_ {X^n=x^n}}$ and $q^n$ is the distribution of $\\mathcal{N}(x^n,\\sigma^22^{-2R}I_{n\\times n})$.</p>\n\n<p>Finding such an encoder/decoder pair would essentially allow us to properly say that quantization of a gaussian source can be modeled as gaussian noise.</p>\n"
+  },
+  {
+   "tags": [
+    "it.information-theory"
+   ],
+   "is_answered": false,
+   "view_count": 1,
+   "answer_count": 0,
+   "score": 0,
+   "last_activity_date": 1785000000,
+   "creation_date": 1785000000,
+   "question_id": 999001,
+   "content_license": "CC BY-SA 4.0",
+   "link": "https://mathoverflow.net/questions/999001/synthetic-late",
+   "title": "Synthetic question asked after the cap",
+   "body": "<p>Synthetic test item asked on 25 July 2026.</p>"
+  },
+  {
+   "tags": [
+    "it.information-theory"
+   ],
+   "is_answered": false,
+   "view_count": 1,
+   "answer_count": 0,
+   "score": 0,
+   "last_activity_date": 1788000000,
+   "creation_date": 1700000000,
+   "last_edit_date": 1788000000,
+   "question_id": 999002,
+   "content_license": "CC BY-SA 4.0",
+   "link": "https://mathoverflow.net/questions/999002/synthetic-edited",
+   "title": "Synthetic question edited after the cap",
+   "body": "<p>Synthetic test item: this body was edited on 29 August 2026.</p>"
+  }
+ ],
+ "has_more": false,
+ "quota_max": 300,
+ "quota_remaining": 296
+}
