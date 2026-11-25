@@ -19,8 +19,8 @@ reservation, with a charge that names it or, if the call never started, a
 release. So calls on one pair can run at once, and each check sees the tokens
 the calls still in flight have reserved. `pair_spend` counts every charge and
 every reservation not yet settled. A reservation left open by a crash stays
-counted, as an estimated cost, so the ledger never shows less spend than
-there was.
+counted as an estimated cost of the tokens it reserved; the crashed call may
+have spent more, and the ledger cannot know.
 """
 
 import builtins
@@ -289,9 +289,9 @@ class Ledger:
         Raise `ValidationError` for an amount that is negative, non-finite,
         too large, or of the wrong type. Raise `ValueError` for an unknown pair,
         a pair or family the manifest does not list, a record of another run
-        or another pair, or a reservation that is not open or is for another
-        pair or family. Raise `KeyError` if `record_id` names no stored record.
-        Nothing is logged on any error.
+        or another pair, or a reservation that is not open or was made for
+        another pair, stage, family, or record. Raise `KeyError` if
+        `record_id` names no stored record. Nothing is logged on any error.
         """
         entry = Charge(
             at=datetime.now(UTC),
@@ -318,6 +318,15 @@ class Ledger:
             if held.family != entry.family:
                 raise ValueError(
                     f"reservation {held.id} is for family {held.family}, not {entry.family}"
+                )
+            if held.stage != entry.stage:
+                raise ValueError(
+                    f"reservation {held.id} is for stage {held.stage}, not {entry.stage}"
+                )
+            if held.record_id != entry.record_id:
+                raise ValueError(
+                    f"reservation {held.id} is for record {held.record_id}, "
+                    f"not {entry.record_id}"
                 )
 
         self._append(entry, check)
@@ -462,6 +471,8 @@ class Ledger:
             os.close(fd)
 
     def charges(self) -> builtins.list[Charge]:
+        """Return the charges logged, in order. Open reservations are not in
+        this list, though `pair_spend`, `costs`, and `cost_report` count them."""
         return [entry for entry in self.entries() if isinstance(entry, Charge)]
 
     def reviews(self) -> builtins.list[Review]:
@@ -493,7 +504,8 @@ class Ledger:
             tokens_in[charge.family] += charge.tokens_in
             tokens_out[charge.family] += charge.tokens_out
             estimated[charge.family] |= charge.estimated
-            seconds[charge.stage] += charge.seconds
+            if charge.seconds:
+                seconds[charge.stage] += charge.seconds
         minutes = sum(
             entry.minutes
             for entry in entries

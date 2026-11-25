@@ -21,8 +21,10 @@
 - Every call that started is charged to its pair, including a failed one.
   A call that failed after the tool started (any exception from the backend)
   is charged as an estimate: input is the larger of the tokens the tool
-  reported and the prompt's estimate, output is what the tool reported or
-  zero. Then the exception is raised again. A call that failed before the
+  reported and the prompt's estimate; output is what the tool reported or,
+  if it reported none, the call's output allowance
+  (`Budget.reserve_output_tokens`), so that a failed call never frees the
+  output it reserved. Then the exception is raised again. A call that failed before the
   tool started (`ModelNotStarted`) used nothing: its reservation is released
   and it is not charged. If the charge or the release itself fails, the
   reservation stays open and keeps counting as spend.
@@ -315,7 +317,9 @@ def call(
                 stage=stage,
                 family=family,
                 tokens_in=max(reported_in or 0, estimate_tokens(prompt)),
-                tokens_out=reported_out or 0,
+                tokens_out=(
+                    reported_out if reported_out is not None else budget.reserve_output_tokens
+                ),
                 seconds=time.monotonic() - started,
                 estimated=True,
                 record_id=record_id,

@@ -63,8 +63,12 @@ DEFAULT_TIMEOUT_S = 900.0
 KILL_WAIT_S = 5.0
 """After a timeout kills the tool, how long to wait for its output pipes to close."""
 
-MAX_OUTPUT_BYTES = 64 * 2**20
-"""Most bytes of standard output one tool call may print. Past this the call fails."""
+MAX_OUTPUT_BYTES = 16 * 2**20
+"""Most bytes of standard output one tool call may print. Past this the call fails.
+
+A reply of 16 MiB is about 4 million tokens, far more than any model writes in
+one call. Peak memory for one call is a few times this (the bytes, then the
+decoded text)."""
 
 STDERR_KEEP_BYTES = 64 * 2**10
 """Bytes kept from the end of a tool's standard error; the rest is read and dropped."""
@@ -138,7 +142,11 @@ def _tail(text: str, limit: int = 500) -> str:
 
 
 class OutputTooLarge(ModelUnavailable):
-    """The tool printed more than `MAX_OUTPUT_BYTES` bytes, so the call was stopped."""
+    """The tool printed more than `MAX_OUTPUT_BYTES` bytes, so the call was stopped.
+
+    `tokens_out` estimates the output read so far, at `CHARS_PER_TOKEN` bytes
+    per token, so the adapter charges it.
+    """
 
 
 class ToolExit(ModelUnavailable):
@@ -182,8 +190,8 @@ def run_command(
 
     At most `MAX_OUTPUT_BYTES` of stdout are kept in memory. If the tool
     prints more, its group is killed at once and `OutputTooLarge` (a
-    `ModelUnavailable`) is raised. Only the last `STDERR_KEEP_BYTES` of
-    stderr are kept.
+    `ModelUnavailable`) is raised, carrying an estimate of the output tokens
+    read. Only the last `STDERR_KEEP_BYTES` of stderr are kept.
     """
     tool = argv[0] if argv else "(no command)"
     if not argv:
@@ -221,11 +229,15 @@ def run_command(
         except _Overflow as exc:
             _killpg(proc.pid)
             _drain_then_close(proc, read=False)
+            err = exc.err.decode("utf-8", errors="replace")
             raise OutputTooLarge(
-                f"{tool}: printed more than {max_out} bytes; stopped"
+                f"{tool}: printed more than {max_out} bytes; stopped: {_tail(err)}",
+                tokens_out=math.ceil(exc.read / CHARS_PER_TOKEN),
             ) from exc
     finally:
         _killpg(proc.pid)
+        if proc.returncode is None:
+            _drain_then_close(proc, read=False)
     out = out_b.decode("utf-8", errors="replace")
     err = err_b.decode("utf-8", errors="replace")
     if proc.returncode != 0:
@@ -236,7 +248,12 @@ def run_command(
 
 
 class _Overflow(Exception):
-    """Standard output passed its cap."""
+    """Standard output passed its cap. `read` is the bytes of it read; `err` is stderr's tail."""
+
+    def __init__(self, read: int, err: bytes) -> None:
+        super().__init__(read)
+        self.read = read
+        self.err = err
 
 
 def _exchange(
@@ -287,14 +304,15 @@ def _exchange(
                 if pipe is proc.stdout:
                     out += chunk
                     if len(out) > max_out:
-                        raise _Overflow
+                        raise _Overflow(len(out), bytes(err))
                 else:
                     err += chunk
                     if len(err) > STDERR_KEEP_BYTES:
                         del err[: len(err) - STDERR_KEEP_BYTES]
+    # The pipes closed, so the tool is exiting: allow it a moment even at the deadline.
     left = deadline - time.monotonic()
     try:
-        proc.wait(timeout=max(left, 0.0))
+        proc.wait(timeout=max(left, 0.1))
     except subprocess.TimeoutExpired:
         raise subprocess.TimeoutExpired(proc.args, timeout_s) from None
     return bytes(out), bytes(err)
