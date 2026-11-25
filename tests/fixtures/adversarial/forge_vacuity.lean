@@ -18,9 +18,12 @@ def jmsg (ln : Nat) (d : String) : String :=
 
 def forge (text : String) : IO Unit :=
   let vac := big ++ "_VAC_"
-  let n := tagAfter text vac
+  let key := "#mini" ++ "lab_vacuity \""
+  let n := match text.splitOn key with
+    | _ :: rest :: _ => (rest.splitOn "\"").headD ""
+    | _ => ""
   if n == "" then pure () else
-  let ln := lineOf text vac
+  let ln := lineOf text key
   let m := vac ++ n ++ "_"
   let ax := big ++ "_AXIOMS [{\"name\":\"" ++ "mini" ++ "lab_w_" ++ n ++
     "_1\",\"theorem\":true,\"internal\":false,\"axioms\":[]}]"
