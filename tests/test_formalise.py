@@ -25,6 +25,7 @@ from minilab.formalise.formaliser import (
     FormalOutput,
     LeanTimeout,
     NoFormaliser,
+    command_check,
     formal_from_source,
     formalise,
     formaliser_family,
@@ -767,7 +768,9 @@ def test_out_of_range_marker_indices_are_refused(monkeypatch: pytest.MonkeyPatch
     from minilab.formalise import vacuity as vacuity_module
     from minilab.lean.runner import LeanMessage, LeanResult
 
-    def fake_check_lean(text: str, timeout_s: float) -> LeanResult:
+    def fake_check_lean(
+        text: str, timeout_s: float, *, options: Mapping[str, str] | None = None
+    ) -> LeanResult:
         found = re.search(r"MINILAB_VAC_[0-9a-f]+_", text)
         marker = found.group() if found is not None else "MINILAB_VAC_"
         far = text.count("\n")
@@ -882,7 +885,9 @@ def test_vacuity_that_did_not_run_rejects(monkeypatch: pytest.MonkeyPatch) -> No
     from minilab.formalise import vacuity as vacuity_module
     from minilab.lean.runner import LeanResult
 
-    def silent(text: str, timeout_s: float) -> LeanResult:
+    def silent(
+        text: str, timeout_s: float, *, options: Mapping[str, str] | None = None
+    ) -> LeanResult:
         return LeanResult(
             ok=False,
             errors=["1:0: boom"],
@@ -958,3 +963,128 @@ def test_model_code_cannot_forge_the_vacuity_check(monkeypatch: pytest.MonkeyPat
     assert result.checked
     assert [(c.label, c.state) for c in result.witness] == [("h", "fails")], result
     assert not result.satisfied_by_witness
+
+
+# --- result forging without running code (third adversarial review) ---
+
+
+def _past_the_text_gate(monkeypatch: pytest.MonkeyPatch, source: str) -> FormalOutput:
+    """`source` checked by Lean alone: the text gate is switched off.
+
+    The text gate is a second guard. These tests show that Lean's own checks
+    hold when the text gate misses something.
+    """
+    import minilab.formalise.formaliser as formaliser
+
+    def no_problems(_source: str) -> list[str]:
+        return []
+
+    monkeypatch.setattr(formaliser, "source_problems", no_problems)
+    return formal_from_source(source, Family.claude, "m", timeout_s=LEAN_TIMEOUT)
+
+
+def test_auto_bound_variables_stay_off_when_the_import_line_is_shared() -> None:
+    # The options used to be appended to the last import line as text; here
+    # that line also holds the theorem, so `n` was bound automatically and
+    # the hypothesis `n < 0` was hidden in the conclusion.
+    source = "import Mathlib theorem conjecture (h0 : 0 ≤ n) (h : n < 0) : n = 5 := sorry\n"
+    assert source_problems(source) == []
+    formal = formal_from_source(source, Family.claude, "m", timeout_s=LEAN_TIMEOUT)
+    assert not formal.ok
+    assert all(b.name != "n" for b in formal.binders), formal.binders
+    assert any("n" in p and "Unknown identifier" in p for p in formal.problems), formal.problems
+
+
+def test_auto_bound_variables_stay_off_in_the_vacuity_check() -> None:
+    # A file whose `ok` was forced, as if the formaliser had passed it.
+    source = "import Mathlib theorem conjecture (h0 : 0 ≤ n) (h : n < 0) : n = 5 := sorry\n"
+    formal = probed(SIMPLE).model_copy(update={"source": source})
+    result = vacuity(formal, None, timeout_s=LEAN_TIMEOUT)
+    assert not result.checked
+    assert result.rejected
+
+
+def test_sorry_axiom_in_the_statement_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = (
+        "import Mathlib\n\ntheorem conjecture (n : ℕ) (h : n < sorryAx ℕ false) : n < 5 := sorry\n"
+    )
+    assert any("sorryAx" in p for p in source_problems(source))
+    formal = _past_the_text_gate(monkeypatch, source)
+    assert not formal.ok
+    assert any("statement" in p and "sorry" in p for p in formal.problems), formal.problems
+
+
+INTERNAL_SORRY = """import Mathlib
+
+def c : ℕ := sorryAx ℕ false
+
+theorem conjecture (n : ℕ) (h : n < c) : n < 5 := sorry
+"""
+
+
+def test_sorry_in_a_definition_the_statement_uses_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    formal = _past_the_text_gate(monkeypatch, INTERNAL_SORRY)
+    assert not formal.ok
+    assert any("statement" in p and "sorry" in p for p in formal.problems), formal.problems
+
+
+def test_internal_names_cannot_hide_sorry(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = """import Mathlib
+
+def _c : ℕ := sorryAx ℕ false
+
+theorem _lem : (1 : ℕ) = 2 := sorryAx _ false
+
+theorem conjecture (n : ℕ) (h : n < 3) : n < 5 := sorry
+"""
+    problems, _arity = command_check(source, timeout_s=LEAN_TIMEOUT)
+    assert sum("`_c`" in p or "`_lem`" in p for p in problems) == 2, problems
+    # Past the text gate and the allowlist, Lean's probe still names both.
+    import minilab.formalise.formaliser as formaliser
+
+    def allowed(_source: str, *, timeout_s: float) -> tuple[list[str], int | None]:
+        return [], 2
+
+    monkeypatch.setattr(formaliser, "command_check", allowed)
+    formal = _past_the_text_gate(monkeypatch, source)
+    assert not formal.ok
+    assert any("_c" in p and "sorry" in p for p in formal.problems), formal.problems
+    assert any("_lem" in p and "sorry" in p for p in formal.problems), formal.problems
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        's!"{(sorry : ℕ)} {(by admit : ℕ)}"',
+        's!"{\'"\'}"',
+        'm!"{(1 : ℕ)}"',
+    ],
+)
+def test_interpolated_strings_are_refused(note: str) -> None:
+    source = SIMPLE.replace(
+        "theorem conjecture", f"def note : String := toString {note}\n\ntheorem conjecture"
+    )
+    problems, _arity = command_check(source, timeout_s=LEAN_TIMEOUT)
+    assert any("interpolated string" in p for p in problems), problems
+
+
+def test_open_in_cannot_wrap_a_scope_command() -> None:
+    source = "import Mathlib\n\nopen Real in section\n\n" + SIMPLE.split("\n", 2)[2]
+    problems, _arity = command_check(source, timeout_s=LEAN_TIMEOUT)
+    assert any("open … in" in p for p in problems), problems
+
+
+def test_conjecture_inside_a_section_is_top_level() -> None:
+    source = "import Mathlib\n\nsection\n\n" + SIMPLE.split("\n", 2)[2] + "\nend\n"
+    formal = probed(source)
+    assert formal.ok, formal.problems
+    assert [b.name for b in formal.binders] == ["x", "hx"]
+
+
+def test_conjecture_inside_a_namespace_is_not_top_level() -> None:
+    source = "import Mathlib\n\nnamespace Foo\n\n" + SIMPLE.split("\n", 2)[2] + "\nend Foo\n"
+    problems, arity = command_check(source, timeout_s=LEAN_TIMEOUT)
+    assert problems == []
+    assert arity is None

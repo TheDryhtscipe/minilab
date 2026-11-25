@@ -16,18 +16,24 @@ the file gets code and nothing it writes can run: not `#eval`, `eval%`,
 Our checks are the guard's own commands, compiled when it is built, given
 their inputs as literals.
 
-Two text gates come before the compile, as a second guard and to give the
-model reasons it can act on. `source_problems` reads the text and refuses
-imports other than Mathlib, a list of dangerous words, any name with
-`minilab` in it (the checks add declarations with that prefix), and any
-number of `sorry`s other than one. Comments and string literals do not
-count, and `«…»` names are opaque. Then `command_check` has Lean parse the
-file, held only as a string, and refuses every top-level command outside an
-allowlist (`open`, `namespace`, `section`, `end`, `universe`, and `def`,
-`abbrev`, `theorem`, `lemma`, `structure`, `inductive` declarations), any
-attribute, `instance`, `variable`, `unsafe`, `partial`, `set_option`,
-`native_decide`, `eval%`, `plausible`, Aesop rule clauses, `decide` with a
-configuration, and any `do` block.
+Two gates come before the compile, as a second guard and to give the model
+reasons it can act on. `source_problems` reads the text and refuses imports
+other than Mathlib, a list of dangerous words (`sorryAx` among them), any
+name with `minilab` in it (the checks add declarations with that prefix),
+and any number of the word `sorry` other than one. It skips comments and
+plain string literals, and `«…»` names are opaque. It reads an interpolated
+string (`s!"…{e}…"`) as a plain string, so it misses what is in the braces;
+the next gate refuses interpolated strings. Then `command_check` has Lean
+parse the file, held only as a string, and refuses every top-level command
+outside an allowlist (`open`, `namespace`, `section`, `end`, `universe`, and
+`def`, `abbrev`, `theorem`, `lemma`, `structure`, `inductive`
+declarations), `open … in` around a command that opens or closes a scope,
+any declaration name with a part that starts with `_`, any attribute,
+`instance`, `variable`, `unsafe`, `partial`, `set_option`, `native_decide`,
+`eval%`, `plausible`, Aesop rule clauses, `decide` with a configuration, an
+interpolated string, and any `do` block. Every `namespace` and `section`
+must be closed. Lean checks the file with auto-bound implicits off
+(`CHECK_OPTIONS`, given on Lean's command line).
 
 `formal_from_source` then compiles the file once, with a probe appended. The
 probe finds `conjecture` in Lean's environment and prints each binder written
@@ -40,8 +46,10 @@ vacuity linter and the hypothesis audit work on what Lean will prove. Each
 run's markers carry a random tag.
 
 The file is `ok` when Lean reports no error, `conjecture` is a theorem whose
-axioms include `sorryAx`, nothing else in the file depends on `sorryAx`, and
-no declaration uses an axiom outside Lean's standard three. A Lean time-out
+axioms include `sorryAx`, its statement does not depend on `sorryAx`, no
+other constant in the file depends on `sorryAx` (internal and generated
+names included), and no declaration uses an axiom outside Lean's standard
+three. A Lean time-out
 raises `LeanTimeout`: it is never a verdict.
 """
 
@@ -50,7 +58,7 @@ import re
 import secrets
 from collections.abc import Iterable, Mapping
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from minilab.lean.runner import LeanResult, check_lean
 from minilab.ledger import Ledger
@@ -274,6 +282,7 @@ FORBIDDEN: tuple[str, ...] = (
     "term_elab",
     "tactic",
     "native_decide",
+    "sorryAx",
 )
 """Words a formalisation may not use. Each could change what Lean or the
 later checks do, or run code while the file compiles."""
@@ -316,7 +325,9 @@ def _statement_span(code: str) -> tuple[int, int] | None:
 def source_problems(source: str) -> list[str]:
     """Why the source cannot be checked, from its text alone. Empty if none.
 
-    Comments and string literals are ignored.
+    Comments and plain string literals are skipped. An interpolated string is
+    read as a plain one, so the braces' contents are skipped too;
+    `command_check` refuses interpolated strings.
     """
     kept, code = _scan(source)
     problems: list[str] = []
@@ -348,25 +359,22 @@ def source_problems(source: str) -> list[str]:
     return problems
 
 
-CHECK_OPTIONS = " set_option autoImplicit false set_option relaxedAutoImplicit false"
-"""Added to the end of the last import line before Lean checks a file. The
-Lean project leaves auto-bound implicits on, so a misspelt name would
-otherwise become a new variable of the statement instead of an error."""
+CHECK_OPTIONS: dict[str, str] = {"autoImplicit": "false", "relaxedAutoImplicit": "false"}
+"""Lean options for every check of a formalisation, given to Lean on its
+command line (`check_lean`'s `options`), not as text in the file. The Lean
+project leaves auto-bound implicits on, so a misspelt name would otherwise
+become a new variable of the statement instead of an error. The model's
+file cannot undo them: `set_option` is refused by both gates."""
 
 
 def checked_source(source: str) -> str:
-    """The text Lean checks: comments removed and `CHECK_OPTIONS` after the imports.
+    """The text Lean checks: the source with comments removed, ending in a newline.
 
     Lines keep their numbers, so Lean's messages point at the model's lines.
+    `command_check` parses this same text.
     """
-    stripped, code = _scan(source)
-    imports = list(_IMPORT.finditer(code))
-    if not imports:
-        return stripped if stripped.endswith("\n") else stripped + "\n"
-    end = stripped.find("\n", imports[-1].end())
-    end = len(stripped) if end < 0 else end
-    text = stripped[:end] + CHECK_OPTIONS + stripped[end:]
-    return text if text.endswith("\n") else text + "\n"
+    stripped = strip_comments(source)
+    return stripped if stripped.endswith("\n") else stripped + "\n"
 
 
 def lean_statement(source: str) -> str:
@@ -427,13 +435,19 @@ def command_check(
     the commands and declaration kinds on the guard's allowlist may appear,
     and none of its denied syntax: attributes, `unsafe`, `partial`,
     `run_tac`, `by_elab`, `native_decide`, `eval%`, `plausible`, Aesop rule
-    clauses, `decide` with a configuration, a `do` block, or `set_option`.
+    clauses, `decide` with a configuration, an interpolated string, a `do`
+    block, or `set_option`. `open … in` may not wrap a scope command, no
+    declaration name may have a part that starts with `_`, and every
+    `namespace` and `section` must be closed. `conjecture` counts inside a
+    `section` but not inside a `namespace`.
     No model code runs in any Lean check, since the guard turns code
     generation off; the allowlist is a second guard that gives the model a
     reason it can act on. Raise LeanTimeout if Lean hits `timeout_s`.
     """
     marker = f"MINILAB_CMD_{secrets.token_hex(8)}_"
-    result = check_lean(_command_check(strip_comments(source), marker), timeout_s)
+    result = check_lean(
+        _command_check(checked_source(source), marker), timeout_s, options=CHECK_OPTIONS
+    )
     if result.timed_out:
         raise LeanTimeout(f"Lean did not finish the command check in {timeout_s} s")
     problems: list[str] = []
@@ -498,10 +512,14 @@ class _RawBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     theorem: bool
+    sorry: bool
     deps: list[int]
     defs: list[str]
     type: str
     truncated: bool
+
+
+_SORRY_LIST: TypeAdapter[list[str]] = TypeAdapter(list[str])
 
 
 class _RawDef(BaseModel):
@@ -579,9 +597,11 @@ def formal_from_source(
     with a marker made for this run: `DEF` for each definition the file
     wrote (not the matchers, projections, instances and other declarations
     Lean adds), with whether it depends on `sorryAx` and which other file
-    definitions it uses; one `BINDER` per binder before the colon; and
-    `BODY`, the conclusion, which keeps any `∀` or `→` written after the
-    colon. Each binder and the conclusion list the file definitions they
+    definitions it uses; `SORRY`, every constant of the file other than
+    `conjecture` that depends on `sorryAx`; one `BINDER` per binder before
+    the colon; and `BODY`, the conclusion, which keeps any `∀` or `→`
+    written after the colon, with whether the statement depends on
+    `sorryAx`. Each binder and the conclusion list the file definitions they
     mention.
 
     Raise LeanTimeout if Lean hits `timeout_s`.
@@ -615,7 +635,7 @@ def formal_from_source(
     body = checked_source(source)
     source_lines = body.count("\n")
     marker = f"{PROBE_PREFIX}{new_nonce()}_"
-    result = check_lean(body + probe(marker, arity), timeout_s)
+    result = check_lean(body + probe(marker, arity), timeout_s, options=CHECK_OPTIONS)
     if result.timed_out:
         raise LeanTimeout(f"Lean did not finish the formaliser check in {timeout_s} s")
     problems = source_errors(result, source_lines)
@@ -623,11 +643,14 @@ def formal_from_source(
     raw_binders: list[_RawBinder] = []
     bodies: list[_RawBody] = []
     raw_defs: list[_RawDef] = []
+    with_sorry: list[list[str]] = []
     missing = False
     try:
         for tag, payload in marker_messages(result, source_lines, marker):
             if tag == "NONE":
                 missing = True
+            elif tag == "SORRY":
+                with_sorry.append(_SORRY_LIST.validate_json(payload))
             elif tag == "DEF":
                 raw_defs.append(_RawDef.model_validate_json(payload))
             elif tag == "BINDER":
@@ -647,17 +670,20 @@ def formal_from_source(
         problems.append(f"`{THEOREM}` is not a theorem")
     elif [b.index for b in raw_binders] != list(range(arity)):
         problems.append("the probe's binders do not match the theorem's header")
+    if len(with_sorry) != 1:
+        problems.append("the probe did not report which declarations depend on `sorry`")
+    if raw_body is not None and raw_body.sorry:
+        problems.append(f"the statement of `{THEOREM}` depends on `sorry`")
     if not problems and probe_errors:
         problems.append("Lean reported errors: " + "; ".join(probe_errors)[:1000])
     own = result.axioms_by_theorem.get(THEOREM)
     if raw_body is not None and raw_body.theorem and (own is None or SORRY_AXIOM not in own):
         problems.append(f"`{THEOREM}` must be proved by `sorry` alone")
-    for name, axioms in result.axioms_by_theorem.items():
-        if name != THEOREM and SORRY_AXIOM in axioms:
-            problems.append(f"`{name}` depends on `sorry`")
-    for item in raw_defs:
-        if item.sorry:
-            problems.append(f"the definition `{item.name}` depends on `sorry`")
+    sorry_names = {n for found in with_sorry for n in found}
+    sorry_names |= {n for n, axioms in result.axioms_by_theorem.items() if SORRY_AXIOM in axioms}
+    sorry_names |= {item.name for item in raw_defs if item.sorry}
+    for name in sorted(sorry_names - {THEOREM}):
+        problems.append(f"`{name}` depends on `sorry`")
     extra = sorted(set(result.axioms) - STANDARD_AXIOMS - {SORRY_AXIOM})
     if extra:
         problems.append(f"the file uses axioms beyond Lean's standard ones: {', '.join(extra)}")

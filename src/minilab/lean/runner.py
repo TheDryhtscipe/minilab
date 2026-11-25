@@ -38,10 +38,12 @@ A time-out, or a missing toolchain, is never a verdict. A time-out gives
 import fcntl
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import IO, Literal, cast
 
@@ -176,7 +178,7 @@ def _read_only_paths(project: Path, lake: Path) -> list[Path]:
     return kept
 
 
-def _command(project: Path, lake: Path, source_file: Path) -> list[str]:
+def _command(project: Path, lake: Path, source_file: Path, options: Mapping[str, str]) -> list[str]:
     if shutil.which("bwrap") is None:
         raise LeanUnavailable("bwrap is not installed; Lean is never run without it")
     args = [
@@ -201,7 +203,10 @@ def _command(project: Path, lake: Path, source_file: Path) -> list[str]:
     for path in _read_only_paths(project, lake):
         args += ["--ro-bind", str(path), str(path)]
     args += ["--remount-ro", "/", "--chdir", str(project), "--"]
-    args += [str(lake), "env", "lean", "--json", source_file.name]
+    args += [str(lake), "env", "lean", "--json"]
+    for name, value in options.items():
+        args += ["-D", f"{name}={value}"]
+    args.append(source_file.name)
     return args
 
 
@@ -304,6 +309,9 @@ def _error_text(message: LeanMessage) -> str:
 
 _guard_built: set[Path] = set()
 
+# A Lean option name or value given on the command line.
+_OPTION = re.compile(r"[A-Za-z0-9_.]+")
+
 
 def _build_guard(project: Path, lake: Path) -> None:
     """Build the guard module once per process, so its compiled code is current.
@@ -340,12 +348,24 @@ def _build_guard(project: Path, lake: Path) -> None:
 
 
 def check_lean(
-    source: str, timeout_s: float = DEFAULT_TIMEOUT_S, *, project: Path | None = None
+    source: str,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+    *,
+    project: Path | None = None,
+    options: Mapping[str, str] | None = None,
 ) -> LeanResult:
     """Compile `source` in the `lean/` project and report errors, `sorry`, and axioms.
 
+    `options` are Lean options set on the command line (`lean -D name=value`)
+    for the whole file. They are not text in the file, so nothing the source
+    writes can move them or undo them except `set_option`.
+
     Raise LeanUnavailable if Lean cannot be run at all.
     """
+    options = {} if options is None else options
+    for name, value in options.items():
+        if not _OPTION.fullmatch(name) or not _OPTION.fullmatch(value):
+            raise ValueError(f"not a Lean option setting: {name}={value}")
     project = lean_project() if project is None else project
     if not (project / "lakefile.toml").exists():
         raise LeanUnavailable(f"no Lean project at {project}")
@@ -363,7 +383,7 @@ def check_lean(
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as out:
             out.write(text)
-        command = _command(project, lake, source_file)
+        command = _command(project, lake, source_file, options)
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
             proc = subprocess.Popen(
                 command,

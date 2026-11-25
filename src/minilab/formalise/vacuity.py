@@ -58,6 +58,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from minilab.encoding.api import Instance, to_fraction
 from minilab.formalise.formaliser import (
+    CHECK_OPTIONS,
     DEFAULT_LEAN_TIMEOUT_S,
     STANDARD_AXIOMS,
     FormalOutput,
@@ -305,7 +306,7 @@ def vacuity(
             text += block
             lines[name] = range(start, text.count("\n") + 1)
 
-    result = check_lean(text, timeout_s)
+    result = check_lean(text, timeout_s, options=CHECK_OPTIONS)
     if result.timed_out:
         return VacuityResult(
             contradictory=False,

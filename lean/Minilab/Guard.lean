@@ -38,9 +38,10 @@ open Lean Meta Elab Command
 namespace Minilab.Guard
 
 /-- In place of Lean's compiler: give no code, and mark each declaration
-`noncomputable`. Code that needs a declaration's code then fails. Some
-callers report that as an error (an Aesop rule); `#eval` reports nothing
-and does nothing. -/
+`noncomputable`. Code that needs a declaration's code then does not run,
+often with no message: `#eval` reports nothing and does nothing, and an
+Aesop rule clause that names the file's tactic leaves only the warning that
+the declaration uses `sorry`. -/
 initialize
   compileDeclsRef.set (fun names _ => names.forM fun n => modifyEnv (addNoncomputable · n))
 
@@ -80,7 +81,8 @@ is internal, and the axioms it depends on. -/
 -- ## The command check
 
 /-- The top-level commands a formalisation may use. `open … in` is allowed
-around an allowed command. -/
+around an allowed command, but not around a command that opens or closes a
+scope (`open`, `namespace`, `section`, `end`). -/
 def allowedCommands : List Name :=
   [``Lean.Parser.Command.open, ``Lean.Parser.Command.namespace,
    ``Lean.Parser.Command.section, ``Lean.Parser.Command.end,
@@ -96,14 +98,16 @@ def allowedDeclarations : List Name :=
 /-- Syntax that may appear nowhere in a formalisation. Besides these, any
 `do` block (a kind whose last part starts with `doSeq`), any `set_option`,
 Aesop's rule clauses (`aesop (add …)`), and `decide` with a configuration
-(`decide +native`) are refused. With code generation off none of them can
+(`decide +native`) are refused. Interpolated strings (`s!"…{e}…"`, `m!`,
+`f!`) are refused because the text gate in Python reads them as plain
+strings, while Lean elaborates the terms inside the braces. With code generation off none of them can
 run model code; the list is a second guard, and it gives the model a reason
 it can act on. -/
 def deniedKinds : List Name :=
   [``Lean.Parser.Term.attributes, ``Lean.Parser.Command.unsafe,
    ``Lean.Parser.Command.partial, ``Lean.Parser.Tactic.runTac,
    `Lean.Parser.Term.byElab, ``Lean.Parser.Tactic.nativeDecide,
-   `Mathlib.Meta.eval_expr, `plausibleSyntax]
+   `Mathlib.Meta.eval_expr, `plausibleSyntax, interpolatedStrKind]
 
 partial def kinds (s : Syntax) (acc : Array (SyntaxNodeKind × Syntax)) :
     Array (SyntaxNodeKind × Syntax) :=
@@ -127,6 +131,7 @@ def lastPart (k : Name) : String :=
 def refusal (kind : Name) (node : Syntax) : Option String :=
   let last := lastPart kind
   if last.startsWith "doSeq" then some "a `do` block"
+  else if kind == interpolatedStrKind then some "an interpolated string"
   else if deniedKinds.contains kind || last == "set_option" then some s!"`{kind}`"
   else if kind.getRoot == `Aesop && last.startsWith "tactic_clause" then
     some "an Aesop rule clause"
@@ -137,10 +142,25 @@ def refusal (kind : Name) (node : Syntax) : Option String :=
 
 syntax (name := commandCheckCmd) "#minilab_command_check " str str : command
 
+/-- The commands that open or close a scope. -/
+def scopeCommands : List Name :=
+  [``Lean.Parser.Command.open, ``Lean.Parser.Command.namespace,
+   ``Lean.Parser.Command.section, ``Lean.Parser.Command.end]
+
+/-- Whether a part of `n` starts with `_`: Lean treats such a name as
+internal, and some checks skip internal names. -/
+def underscored (n : Name) : Bool :=
+  n.components.any fun c => match c with
+    | .str _ s => s.startsWith "_"
+    | _ => false
+
 /-- Parse `source` with the environment's syntax, without elaborating it
 (only its `open`, `namespace`, `section` and `end` commands, so scoped
-notation parses). Print `PROBLEM` for each refusal, then `ARITY` (how many
-binders `conjecture` has before its colon, or null), then `DONE`. -/
+notation parses). `conjecture` counts only where the current namespace is
+the root: inside a `section` it does, inside a `namespace` it does not.
+Print `PROBLEM` for each refusal, then `ARITY` (how many binders
+`conjecture` has before its colon, or null), then `DONE`. The scopes the
+source opened are closed again before the command ends. -/
 @[command_elab commandCheckCmd] def elabCommandCheck : CommandElab := fun stx => do
   let some marker := stx[1].isStrLit? | throwError "expected the marker"
   let some src := stx[2].isStrLit? | throwError "expected the source"
@@ -149,7 +169,7 @@ binders `conjecture` has before its colon, or null), then `DONE`. -/
   let mut mps := mps
   let mut msgs := msgs
   let mut problems : Array String := #[]
-  let mut depth : Int := 0
+  let saved ← getScopes
   let mut arity : Option Nat := none
   let lineOf : Syntax → Nat := fun s => (inputCtx.fileMap.toPosition (s.getPos?.getD 0)).line
   repeat
@@ -174,6 +194,10 @@ binders `conjecture` has before its colon, or null), then `DONE`. -/
       if o.getKind != ``Lean.Parser.Command.open then
         problems := problems.push s!"line {line}: only `open … in` may wrap a command"
         fine := false
+    if !opens.isEmpty && scopeCommands.contains k then
+      problems := problems.push
+        s!"line {line}: `open … in` may not wrap `open`, `namespace`, `section`, or `end`"
+      fine := false
     if !allowedCommands.contains k then
       problems := problems.push s!"line {line}: the command `{k}` is not allowed"
       fine := false
@@ -188,25 +212,26 @@ binders `conjecture` has before its colon, or null), then `DONE`. -/
         let p := s!"line {ln}: {w} is not allowed"
         if !problems.contains p then problems := problems.push p
         fine := false
-      if kind == ``Lean.Parser.Command.declId && depth == 0 && node[0].getId == `conjecture then
+      if kind == ``Lean.Parser.Command.declId && underscored node[0].getId then
+        let p := s!"line {lineOf node}: the name `{node[0].getId}` starts with `_`, which \
+          Lean treats as internal"
+        if !problems.contains p then problems := problems.push p
+        fine := false
+      if kind == ``Lean.Parser.Command.declId && node[0].getId == `conjecture
+          && (← getCurrNamespace) == .anonymous then
         let sig := (kinds cmd #[]).find? (fun p => p.1 == ``Lean.Parser.Command.declSig)
         match sig with
         | some (_, s) => arity := some (arityOf s)
         | none => pure ()
-    if fine && opens.isEmpty then
-      if k == ``Lean.Parser.Command.namespace || k == ``Lean.Parser.Command.section then
-        depth := depth + 1
-      if k == ``Lean.Parser.Command.end then
-        depth := depth - 1
-      if k == ``Lean.Parser.Command.open || k == ``Lean.Parser.Command.namespace
-          || k == ``Lean.Parser.Command.section || k == ``Lean.Parser.Command.end then
-        try elabCommand cmd
-        catch e => problems := problems.push s!"line {line}: {← e.toMessageData.toString}"
+    if fine && scopeCommands.contains k then
+      try elabCommand cmd
+      catch e => problems := problems.push s!"line {line}: {← e.toMessageData.toString}"
   for m in msgs.toList do
     if m.severity == .error then
       problems := problems.push s!"Lean could not parse the file: {(← m.toString).take 300}"
-  if depth != 0 then
+  if (← getScopes).length != saved.length then
     problems := problems.push "every `namespace` and `section` must be closed with `end`"
+  modify fun st => { st with scopes := saved }
   for p in problems.toList.take 20 do
     say marker "PROBLEM" (toJson (p.take 300))
   say marker "ARITY" (toJson arity)
@@ -222,14 +247,25 @@ def maxDefsListed : Nat := 50
 
 syntax (name := probeCmd) "#minilab_probe " str num : command
 
-/-- Print `DEF` for each definition the file wrote, one `BINDER` for each of
-the first `arity` binders of `conjecture`, and `BODY` for the rest of its
-statement; or `NONE` if there is no `conjecture`. Binder types are shown
+/-- The most names `SORRY` lists. -/
+def maxSorryListed : Nat := 20
+
+/-- Print `SORRY`, the constants of the file other than `conjecture` that
+depend on `sorryAx` (internal and generated ones too); `DEF` for each
+definition the file wrote; one `BINDER` for each of the first `arity`
+binders of `conjecture`; and `BODY` for the rest of its statement, with
+whether the statement itself depends on `sorryAx`. Print `NONE` in place of
+`BINDER` and `BODY` if there is no `conjecture`. Binder types are shown
 without `optParam` and `autoParam`. -/
 @[command_elab probeCmd] def elabProbe : CommandElab := fun stx => do
   let some marker := stx[1].isStrLit? | throwError "expected the marker"
   let some arity := stx[2].isNatLit? | throwError "expected the arity"
   let env ← getEnv
+  let mut withSorry : Array String := #[]
+  for (name, _) in env.constants.map₂.toList do
+    if name != `conjecture && (← collectAxioms name).contains ``sorryAx then
+      withSorry := withSorry.push ((privateToUserName? name).getD name).toString
+  say marker "SORRY" (toJson ((withSorry.qsort (· < ·)).toList.take maxSorryListed))
   let mut fileDefs : Array Name := #[]
   for (name, ci) in env.constants.map₂.toList do
     let user := (privateToUserName? name).getD name
@@ -257,6 +293,9 @@ without `optParam` and `autoParam`. -/
     let isThm := match info with
       | ConstantInfo.thmInfo _ => true
       | _ => false
+    let mut typeSorry := false
+    for c in info.type.getUsedConstants do
+      if (← collectAxioms c).contains ``sorryAx then typeSorry := true
     liftTermElabM do
       forallBoundedTelescope info.type (some arity) fun xs body => do
         if xs.size != arity then
@@ -280,7 +319,8 @@ without `optParam` and `autoParam`. -/
         for j in [0:xs.size] do
           if b.containsFVar xs[j]!.fvarId! then deps := deps.push j
         let s := toString (← ppExpr b)
-        say marker "BODY" (Json.mkObj [("theorem", toJson isThm), ("deps", toJson deps),
+        say marker "BODY" (Json.mkObj [("theorem", toJson isThm), ("sorry", toJson typeSorry),
+            ("deps", toJson deps),
             ("defs", mentions b), ("type", toJson (s.take maxTypeChars)),
             ("truncated", toJson (decide (s.length > maxTypeChars)))])
 
