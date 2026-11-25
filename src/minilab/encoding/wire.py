@@ -136,7 +136,9 @@ def to_wire(value: object) -> WireValue:
     if type(value) is mpmath.mpf:
         if not mpmath.isfinite(value):
             return WireOpaque(type_name="non-finite mpf")
-        return WireMpf(man=_hex(value.man), exp=value.exp)
+        # mpmath keeps the sign apart: `man` is never negative.
+        sign, man, exp, _ = cast(tuple[int, int, int, int], value._mpf_)  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue]
+        return WireMpf(man=_hex(-man if sign else man), exp=exp)
     if type(value) is flint.arb:
         return _arb_to_wire(value)
     if type(value) is tuple:
