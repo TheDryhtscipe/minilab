@@ -26,12 +26,14 @@ from fixtures.pilot import s7 as s7_module
 from fixtures.pilot.s7 import S7Encoding
 
 from minilab.certify import ExactCertificate, check_certificate
-from minilab.encoding.api import Instance, to_fraction
+from minilab.encoding import sandbox
+from minilab.encoding.api import ExactMargin, Instance, to_fraction
+from minilab.encoding.sandbox import EncodingOutput, Sandboxed, SandboxFailure
 from minilab.falsify.coverage import CoverageReport
 from minilab.falsify.mechanism import check_mechanism
 from minilab.falsify.reformulate import check_reformulation, reformulate_and_attack
 from minilab.falsify.search import LocalEvaluator, SearchBudget, attack
-from minilab.falsify.stage import run_falsifier_stage
+from minilab.falsify.stage import CertificationFailed, run_falsifier_stage
 from minilab.ledger import Ledger
 from minilab.models.adapter import Budget, ModelReply, ModelUnavailable, default_backends
 from minilab.models.backends import Backend
@@ -638,3 +640,62 @@ def test_coverage_report_round_trips() -> None:
     report = result.coverage
     assert report.starts == 8 and report.worst_point is not None
     assert CoverageReport.model_validate(json.loads(report.model_dump_json())) == report
+
+
+# --- tool failures while certifying ---
+
+
+HANGS = (
+    toy_source("t - 4")
+    .replace(
+        '        t = to_fraction(x.values["t"])\n        return t - 4\n',
+        "        while True:\n            pass\n",
+        1,
+    )
+    .replace(
+        "        value = self.exact_margin(x)\n"
+        "        return mpmath.mpf(value.numerator) / value.denominator\n",
+        '        return mpmath.mpf(str(x.values["t"])) - 4\n',
+        1,
+    )
+)
+"""The false toy, but `exact_margin` never returns: every certificate times out."""
+
+
+def test_certificate_timeout_never_becomes_a_survival(store: RecordStore, ledger: Ledger) -> None:
+    assert "while True" in HANGS and "mpmath.mpf(str(" in HANGS
+    record_id = encoded(store, HANGS)
+    path = store.root / "runs" / RUN / "records" / f"{record_id}.json"
+    before = path.read_bytes()
+    fakes = all_say("no reformulation")
+    with pytest.raises(CertificationFailed, match="timed out"):
+        run_falsifier_stage(
+            record_id,
+            ledger=ledger,
+            budget=BUDGET,
+            backends=fakes,
+            search=SearchBudget(starts=4, local_evaluations=0, boundary_rays=0, max_certify=1),
+            timeout_s=3,
+        )
+    assert path.read_bytes() == before
+    assert store.load(record_id).status is Status.proposed
+    # It stopped before spending model budget on reformulations.
+    assert all(fake.prompts == [] for fake in fakes.values())
+
+
+def test_failed_probe_is_not_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    real = sandbox.run_encoding
+    runs: list[int] = []
+
+    def flaky(source: str, calls: sandbox.EncodingCalls, timeout_s: float) -> EncodingOutput:
+        runs.append(len(calls))
+        if len(runs) == 1:
+            return EncodingOutput(failure="the encoding timed out after 1s")
+        return real(source, calls, timeout_s)
+
+    monkeypatch.setattr(sandbox, "run_encoding", flaky)
+    make = Sandboxed(FALSE_TOY, Family.claude)
+    with pytest.raises(SandboxFailure, match="timed out"):
+        make()
+    assert make.failures == ("the encoding timed out after 1s",)
+    assert isinstance(make(), ExactMargin)

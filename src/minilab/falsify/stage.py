@@ -13,9 +13,10 @@ decided by `check_kill` with both encodings (decision doc-j6t).
 
 It writes `killed` with the certificate file, or `survived` with the coverage
 file, under `runs/<run_id>/falsifier/`. A model failure (`ModelUnavailable`,
-`BudgetExceeded`), an unusable sandbox, or a search that could evaluate no
-point at all raises before the stage is written, so the record's status is
-unchanged and the stage can run again.
+`BudgetExceeded`), an unusable sandbox, a search that could evaluate no
+point at all, or, with no kill, a certificate run that timed out or crashed
+(`CertificationFailed`) raises before the stage is written, so the record's
+status is unchanged and the stage can run again.
 """
 
 import random
@@ -40,6 +41,10 @@ from minilab.records import Family, Record, Stage, StageOutput, Status
 
 class SearchFailed(Exception):
     """The search evaluated no valid point, so it has no coverage to report."""
+
+
+class CertificationFailed(Exception):
+    """A candidate could not be certified because the sandbox failed, not the maths."""
 
 
 class FalsifierResult(BaseModel):
@@ -71,6 +76,21 @@ def _encodings(record: Record, run_dir: Path, timeout_s: float) -> tuple[Sandbox
             )
         )
     return made[0], made[1]
+
+
+def _no_sandbox_failure(record_id: str, first: Sandboxed, second: Sandboxed) -> None:
+    """Raise CertificationFailed if a certificate run of either encoding failed as a whole.
+
+    A time-out or crash while building or checking a certificate leaves that
+    candidate undecided. The certifier reports it as a refusal, but a refusal
+    the maths did not make is no ground for `survived`.
+    """
+    failures = [*first.failures, *second.failures]
+    if failures:
+        raise CertificationFailed(
+            f"{record_id}: {len(failures)} certificate run(s) failed in the sandbox, so a "
+            f"candidate is undecided; the first: {failures[0]}"
+        )
 
 
 def run_falsifier_stage(
@@ -106,6 +126,7 @@ def run_falsifier_stage(
     result = attack(first, plan, rng, assumptions=assumptions, certify=certify)
     notes: list[str] = []
     if not result.killed:
+        _no_sandbox_failure(record_id, first, second)
         try:
             result = reformulate_and_attack(
                 record,
@@ -143,6 +164,8 @@ def run_falsifier_stage(
             notes.append(f"No mechanism: {exc}.")
     elif result.coverage.evaluations == 0:
         raise SearchFailed(f"{record_id}: the search evaluated no valid point")
+    else:
+        _no_sandbox_failure(record_id, first, second)
 
     directory = run_dir / "falsifier"
     directory.mkdir(parents=True, exist_ok=True)
