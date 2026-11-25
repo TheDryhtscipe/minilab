@@ -4,8 +4,17 @@ Build plan doc-5wh, Task 11; design doc-gmj, stage 5.
 
 One Lean run checks three things.
 
+Every declaration the linter adds, and every marker it reads, carries a
+random tag made for this run (`MinilabContraGoal_<tag>`), and a run counts
+only if exactly one `READY` marker came back and every marker names a binder
+of the right kind. The tag stops a file from declaring or printing the
+linter's names ahead of time. It is no defence against model code that runs
+while the file compiles, which could read the tag from the file; that is
+the formaliser's command check's job, and the linter trusts an `ok`
+formalisation from `formal_from_source` to have passed it.
+
 **Contradictory hypotheses.** A Lean meta-program declares
-`MinilabContraGoal`, the statement `∀ binders, False`, and the linter tries
+`MinilabContraGoal_<tag>`, the statement `∀ binders, False`, and the linter tries
 to prove it with a fixed list of tactics (`simp_all` and `norm_num` with the
 file's definitions, `linarith`, `nlinarith`, `omega`, `tauto`). A proof that
 Lean accepts, with only Lean's standard axioms, is a certificate that no
@@ -24,11 +33,16 @@ the instantiated hypothesis and its negation, so each is `holds`, `fails`,
 
 **Unused binders.** Lean's unused-variables linter cannot do this job: on a
 theorem proved by `sorry`, every hypothesis is unused. So the linter works on
-the probed statement instead. A binder is relevant if the conclusion mentions
-it, if a relevant binder's type mentions it, or if it is a hypothesis or
-instance binder whose type mentions a relevant binder. Every other binder is
-unused: it cannot bear on the conclusion. A hypothesis that mentions no
-variable at all is unused too.
+the probed statement instead, with a relevance closure over the binders and
+the file's definitions (`unused_binders`). A binder is relevant if the
+conclusion mentions it, if a relevant binder's type mentions it, or if it is
+a hypothesis or instance binder whose type mentions a relevant binder or a
+relevant definition. A definition is relevant if the conclusion or a
+relevant binder mentions it, or a relevant definition uses it. So
+`(L : ℝ) (hL : ∀ x, ‖deriv loss x‖ ≤ L)` is relevant to a conclusion about
+`loss`. Every other binder is unused: it cannot bear on the conclusion. A
+hypothesis that mentions no variable and no relevant definition, such as
+`(1 : ℝ) < 2`, is unused too.
 
 A rejected formalisation has contradictory hypotheses, an unused binder, or
 a check that did not run. A Lean time-out is never a verdict: it sets
@@ -50,6 +64,7 @@ from minilab.formalise.formaliser import (
     FormalOutput,
     checked_source,
     marker_messages,
+    new_nonce,
 )
 from minilab.lean.runner import LeanResult, check_lean
 
@@ -119,18 +134,32 @@ class _Marker(BaseModel):
 
 
 def unused_binders(formal: FormalOutput) -> list[str]:
-    """Labels of the binders that cannot bear on the conclusion, in order."""
+    """Labels of the binders that cannot bear on the conclusion, in order.
+
+    The relevance closure, over binders and the file's definitions: the
+    conclusion's binders and definitions are relevant; a relevant binder's
+    binders and definitions are relevant; a relevant definition's definitions
+    are relevant; and a hypothesis or instance binder that mentions a
+    relevant binder or a relevant definition is relevant.
+    """
     relevant = set(formal.conclusion_deps)
+    defs = set(formal.conclusion_defs)
     changed = True
     while changed:
         changed = False
+        for name in list(defs):
+            more = set(formal.definition_uses.get(name, [])) - defs
+            if more:
+                defs |= more
+                changed = True
         for binder in formal.binders:
             deps = set(binder.deps)
             if binder.index in relevant:
-                if not deps <= relevant:
+                if not deps <= relevant or not set(binder.defs) <= defs:
                     relevant |= deps
+                    defs |= set(binder.defs)
                     changed = True
-            elif (binder.prop or binder.instance) and deps & relevant:
+            elif (binder.prop or binder.instance) and (deps & relevant or set(binder.defs) & defs):
                 relevant.add(binder.index)
                 changed = True
     return [b.label for b in formal.binders if b.index not in relevant]
@@ -176,12 +205,12 @@ def _lean_string(text: str) -> str:
     return json.dumps(text, ensure_ascii=False)
 
 
-def _program(terms: list[tuple[str, str, bool]]) -> str:
+def _program(terms: list[tuple[str, str, bool]], nonce: str, arity: int) -> str:
     """The meta-program that declares the goals; see the module docstring."""
     witness = ", ".join(
         f"({_lean_string(n)}, {_lean_string(t)}, {'true' if i else 'false'})" for n, t, i in terms
     )
-    m = VACUITY_MARKER
+    m = f"{VACUITY_MARKER}{nonce}_"
     return f"""
 open Lean Meta Elab Command in
 #eval show CommandElabM Unit from do
@@ -200,8 +229,9 @@ open Lean Meta Elab Command in
                                  safety := DefinitionSafety.safe }}
     addDecl (Declaration.defnDecl dv)
   liftTermElabM do
-    forallTelescope info.type fun xs _ => do
-      define `MinilabContraGoal (← mkForallFVars xs (mkConst ``False))
+    forallBoundedTelescope info.type (some {arity}) fun xs _ => do
+      if xs.size != {arity} then throwError "`{THEOREM}` has fewer binders than its header"
+      define `MinilabContraGoal_{nonce} (← mkForallFVars xs (mkConst ``False))
       let mut fromV : Array Expr := #[]
       let mut toV : Array Expr := #[]
       for i in [0:xs.size] do
@@ -211,7 +241,8 @@ open Lean Meta Elab Command in
         let ty := raw.replaceFVars fromV toV
         let closed := !ty.hasFVar && !ty.hasMVar
         if ← isProp raw then
-          define (Name.mkSimple s!"MinilabWitness_{{i}}") (if closed then ty else mkConst ``True)
+          define (Name.mkSimple s!"MinilabWitness_{nonce}_{{i}}")
+            (if closed then ty else mkConst ``True)
           say "PROP" (Json.mkObj [("index", toJson i), ("instantiated", toJson closed)])
         else if d.binderInfo.isInstImplicit then
           if closed then
@@ -228,9 +259,12 @@ open Lean Meta Elab Command in
           | some (_, text, isInt) =>
             let codomain := if ty.isForall && !ty.bindingBody!.hasLooseBVars
               && ty.bindingDomain!.isAppOfArity ``Fin 1 then ty.bindingBody! else ty
-            if !(closed && scalar codomain && (isInt || !integral codomain)) then
+            if !(closed && scalar codomain) then
               say "SUBST" (Json.mkObj [("index", toJson i), ("ok", toJson false),
-                ("detail", toJson "its type is not a number or a vector of numbers")])
+                ("detail", toJson "its type is not ℕ, ℤ, ℚ, ℝ, or a vector of one of them")])
+            else if !isInt && integral codomain then
+              say "SUBST" (Json.mkObj [("index", toJson i), ("ok", toJson false),
+                ("detail", toJson "the value is a fraction and the variable's type is ℕ or ℤ")])
             else
               match Parser.runParserCategory (← getEnv) `term text with
               | Except.error e =>
@@ -264,10 +298,10 @@ def _simp_set(names: list[str]) -> str:
     return f" [{', '.join(names)}]" if names else ""
 
 
-def _contra_theorem(defs: list[str]) -> str:
+def _contra_theorem(defs: list[str], nonce: str) -> str:
     simp = _simp_set(defs)
-    return f"""{_OPTIONS}theorem _root_.{CONTRA} : MinilabContraGoal := by
-  delta MinilabContraGoal
+    return f"""{_OPTIONS}theorem _root_.{CONTRA}_{nonce} : MinilabContraGoal_{nonce} := by
+  delta MinilabContraGoal_{nonce}
   intros
   first
     | (simp_all{simp}; done)
@@ -279,18 +313,18 @@ def _contra_theorem(defs: list[str]) -> str:
 """
 
 
-def _witness_theorems(index: int, defs: list[str]) -> tuple[str, str]:
+def _witness_theorems(index: int, defs: list[str], nonce: str) -> tuple[str, str]:
     simp = _simp_set([*defs, "Fin.sum_univ_succ", "Fin.forall_fin_succ", "Fin.exists_fin_succ"])
-    goal = f"MinilabWitness_{index}"
+    goal = f"MinilabWitness_{nonce}_{index}"
     return (
-        f"""{_OPTIONS}theorem _root_.minilab_w_{index} : {goal} := by
+        f"""{_OPTIONS}theorem _root_.minilab_w_{nonce}_{index} : {goal} := by
   delta {goal}
   first
     | infer_instance
     | (norm_num{simp}; done)
     | decide
 """,
-        f"""{_OPTIONS}theorem _root_.minilab_wn_{index} : ¬ {goal} := by
+        f"""{_OPTIONS}theorem _root_.minilab_wn_{nonce}_{index} : ¬ {goal} := by
   delta {goal}
   first
     | (norm_num{simp}; done)
@@ -323,19 +357,21 @@ def vacuity(
     terms: list[tuple[str, str, bool]] = []
     if witness is not None:
         terms, notes = witness_terms(formal, witness)
-    defs = [d for d in formal.definitions if _IDENT.match(d) and not d.startswith("inst")]
+    defs = [d for d in formal.definitions if _IDENT.match(d)]
+    nonce = new_nonce()
+    contra = f"{CONTRA}_{nonce}"
 
     body = checked_source(formal.source)
-    text = body + _program(terms)
+    text = body + _program(terms, nonce, len(formal.binders))
     contra_start = text.count("\n") + 1
-    text += _contra_theorem(defs)
+    text += _contra_theorem(defs, nonce)
     contra_lines = range(contra_start, text.count("\n") + 1)
     lines: dict[str, range] = {}
     for binder in formal.hypotheses:
-        holds, fails = _witness_theorems(binder.index, defs)
+        holds, fails = _witness_theorems(binder.index, defs, nonce)
         for name, block in (
-            (f"minilab_w_{binder.index}", holds),
-            (f"minilab_wn_{binder.index}", fails),
+            (f"minilab_w_{nonce}_{binder.index}", holds),
+            (f"minilab_wn_{nonce}_{binder.index}", fails),
         ):
             start = text.count("\n") + 1
             text += block
@@ -362,28 +398,38 @@ def vacuity(
     instantiated: dict[int, bool] = {}
     substituted: set[int] = set()
     failed_values: dict[int, str] = {}
-    ready = False
-    for tag, payload in marker_messages(result, source_lines, VACUITY_MARKER):
+    by_index = {b.index: b for b in formal.binders}
+    readies = 0
+    malformed = 0
+    for tag, payload in marker_messages(result, source_lines, f"{VACUITY_MARKER}{nonce}_"):
         if tag == "READY":
-            ready = True
+            readies += 1
             continue
         try:
             item = _Marker.model_validate_json(payload)
         except ValidationError:
+            malformed += 1
             continue
-        if tag == "PROP" and item.instantiated is not None:
+        binder = by_index.get(item.index)
+        if binder is None:
+            malformed += 1
+        elif tag == "PROP" and binder.prop and item.instantiated is not None:
             instantiated[item.index] = item.instantiated
-        elif tag == "SUBST" and item.ok is True:
+        elif tag == "SUBST" and not binder.prop and item.ok is True:
             substituted.add(item.index)
-        elif tag == "SUBST":
+        elif tag == "SUBST" and not binder.prop:
             failed_values[item.index] = item.detail or "not accepted"
-    by_index = {b.index: b for b in formal.binders}
+        else:
+            malformed += 1
     for index, detail in sorted(failed_values.items()):
         notes.append(f"the witness value for {by_index[index].label} was not used: {detail}")
+    ready = readies == 1 and malformed == 0
     if not ready:
-        notes.append("the vacuity meta-program did not finish: " + "; ".join(result.errors)[:1000])
+        notes.append(
+            "the vacuity meta-program did not finish cleanly: " + "; ".join(result.errors)[:1000]
+        )
 
-    contradictory = ready and _proved(result, CONTRA, contra_lines)
+    contradictory = ready and _proved(result, contra, contra_lines)
     checks: list[WitnessCheck] = []
     if witness is not None:
         for binder in formal.hypotheses:
@@ -395,10 +441,14 @@ def vacuity(
                     instantiated=instantiated.get(binder.index, False),
                     substituted=substituted,
                     holds=_proved(
-                        result, f"minilab_w_{binder.index}", lines[f"minilab_w_{binder.index}"]
+                        result,
+                        f"minilab_w_{nonce}_{binder.index}",
+                        lines[f"minilab_w_{nonce}_{binder.index}"],
                     ),
                     fails=_proved(
-                        result, f"minilab_wn_{binder.index}", lines[f"minilab_wn_{binder.index}"]
+                        result,
+                        f"minilab_wn_{nonce}_{binder.index}",
+                        lines[f"minilab_wn_{nonce}_{binder.index}"],
                     ),
                 )
             )
@@ -423,14 +473,15 @@ def _witness_check(
     holds: bool,
     fails: bool,
 ) -> WitnessCheck:
-    binder = formal.binders[index]
+    by_index = {b.index: b for b in formal.binders}
+    binder = by_index[index]
     if not ready:
         return WitnessCheck(label=binder.label, state="undecided", detail="the check did not run")
     if not instantiated:
         missing = [
-            formal.binders[d].label
+            by_index[d].label
             for d in binder.deps
-            if d not in substituted and not formal.binders[d].prop
+            if d in by_index and d not in substituted and not by_index[d].prop
         ]
         detail = "no value for " + ", ".join(missing) if missing else "not closed by the witness"
         return WitnessCheck(label=binder.label, state="not_instantiated", detail=detail)

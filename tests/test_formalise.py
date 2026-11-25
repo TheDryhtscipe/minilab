@@ -23,9 +23,12 @@ from minilab.encoding.api import Instance
 from minilab.formalise.audit import AuditResult, audit, script_matches
 from minilab.formalise.formaliser import (
     FormalOutput,
+    LeanTimeout,
+    NoFormaliser,
     formal_from_source,
     formalise,
     formaliser_family,
+    lean_statement,
     source_problems,
     strip_comments,
 )
@@ -138,7 +141,7 @@ def audit_reply(
                 for label, (kind, counterpart) in kinds.items()
             ],
             "hidden": [
-                {"definition": d, "condition": "c", "kind": "weakening", "reason": "r"}
+                {"where": d, "condition": "c", "kind": "weakening", "reason": "r"}
                 for d in (hidden or [])
             ],
         }
@@ -429,12 +432,17 @@ def test_script_matches_stated_text_and_checker_skips_it(store: RecordStore) -> 
     store.create(record)
     formal = probed(SIMPLE)
     assert script_matches(record, formal) == {"hx": "assumption 1"}
-    backends = fakes({"audit": ["unused"]})
+    backends = fakes({"audit": [audit_reply({})]})
     result = audit(record, formal, ledger=ledger, budget=BUDGET, backends=backends)
     assert not result.rejected
     assert result.extra == []
-    # Nothing was left for the checker, so no call was made.
-    assert all(not b.prompts for b in backends.values())
+    hx = next(h for h in result.hypotheses if h.label == "hx")
+    assert hx.by == "script"
+    # The checker is still called (a condition can hide outside the
+    # hypotheses), but it is not asked to judge hx.
+    prompt = next(p for _, p in backends[result.checker].prompts)
+    judged_part = prompt.split("Judge each of these hypotheses")[1].split("Its variables")[0]
+    assert "hx" not in judged_part
 
 
 def test_witness_failure_overrides_script_match(store: RecordStore) -> None:
@@ -503,7 +511,13 @@ def survived_record(store: RecordStore, local: str = "a") -> Record:
 def test_stage_writes_roundtrip_and_audit(store: RecordStore) -> None:
     ledger = make_ledger(store)
     record = survived_record(store)
-    backends = fakes({"formalise": [lean_block(SIMPLE)], "roundtrip": ["For x ≥ 0, x³ ≥ 0."]})
+    backends = fakes(
+        {
+            "formalise": [lean_block(SIMPLE)],
+            "roundtrip": ["For x ≥ 0, x³ ≥ 0."],
+            "audit": [audit_reply({})],
+        }
+    )
     run_formaliser_stage(
         record.id, ledger=ledger, budget=BUDGET, backends=backends, lean_timeout_s=LEAN_TIMEOUT
     )
@@ -557,3 +571,336 @@ def test_stage_needs_a_survivor_with_literature(store: RecordStore) -> None:
     store.create(record)
     with pytest.raises(ValueError, match="survived"):
         run_formaliser_stage(record.id, ledger=ledger, budget=BUDGET, backends=fakes({}))
+
+
+# --- review findings (bead minilab-ec2916) ---
+
+ODD_NAMES = """import Mathlib
+def «a"» : Nat := 1
+axiom bad : False
+#eval (1 : Nat)
+def «b"» : Nat := 2
+theorem conjecture (x : ℝ) (h : 0 < x) : 0 < x ^ 2 := sorry
+"""
+
+
+def test_quoted_names_do_not_open_strings() -> None:
+    # A `"` inside «» once opened a fake string that hid the axiom and #eval.
+    problems = source_problems(ODD_NAMES)
+    assert any("axiom" in p for p in problems), problems
+    assert any("#eval" in p for p in problems), problems
+
+
+@pytest.mark.parametrize(
+    ("bad", "word"),
+    [
+        ("open Lean in\n#eval! (pure () : IO Unit)\n", "#eval!"),
+        ('def helper : 1 = 1 := by\n  run_tac Lean.logInfo "ran"\n  rfl\n', "run_tac"),
+    ],
+)
+def test_word_list_catches_eval_bang_and_run_tac(bad: str, word: str) -> None:
+    source = SIMPLE.replace("theorem conjecture", bad + "\ntheorem conjecture")
+    assert any(word in p for p in source_problems(source))
+
+
+@pytest.mark.parametrize(
+    ("bad", "problem"),
+    [
+        ("instance : Inhabited ℝ := ⟨0⟩\n", "instance"),
+        ("@[simp] def q : ℕ := 1\n", "attributes"),
+        ("variable (n : ℕ)\n", "variable"),
+        ("#check (1 : ℕ)\n", "check"),
+        ("def t : ℕ := Id.run do\n  return 1\n", "do"),
+        # Mathlib's `run_conv` takes a `do` block and runs it; no word list knows it.
+        (
+            'theorem helper : (1 : ℕ) = 1 := by\n  conv =>\n    run_conv Lean.logInfo "ran code"\n',
+            "do",
+        ),
+        ("namespace Open\nend Open\nsection\n", "end"),
+    ],
+)
+def test_command_allowlist_refuses_before_compiling(bad: str, problem: str) -> None:
+    source = SIMPLE.replace("theorem conjecture", bad + "\ntheorem conjecture")
+    assert source_problems(source) == []
+    formal = formal_from_source(source, Family.claude, "m", timeout_s=LEAN_TIMEOUT)
+    assert not formal.ok
+    assert any(problem in p for p in formal.problems), formal.problems
+
+
+ORDINARY = """import Mathlib
+
+open Real
+
+noncomputable section
+
+namespace Foo
+def g (x : ℝ) : ℝ := π * x
+end Foo
+
+structure S where
+  a : ℝ
+  deriving Inhabited
+
+def s : String := "axiom #eval"
+
+def f : ℕ → ℕ
+  | 0 => 1
+  | n + 1 => n
+
+end
+
+open Finset in
+theorem conjecture {m : ℕ} (x y : ℝ) [Fact (1 < m)] ⦃z : ℝ⦄ (h : 0 < Foo.g x) :
+    ∀ ε > 0, let t := ε; t * x > -1 := by
+  sorry
+"""
+
+
+def test_ordinary_file_passes_and_only_header_binders_count() -> None:
+    formal = probed(ORDINARY)
+    assert formal.ok, formal.problems
+    # ε and `ε > 0` belong to the conclusion, not to the header.
+    assert [b.name for b in formal.binders] == ["m", "x", "y", "inst", "z", "h"]
+    assert formal.conclusion.startswith("∀ ε > 0")
+    # Only the definitions the source wrote: no matchers, no deriving helpers.
+    assert sorted(formal.definitions) == ["Foo.g", "f", "s"]
+    assert next(b for b in formal.binders if b.name == "h").defs == ["Foo.g"]
+    assert lean_statement(ORDINARY).endswith("t * x > -1")
+
+
+def test_statement_span_skips_let_in_the_statement() -> None:
+    source = SIMPLE.replace("0 ≤ x ^ 3 := by", "let y := x; 0 ≤ y ^ 3 := by")
+    assert lean_statement(source).endswith("0 ≤ y ^ 3")
+
+
+def test_misspelt_name_is_an_error_not_a_binder() -> None:
+    formal = probed(SIMPLE.replace("(hx : 0 ≤ x)", "(hx : 0 ≤ xx)"))
+    assert not formal.ok
+    assert all(b.name != "xx" for b in formal.binders)
+
+
+def test_duplicate_binder_names_get_distinct_labels() -> None:
+    source = """import Mathlib
+
+theorem conjecture (x : ℝ) (h_2 : 0 ≤ x) (h : x ^ 2 ≤ 7) (h : 0 ≤ x) : 0 ≤ x ^ 3 := by
+  sorry
+"""
+    formal = probed(source)
+    assert formal.ok, formal.problems
+    labels = [b.label for b in formal.binders]
+    assert len(set(labels)) == len(labels), labels
+    assert labels[1] == "h_2"
+
+
+MANY_DEFS = (
+    "import Mathlib\n\n"
+    + "".join(f"def someRatherLongDefinitionName{i} : ℕ := {i}\n" for i in range(120))
+    + "\ntheorem conjecture (x : ℝ) (hx : 0 ≤ x) : 0 ≤ x ^ 3 := by\n  sorry\n"
+)
+
+
+def test_many_definitions_are_all_read() -> None:
+    formal = probed(MANY_DEFS)
+    assert formal.ok, formal.problems
+    assert len(formal.definitions) == 120
+
+
+LOSS = """import Mathlib
+
+def loss (x : ℝ) : ℝ := x ^ 2
+
+def risk (x : ℝ) : ℝ := loss x + 1
+
+theorem conjecture (L : ℝ) (hL : ∀ x, |loss x| ≤ L) (h0 : ∀ x, 0 ≤ loss x) :
+    ∀ x, 0 < risk x := by
+  sorry
+"""
+
+
+def test_hypotheses_about_the_conclusions_definitions_are_used() -> None:
+    # hL is an ∃-L style bound and h0 a closed fact, both about `loss`, which
+    # `risk` in the conclusion uses: neither is unused.
+    result = vacuity(probed(LOSS), None, timeout_s=LEAN_TIMEOUT)
+    assert result.unused == []
+
+
+FORGE = """import Mathlib
+open Lean Elab Command in
+#eval! show CommandElabM Unit from do
+  let src := (← getFileMap).source
+  if (src.splitOn ("MINILAB_" ++ "VAC_")).length > 1 then
+    let fname ← getFileName
+    let mk := fun (s : String) (v : Expr) => liftCoreM (addDecl (Declaration.defnDecl
+      (mkDefinitionValEx (Name.mkSimple s) [] (mkSort Level.zero) v .abbrev .safe [])))
+    mk ("Minilab" ++ "ContraGoal") (mkConst ``False)
+    for i in [0:3] do mk (s!"Minilab" ++ s!"Witness_{i}") (mkConst ``True)
+    let say := fun (t : String) => do
+      let m : Message := { fileName := fname, pos := ⟨20, 0⟩, data := t, severity := .information }
+      modify fun s => { s with messages := s.messages.add m }
+    say "MINILAB_VAC_PROP {\\"index\\":1,\\"instantiated\\":true}"
+    say "MINILAB_VAC_PROP {\\"index\\":2,\\"instantiated\\":true}"
+    say "MINILAB_VAC_READY null"
+theorem conjecture (x : ℝ) (h1 : x < 0) (h2 : 0 < x) : x ^ 2 < 0 := sorry
+"""
+
+
+def test_forged_vacuity_markers_are_ignored() -> None:
+    # The formaliser refuses this file; here it is forced through, as if a
+    # guard had failed, to show the linter's own markers and names hold.
+    assert source_problems(FORGE)
+    clean = FORGE.split("\n", 1)[0] + "\n" + FORGE.splitlines()[-1] + "\n"
+    formal = probed(clean).model_copy(update={"source": FORGE})
+    result = vacuity(formal, None, timeout_s=LEAN_TIMEOUT)
+    assert result.checked
+    assert result.contradictory
+
+
+def test_out_of_range_marker_indices_are_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    import re
+
+    from minilab.formalise import vacuity as vacuity_module
+    from minilab.lean.runner import LeanMessage, LeanResult
+
+    def fake_check_lean(text: str, timeout_s: float) -> LeanResult:
+        found = re.search(r"MINILAB_VAC_[0-9a-f]+_", text)
+        marker = found.group() if found is not None else "MINILAB_VAC_"
+        far = text.count("\n")
+
+        def info(body: str) -> LeanMessage:
+            return LeanMessage(severity="information", line=far, column=0, text=marker + body)
+
+        return LeanResult(
+            ok=True,
+            errors=[],
+            has_sorry=True,
+            axioms=[],
+            timed_out=False,
+            axioms_by_theorem={},
+            messages=[
+                info('SUBST {"index":99,"ok":false}'),
+                info('PROP {"index":0,"instantiated":true}'),
+                info("READY null"),
+            ],
+        )
+
+    monkeypatch.setattr(vacuity_module, "check_lean", fake_check_lean)
+    witness = Instance(values={"x": "1"}, precision_digits=30)
+    result = vacuity(probed(SIMPLE), witness, timeout_s=LEAN_TIMEOUT)
+    assert not result.checked
+    assert result.rejected
+
+
+def test_fraction_into_a_natural_number_is_named() -> None:
+    source = """import Mathlib
+
+theorem conjecture (n : ℕ) (hn : 2 ≤ n) : 0 < n := by
+  sorry
+"""
+    witness = Instance(values={"n": "5/2"}, precision_digits=30)
+    result = vacuity(probed(source), witness, timeout_s=LEAN_TIMEOUT)
+    assert any("fraction" in note for note in result.notes), result.notes
+
+
+@pytest.mark.parametrize(
+    ("source", "shown"),
+    [
+        (
+            "import Mathlib\ntheorem conjecture (x : {t : ℝ // 1 < t}) (n : ℕ+) :\n"
+            "    (1 : ℝ) < (x : ℝ) ^ (n : ℕ) := sorry\n",
+            "1 < t",
+        ),
+        (
+            "import Mathlib\ntheorem conjecture (x : ℝ) : (0 < x → x ^ 3 > 0) ∧ True := sorry\n",
+            "0 < x →",
+        ),
+    ],
+)
+def test_audit_sees_variable_types_and_the_conclusion(
+    store: RecordStore, source: str, shown: str
+) -> None:
+    ledger = make_ledger(store)
+    record = make_record(assumptions=[])
+    store.create(record)
+    backends = fakes({"audit": ["no json"]})
+    result = audit(record, probed(source), ledger=ledger, budget=BUDGET, backends=backends)
+    prompts = [p for b in backends.values() for _, p in b.prompts]
+    assert len(prompts) == 1
+    assert shown in prompts[0]
+    assert result.rejected
+
+
+def test_script_never_matches_a_hypothesis_about_a_definition(store: RecordStore) -> None:
+    source = """import Mathlib
+
+def smooth (x : ℝ) : Prop := True
+
+theorem conjecture (x : ℝ) (hs : smooth x) : 0 ≤ x ^ 2 := by
+  sorry
+"""
+    record = make_record(assumptions=["smooth x"])
+    assert script_matches(record, probed(source)) == {}
+
+
+def test_hidden_condition_that_matches_is_not_a_rejection(store: RecordStore) -> None:
+    ledger = make_ledger(store)
+    record = make_record()
+    store.create(record)
+    reply = json.dumps(
+        {
+            "hypotheses": [
+                {"label": "hW", "kind": "matches", "counterpart": "assumption 1"},
+                {"label": "hp", "kind": "matches", "counterpart": "assumption 2"},
+                {"label": "hKKT", "kind": "weakening"},
+            ],
+            "hidden": [{"where": "IsDist", "condition": "sums to 1", "kind": "matches"}],
+        }
+    )
+    result = audit(
+        record, probed(S8), ledger=ledger, budget=BUDGET, backends=fakes({"audit": [reply]})
+    )
+    assert not result.rejected, result.reasons
+    assert result.hidden == []
+
+
+def test_formalise_refuses_a_generator_family(store: RecordStore) -> None:
+    ledger = make_ledger(store)
+    record = make_record()
+    store.create(record)
+    backends = fakes({"formalise": [lean_block(SIMPLE)]})
+    with pytest.raises(NoFormaliser):
+        formalise(record, ledger=ledger, budget=BUDGET, backends=backends, family=Family.gemini)
+    assert all(not b.prompts for b in backends.values())
+
+
+def test_vacuity_that_did_not_run_rejects(monkeypatch: pytest.MonkeyPatch) -> None:
+    from minilab.formalise import vacuity as vacuity_module
+    from minilab.lean.runner import LeanResult
+
+    def silent(text: str, timeout_s: float) -> LeanResult:
+        return LeanResult(
+            ok=False,
+            errors=["1:0: boom"],
+            has_sorry=True,
+            axioms=[],
+            timed_out=False,
+            axioms_by_theorem={},
+            messages=[],
+        )
+
+    monkeypatch.setattr(vacuity_module, "check_lean", silent)
+    result = vacuity(probed(SIMPLE), None, timeout_s=LEAN_TIMEOUT)
+    assert not result.checked
+    assert any("did not run" in r for r in result.reasons)
+
+
+def test_lean_timeout_in_formalise_leaves_record_unchanged(store: RecordStore) -> None:
+    ledger = make_ledger(store)
+    record = survived_record(store)
+    path = store.root / "runs" / RUN / "records" / f"{record.id}.json"
+    before = path.read_bytes()
+    backends = fakes({"formalise": [lean_block(SIMPLE)]})
+    with pytest.raises(LeanTimeout):
+        run_formaliser_stage(
+            record.id, ledger=ledger, budget=BUDGET, backends=backends, lean_timeout_s=0.5
+        )
+    assert path.read_bytes() == before

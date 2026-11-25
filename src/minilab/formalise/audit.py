@@ -5,25 +5,30 @@ Build plan doc-5wh, Task 11; design doc-gmj, stage 5.
 The script goes first. It matches a hypothesis to the record only when the
 hypothesis's Lean type, as Lean prints it, is the same text as one of the
 record's assumptions or its domain of validity (whitespace and Unicode
-compatibility forms aside). It does not match by name: the names are the
-formaliser's own labels, and trusting them would let the formaliser vouch for
-itself.
+compatibility forms aside), and the type mentions none of the file's
+definitions (the text of a definition's name says nothing about what the
+definition says). It does not match by name: the names are the formaliser's
+own labels, and trusting them would let the formaliser vouch for itself.
 
-Everything else goes to a checker model from a family other than the
-formaliser's (`pick_checker`): each hypothesis the script did not match, and
-each the falsifier's witness fails in Lean (a stated assumption holds at the
-witness, so a hypothesis that fails there says more than the record does).
-The file's definitions also go to the checker whenever there are any, since a
-definition can hide a condition too. The checker sorts each hypothesis as
+A checker model from a family other than the formaliser's (`pick_checker`)
+is always called, because a condition can hide outside the hypotheses: in a
+definition, in a variable's type (a subtype, `ℕ+`, `ℝ≥0`), in an instance
+binder, or in the conclusion (`(0 < x → P x) ∧ True`). It is asked to judge
+each hypothesis the script did not match and each the falsifier's witness
+fails in Lean (a stated assumption holds at the witness, so a hypothesis
+that fails there says more than the record does). It sorts each as
 `matches` (it says what an assumption or the domain says), `weakening` (an
 extra condition that may be stated as a weakening of the conjecture), or
 `begs_question` (it assumes what the conjecture claims, or something close to
-it), and lists conditions hidden in definitions the same way.
+it). It also lists each condition hidden anywhere else, with `where` it is
+and the same kinds; a listed condition of kind `matches` or `none` says
+nothing extra and is dropped.
 
 It fails closed. A hypothesis the checker does not judge is `unjudged`, and
 an unreadable reply leaves every hypothesis it was asked about `unjudged`.
-The formalisation is rejected if any hypothesis or hidden condition is
-`begs_question` or `unjudged`. A weakening is not a rejection: its text goes
+A hidden condition of any other kind is `unjudged`. The formalisation is
+rejected if any hypothesis or hidden condition is `begs_question` or
+`unjudged`. A weakening is not a rejection: its text goes
 into `weakenings` for the stage to record. (A stage cannot edit the record's
 assumptions, so the weakenings live in the formaliser stage's data.)
 
@@ -64,11 +69,14 @@ class AuditedHypothesis(BaseModel):
 
 
 class HiddenCondition(BaseModel):
-    """A condition that a definition adds, as the checker reported it."""
+    """A condition outside the hypotheses, as the checker reported it.
+
+    `where` names the definition, the binder, or "conclusion".
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    definition: str
+    where: str
     condition: str
     kind: Literal["weakening", "begs_question", "unjudged"]
     reason: str = ""
@@ -85,7 +93,7 @@ class AuditResult(BaseModel):
     hidden: list[HiddenCondition]
     rejected: bool
     reasons: list[str]
-    checker: Family | None
+    checker: Family
     judged: bool
 
 
@@ -107,14 +115,17 @@ def _balanced(text: str) -> bool:
 
 
 def script_matches(record: Record, formal: FormalOutput) -> dict[str, str]:
-    """Hypothesis label to "assumption i" (1-based) or "domain", by exact stated text."""
+    """Hypothesis label to "assumption i" (1-based) or "domain", by exact stated text.
+
+    A hypothesis whose type mentions a file definition is never matched.
+    """
     stated: list[tuple[str, str]] = [
         (_normal(a), f"assumption {i}") for i, a in enumerate(record.assumptions, 1)
     ]
     stated.append((_normal(record.domain_of_validity), DOMAIN))
     found: dict[str, str] = {}
     for hypothesis in formal.hypotheses:
-        if hypothesis.truncated:
+        if hypothesis.truncated or hypothesis.defs:
             continue
         lean = _normal(hypothesis.type)
         for text, where in stated:
@@ -133,6 +144,12 @@ def audit_prompt(
         + ("  (this hypothesis fails at the falsifier's witness)" if b.label in failing else "")
         for b in asked
     )
+    variables = "\n".join(
+        f"- {b.label} : {b.type}" + ("  (instance binder)" if b.instance else "")
+        for b in formal.binders
+        if not b.prop
+    )
+    conclusion = formal.conclusion + (" …(cut)" if formal.conclusion_truncated else "")
     return f"""You are doing a hypothesis audit of a Lean formalisation of a conjecture.
 
 The conjecture as stated:
@@ -149,6 +166,12 @@ The Lean file:
 Judge each of these hypotheses of `{formal.theorem}`:
 {listed or "  (none)"}
 
+Its variables:
+{variables or "  (none)"}
+
+Its conclusion, as Lean prints it:
+{conclusion}
+
 For each one, give its kind:
 - "matches": it says what one stated assumption or the domain says. Give that
   counterpart as "assumption <number>" or "domain".
@@ -159,12 +182,16 @@ For each one, give its kind:
 A hypothesis that fails at the falsifier's witness cannot match an assumption
 the witness satisfies.
 
-Also list each condition that a definition in the file adds beyond what the
-statement says, with kind "weakening" or "begs_question".
+Also list each condition the statement does not have that hides outside
+these hypotheses: in a definition in the file, in a variable's type (a
+subtype, `ℕ+`, `ℝ≥0` and the like), in an instance binder, or in the
+conclusion (an implication or case split the statement does not make). Give
+`where` as the definition's name, the variable's label, or "conclusion", and
+kind "weakening" or "begs_question". List nothing that the statement says.
 
 Reply with one JSON object and nothing else:
 {{"hypotheses": [{{"label": "...", "kind": "...", "counterpart": "..." or null, "reason": "..."}}],
- "hidden": [{{"definition": "...", "condition": "...", "kind": "...", "reason": "..."}}]}}"""
+ "hidden": [{{"where": "...", "condition": "...", "kind": "...", "reason": "..."}}]}}"""
 
 
 class _RawVerdict(BaseModel):
@@ -179,7 +206,7 @@ class _RawVerdict(BaseModel):
 class _RawHidden(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    definition: str
+    where: str
     condition: str
     kind: str
     reason: str = ""
@@ -217,6 +244,8 @@ def parse_reply(text: str) -> _RawReply | None:
 
 _JUDGED: frozenset[str] = frozenset({"matches", "weakening", "begs_question"})
 
+_NOTHING_HIDDEN: frozenset[str] = frozenset({"matches", "none"})
+
 
 def audit(
     record: Record,
@@ -227,7 +256,7 @@ def audit(
     backends: Mapping[Family, Backend] | None = None,
     vacuity: VacuityResult | None = None,
 ) -> AuditResult:
-    """Audit `formal`'s hypotheses against `record`, as the module describes.
+    """Audit `formal` against `record`, as the module describes.
 
     `vacuity` gives the witness results; a hypothesis the witness fails goes
     to the checker even if the script matched it. Raise NoChecker if no
@@ -238,6 +267,8 @@ def audit(
         w.label for w in (vacuity.witness if vacuity is not None else []) if w.state == "fails"
     }
     asked = [h for h in formal.hypotheses if h.label not in matched or h.label in failing]
+    # The script's matches are never re-asked; `script_matches` already
+    # refuses a hypothesis that mentions a file definition.
     verdicts: dict[str, AuditedHypothesis] = {}
     for h in formal.hypotheses:
         if h.label in matched and h.label not in failing:
@@ -250,55 +281,54 @@ def audit(
                 by="script",
             )
     hidden: list[HiddenCondition] = []
-    checker: Family | None = None
-    judged = True
-    if asked or formal.definitions:
-        checker = pick_checker(formal.family, ledger.manifest.families)
-        reply = call(
-            checker,
-            Role.audit,
-            audit_prompt(record, formal, asked, failing),
-            record_id=record.id,
-            pair=record.pair,
-            ledger=ledger,
-            budget=budget,
-            backends=backends,
-        )
-        parsed = parse_reply(reply.text)
-        judged = parsed is not None
-        given: dict[str, _RawVerdict] = {}
-        if parsed is not None:
-            for verdict in parsed.hypotheses:
-                given.setdefault(verdict.label, verdict)
-            for item in parsed.hidden:
-                hidden_kind: Literal["weakening", "begs_question", "unjudged"] = "unjudged"
-                if item.kind == "weakening" or item.kind == "begs_question":
-                    hidden_kind = item.kind
-                hidden.append(
-                    HiddenCondition(
-                        definition=item.definition,
-                        condition=item.condition,
-                        kind=hidden_kind,
-                        reason=item.reason,
-                    )
+    checker = pick_checker(formal.family, ledger.manifest.families)
+    reply = call(
+        checker,
+        Role.audit,
+        audit_prompt(record, formal, asked, failing),
+        record_id=record.id,
+        pair=record.pair,
+        ledger=ledger,
+        budget=budget,
+        backends=backends,
+    )
+    parsed = parse_reply(reply.text)
+    judged = parsed is not None
+    given: dict[str, _RawVerdict] = {}
+    if parsed is not None:
+        for verdict in parsed.hypotheses:
+            given.setdefault(verdict.label, verdict)
+        for item in parsed.hidden:
+            if item.kind in _NOTHING_HIDDEN:
+                continue
+            hidden_kind: Literal["weakening", "begs_question", "unjudged"] = "unjudged"
+            if item.kind == "weakening" or item.kind == "begs_question":
+                hidden_kind = item.kind
+            hidden.append(
+                HiddenCondition(
+                    where=item.where,
+                    condition=item.condition,
+                    kind=hidden_kind,
+                    reason=item.reason,
                 )
-        for h in asked:
-            verdict = given.get(h.label)
-            kind: Kind = "unjudged"
-            if verdict is not None and verdict.kind in _JUDGED:
-                kind = cast(Kind, verdict.kind)
-            verdicts[h.label] = AuditedHypothesis(
-                label=h.label,
-                type=h.type,
-                kind=kind,
-                counterpart=verdict.counterpart if verdict is not None else None,
-                reason=verdict.reason if verdict is not None else "the checker gave no verdict",
-                by="checker",
             )
+    for h in asked:
+        verdict = given.get(h.label)
+        kind: Kind = "unjudged"
+        if verdict is not None and verdict.kind in _JUDGED:
+            kind = cast(Kind, verdict.kind)
+        verdicts[h.label] = AuditedHypothesis(
+            label=h.label,
+            type=h.type,
+            kind=kind,
+            counterpart=verdict.counterpart if verdict is not None else None,
+            reason=verdict.reason if verdict is not None else "the checker gave no verdict",
+            by="checker",
+        )
     hypotheses = [verdicts[h.label] for h in formal.hypotheses]
     extra = [h.label for h in hypotheses if h.kind != "matches"]
     weakenings = [f"{h.label}: {h.type}" for h in hypotheses if h.kind == "weakening"]
-    weakenings += [f"{c.definition}: {c.condition}" for c in hidden if c.kind == "weakening"]
+    weakenings += [f"{c.where}: {c.condition}" for c in hidden if c.kind == "weakening"]
     reasons: list[str] = []
     if not judged:
         reasons.append("the checker's reply could not be read")
@@ -309,9 +339,9 @@ def audit(
             reasons.append(f"hypothesis {h.label} was not judged")
     for c in hidden:
         if c.kind == "begs_question":
-            reasons.append(f"definition {c.definition} begs the question: {c.condition}")
+            reasons.append(f"a condition in {c.where} begs the question: {c.condition}")
         elif c.kind == "unjudged":
-            reasons.append(f"a condition in definition {c.definition} was not judged")
+            reasons.append(f"a condition in {c.where} was not judged")
     return AuditResult(
         hypotheses=hypotheses,
         extra=extra,
