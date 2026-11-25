@@ -6,7 +6,7 @@ hold (build plan doc-5wh, Task 6):
 
 1. the point satisfies every assumption predicate and the domain predicate;
 2. the margin is negative: exactly, by a rigorous enclosure, or between primal
-   and dual bounds whose gap is below 1/1000 of the violation;
+   and dual bounds whose gap is below 1/1000 of the upper bound;
 3. 1 and 2 hold again at twice the precision, or at 100 digits or more if the
    margin is within 1e-6 of zero or the encoding flags the point as
    near-degenerate; and the two checks agree on the margin.
@@ -20,7 +20,9 @@ through the encoding. It takes a factory and builds a fresh encoding for each
 run, so state kept on the encoding object (a cache, a solver's warm start)
 cannot carry from the first run to the repeat. It cannot see state kept
 elsewhere, such as on the class or in a module. It rejects a certificate if an
-encoding call changes the working precision. Models never write this code.
+encoding call or the factory leaves the working precision changed. It cannot
+see an encoding that sets its own precision and restores it before it returns.
+Models never write this code.
 
 The encoding's capabilities (`margin_ball`, `primal_dual`) are written by a
 model, so one encoding's say-so is not enough for a kill: `check_kill` accepts
@@ -82,13 +84,15 @@ def _check_at(
     Returns the margin check and whether the encoding flags the point as
     near-degenerate.
     """
-    point = cert.point.at_precision(digits)
+    # A deep copy: an encoding could write into the point's values, and the
+    # repeat, the other encoding, and the caller must not see that.
+    point = cert.point.model_copy(deep=True).at_precision(digits)
     with working_digits(digits):
         expected = (mpmath.mp.prec, flint.ctx.prec)
 
         def moved(step: str) -> MarginCheck | None:
-            # An encoding that sets its own precision would make the repeat
-            # check run at the same precision as the first.
+            # An encoding that leaves its own precision set would make the
+            # repeat check run at the same precision as the first.
             if (mpmath.mp.prec, flint.ctx.prec) == expected:
                 return None
             return MarginCheck.failed(
@@ -135,9 +139,9 @@ def _check_at(
                     reject(f"the near-degeneracy flag is not a bool: {type(flag).__name__}")
                 ), False
             degenerate = flag
-        except Exception as exc:  # noqa: BLE001 - encoding code may raise anything
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 - encoding code may raise anything
             return MarginCheck.failed(
-                reject(f"the encoding raised {type(exc).__name__} at {digits} digits: {exc}")
+                reject(f"the encoding raised {_describe(exc)} at {digits} digits")
             ), False
     return margin, degenerate
 
@@ -150,13 +154,34 @@ def check_certificate(make: EncodingFactory, cert: Certificate) -> CheckResult:
     """
     try:
         return _check_certificate(make, cert)
-    except Exception as exc:  # noqa: BLE001 - a check must answer, never raise
-        return reject(f"the check raised {type(exc).__name__}: {exc}")
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 - answer, except to KeyboardInterrupt
+        return reject(f"the check raised {_describe(exc)}")
+
+
+def _describe(exc: BaseException) -> str:
+    """Name an exception from encoding code, whose own text may raise."""
+    try:
+        text = str(exc)
+    except Exception:  # noqa: BLE001 - the text is encoding code too
+        text = "(its text raised)"
+    return f"{type(exc).__name__}: {text[:500]}"
+
+
+def _build(make: EncodingFactory, digits: int) -> Encoding | CheckResult:
+    """Call the factory at `digits` digits; reject it if it changes the precision."""
+    with working_digits(digits):
+        expected = (mpmath.mp.prec, flint.ctx.prec)
+        enc = make()
+        if (mpmath.mp.prec, flint.ctx.prec) != expected:
+            return reject("the factory changed the working precision")
+    return enc
 
 
 def _check_certificate(make: EncodingFactory, cert: Certificate) -> CheckResult:
     digits = _digits(cert)
-    enc = make()
+    enc = _build(make, digits)
+    if isinstance(enc, CheckResult):
+        return enc
     first, degenerate = _check_at(enc, cert, digits)
     if not first.result.accepted:
         return first.result
@@ -167,7 +192,9 @@ def _check_certificate(make: EncodingFactory, cert: Certificate) -> CheckResult:
     if near_zero or degenerate:
         recheck_digits = max(RECHECK_DIGITS, recheck_digits)
         why = "near zero, so repeated" if near_zero else "near-degenerate, so repeated"
-    fresh = make()
+    fresh = _build(make, recheck_digits)
+    if isinstance(fresh, CheckResult):
+        return fresh
     if fresh is enc:
         return reject("the factory returned the same encoding object twice")
     second, _ = _check_at(fresh, cert, recheck_digits)

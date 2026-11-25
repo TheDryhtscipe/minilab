@@ -687,3 +687,106 @@ def test_s7_refuses_distortions_it_cannot_order() -> None:
     same = Instance(values=values, precision_digits=40)
     with working_digits(40), pytest.raises(ValueError, match="too close"):
         S7Encoding().primal_dual(same)
+
+
+class PointMemo(BallToy):
+    """Caches its ball in the point it is given, which outlives a fresh encoding."""
+
+    def margin_ball(self, x: Instance) -> flint.arb:
+        values = cast(dict[str, object], x.values)
+        if "_memo" not in values:
+            values["_memo"] = self.ball()
+        return cast(flint.arb, values["_memo"])
+
+
+def test_each_run_gets_its_own_copy_of_the_point() -> None:
+    cert = ball_cert("-2", "-1")
+    result = check_certificate(partial(PointMemo, drift), cert)
+    assert not result.accepted
+    assert "do not agree" in result.reason
+    assert cert.point.values == {}
+
+
+class Unprintable(Exception):
+    def __str__(self) -> str:
+        raise ValueError("cannot print")
+
+
+@pytest.mark.parametrize("exc", [Unprintable(), SystemExit(3)])
+def test_check_answers_whatever_the_encoding_raises(exc: BaseException) -> None:
+    def boom() -> flint.arb:
+        raise exc
+
+    result = check_certificate(partial(BallToy, boom), ball_cert("-1", "-1"))
+    assert not result.accepted
+    assert type(exc).__name__ in result.reason
+    result = check_kill(partial(BallToy, boom), lambda: BallToy(boom), ball_cert("-1", "-1"))
+    assert not result.accepted
+
+
+class AlwaysBelow(flint.arb):
+    """An arb whose comparisons say it lies below anything."""
+
+    def __lt__(self, other: object) -> bool:
+        return True
+
+
+class AlwaysEqual(Fraction):
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        return False
+
+    def __ge__(self, other: object) -> bool:
+        return False
+
+
+class TupleLike(tuple[flint.arb, flint.arb]):
+    pass
+
+
+def test_subclasses_of_the_returned_types_rejected() -> None:
+    result = check_certificate(partial(BallToy, lambda: AlwaysBelow(1)), ball_cert("1", "1"))
+    assert not result.accepted
+    assert "not an arb" in result.reason
+
+    class SubExact(Toy):
+        def exact_margin(self, x: Instance) -> Fraction:
+            return AlwaysEqual(1, 5)
+
+    result = check_certificate(SubExact, ExactCertificate(point=POINT, margin=Fraction(-1)))
+    assert not result.accepted
+    assert "not a Fraction" in result.reason
+
+    def wrapped() -> tuple[flint.arb, flint.arb]:
+        return TupleLike(exact("-1"))
+
+    result = check_certificate(partial(DualToy, wrapped), dual_cert("-1", "-1", "-1"))
+    assert not result.accepted
+    assert "not two arb balls" in result.reason
+
+
+def test_factory_must_not_change_the_precision() -> None:
+    before = (mpmath.mp.dps, flint.ctx.prec)
+
+    def make() -> BallToy:
+        mpmath.mp.dps = 7
+        flint.ctx.dps = 7
+        return BallToy(lambda: flint.arb(-1))
+
+    result = check_certificate(make, ball_cert("-1", "-1"))
+    assert not result.accepted
+    assert "changed the working precision" in result.reason
+    assert (mpmath.mp.dps, flint.ctx.prec) == before
+
+
+def test_duality_gap_is_measured_against_the_bounds() -> None:
+    # Bounds -1e-30 and -1e-28: the gap is 99 times the upper bound. A claim
+    # inflated within the tolerance must not make the gap look small.
+    def wide() -> tuple[flint.arb, flint.arb]:
+        return flint.arb("-1e-30"), flint.arb("-1e-28")
+
+    result = check_certificate(partial(DualToy, wide), dual_cert("-1e-30", "-1e-28", "-1.0005e-25"))
+    assert not result.accepted
+    assert "duality gap" in result.reason

@@ -28,7 +28,8 @@ def check_exact_margin(enc: Encoding, cert: ExactCertificate, point: Instance) -
     if not point.is_rational():
         return MarginCheck.failed(reject("an exact certificate needs a rational point"))
     margin = enc.exact_margin(point)
-    if not isinstance(margin, Fraction):  # pyright: ignore[reportUnnecessaryIsInstance]
+    # Exactly a Fraction: a subclass could override the comparisons below.
+    if type(margin) is not Fraction:  # pyright: ignore[reportUnnecessaryComparison]
         return MarginCheck.failed(
             reject(f"the exact margin is not a Fraction: {type(margin).__name__}")
         )

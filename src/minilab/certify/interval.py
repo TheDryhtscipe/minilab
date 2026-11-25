@@ -36,7 +36,8 @@ def check_interval_margin(enc: Encoding, cert: IntervalCertificate, point: Insta
     if low > high:
         return MarginCheck.failed(reject(f"the claimed enclosure is empty: [{low}, {high}]"))
     ball = enc.margin_ball(point)
-    if not isinstance(ball, flint.arb):  # pyright: ignore[reportUnnecessaryIsInstance]
+    # Exactly an arb: a subclass could override the comparisons below.
+    if type(ball) is not flint.arb:  # pyright: ignore[reportUnnecessaryComparison]
         return MarginCheck.failed(reject(f"the ball margin is not an arb: {type(ball).__name__}"))
     if not ball.is_finite():
         return MarginCheck.failed(reject(f"the margin enclosure is not finite: {ball}"))

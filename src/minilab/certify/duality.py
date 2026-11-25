@@ -13,7 +13,7 @@ from minilab.encoding.api import MAX_DIGITS, DualBounds, Encoding, Instance, to_
 # "Falsifier"). Float precision gave the pilot its spurious ratios.
 MIN_DUALITY_DIGITS = 30
 
-# The gap between the bounds must be smaller than this share of the violation.
+# The gap between the bounds must be smaller than this share of the upper bound.
 GAP_SHARE = 1000
 
 # A claimed bound matches the recomputed ball if it lies within
@@ -45,7 +45,7 @@ def check_duality_margin(enc: Encoding, cert: DualityCertificate, point: Instanc
     its recomputed ball; the highest point of the two balls lies below zero; the
     claimed violation is negative and lies between the bounds, give or take the
     tolerance; and the gap between the lowest and highest points of the balls
-    is certainly smaller than 1/1000 of the violation.
+    is certainly smaller than 1/1000 of the upper bound's distance from zero.
 
     The sign test is rigorous if the encoding's balls are honest: the margin
     lies at or below the highest point of the two balls.
@@ -72,10 +72,11 @@ def check_duality_margin(enc: Encoding, cert: DualityCertificate, point: Instanc
         return MarginCheck.failed(reject(f"a claimed value is not a number: {exc}"))
     # Encoding code is untrusted: check the shape of what it returns.
     bounds = cast(object, enc.primal_dual(point))
+    # Exact types: a subclass could override iteration or the comparisons below.
     if not (
-        isinstance(bounds, tuple)
+        type(bounds) is tuple
         and len(cast(tuple[object, ...], bounds)) == 2
-        and all(isinstance(b, flint.arb) for b in cast(tuple[object, ...], bounds))
+        and all(type(b) is flint.arb for b in cast(tuple[object, ...], bounds))
     ):
         return MarginCheck.failed(
             reject(f"the primal and dual bounds are not two arb balls: {bounds!r:.100}")
@@ -110,11 +111,13 @@ def check_duality_margin(enc: Encoding, cert: DualityCertificate, point: Instanc
             )
         )
     gap = high - low
-    if not gap * GAP_SHARE < abs(claim):
+    # Against the recomputed upper bound, not the claim: the tolerance would
+    # let a claim be inflated past both bounds.
+    if not gap * GAP_SHARE < abs(high):
         return MarginCheck.failed(
             reject(
                 f"the duality gap {gap.upper().str(5, radius=False)} is not below "
-                f"1/{GAP_SHARE} of the violation {cert.violation}"
+                f"1/{GAP_SHARE} of the upper bound {show(high)}"
             )
         )
     return MarginCheck(
