@@ -5,9 +5,10 @@ Build plan doc-5wh, Task 11; design doc-gmj, stage 5.
 A family other than the formaliser's, never Gemini (`pick_checker`),
 translates the Lean file into English. Its prompt holds only the Lean source
 with its comments removed: never the record's statement, its assumptions, or
-any comment the formaliser wrote. Names and string literals in the source
-stay, so the formaliser can still carry some of the original wording in
-them; the round trip narrows that channel, it does not close it.
+any comment the formaliser wrote. The command check refuses string
+literals, but names in the source stay, so the formaliser can still carry
+some of the original wording in them; the round trip narrows that channel,
+it does not close it.
 The record keeps both texts, so the reviewer can compare them.
 """
 
