@@ -6,3 +6,6 @@ doca.sqlite*
 
 # Search indexes
 index/
+
+# DOCA log and its rotations (written on every DOCA call)
+doca.log*
