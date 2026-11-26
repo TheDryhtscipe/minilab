@@ -68,6 +68,7 @@ from minilab.scheduler import Pair, canonical_pair
 
 __all__ = [
     "ENV_ALLOWLIST",
+    "GEMINI_ROLES",
     "ROLE_STAGE",
     "Budget",
     "BudgetExceeded",
@@ -76,7 +77,6 @@ __all__ = [
     "ModelUnavailable",
     "NoChecker",
     "Role",
-    "GEMINI_ROLES",
     "RoleNotAllowed",
     "call",
     "default_backends",
