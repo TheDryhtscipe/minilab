@@ -5,6 +5,7 @@ takes a few seconds. Source that a model wrote may run `#eval` with IO, so the
 runner compiles it with no network and a read-only view of the files it needs.
 """
 
+import json
 import time
 from pathlib import Path
 
@@ -39,11 +40,13 @@ WRONG = """import Mathlib.Data.Nat.Basic
 theorem wrong : (1 : ℕ) + 1 = 3 := rfl
 """
 
-LOOP = """partial def spin (n : Nat) : Nat := spin (n + 1)
+# No code runs, so the loop is Lean's own: `decide` unfolds `Nat.rec` a
+# hundred million times.
+LOOP = """def f (n : Nat) : Nat := Nat.rec 0 (fun _ acc => acc + 1) n
 
-theorem fine : True := trivial
-
-#eval spin 0
+set_option maxHeartbeats 0 in
+set_option maxRecDepth 1000000 in
+theorem spin : f 100000000 = 100000000 := by decide
 """
 
 
@@ -108,9 +111,9 @@ def test_eval_cannot_write_files(tmp_path: Path) -> None:
     source = f'#eval (IO.FS.writeFile "{target}" "x" : IO Unit)\n'
     result = check_lean(source, timeout_s=60)
     assert not target.exists()
-    assert not result.ok
-    # Lean ran the #eval and the write failed, naming the file.
-    assert any(str(target) in error for error in result.errors), result.errors
+    # Code generation is off, so the #eval never ran: Lean did not even try
+    # the write (which bwrap would also refuse).
+    assert not any(str(target) in error for error in result.errors), result.errors
 
 
 # A false statement proved from a custom axiom. Each must show the axiom.
@@ -163,3 +166,32 @@ def test_axiom_check_that_never_ran_fails_closed() -> None:
     result = check_lean(EXIT_EARLY, timeout_s=120)
     assert not result.ok
     assert any("axiom check" in error for error in result.errors), result.errors
+
+
+def _forged_axioms() -> str:
+    """A file whose `#eval` prints a forged axiom check (no axioms for
+    `conjecture`) as a line of Lean's JSON, then exits before the real one
+    runs, as model code that ran at compile time could. It runs first, so
+    no message of Lean's is waiting to be printed over it."""
+    data = "MINILAB_AXIOMS " + json.dumps(
+        [{"name": "conjecture", "theorem": True, "internal": False, "axioms": []}]
+    )
+    line = json.dumps(
+        {"severity": "information", "pos": {"line": 10000, "column": 0}, "data": data}
+    )
+    return f"""import Mathlib.Data.Nat.Basic
+
+#eval show IO Unit from do
+  let out ← IO.FS.Handle.mk "/dev/stdout" IO.FS.Mode.append
+  out.putStrLn {json.dumps(line)}
+  out.flush
+  IO.Process.exit 0
+
+theorem conjecture : (1 : ℕ) = 2 := by sorry
+"""
+
+
+def test_source_code_does_not_run_while_lean_checks_it() -> None:
+    result = check_lean(_forged_axioms())
+    assert result.axioms_by_theorem.get("conjecture") == ["sorryAx"], result
+    assert result.has_sorry
