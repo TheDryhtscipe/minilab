@@ -925,9 +925,13 @@ def test_stage_refuses_a_lean_file_that_changed(store: RecordStore) -> None:
 # --- live: the pilot cases (design doc-gmj, "Pilot validation") ---
 
 
-def _flag_runs(store: RecordStore, source: str, runs: int = 3) -> list[ScreenResult]:
+def _flag_runs(
+    store: RecordStore,
+    source: str,
+    runs: int = 3,
+    families: tuple[Family, ...] = (Family.claude, Family.codex),
+) -> list[ScreenResult]:
     # The user's runs have no local model (decision of 2026-11-26, bead minilab-a32a1c).
-    families = (Family.claude, Family.codex)
     results: list[ScreenResult] = []
     ledger = make_ledger(store, families)
     for i in range(runs):
@@ -944,7 +948,11 @@ def _flag_runs(store: RecordStore, source: str, runs: int = 3) -> list[ScreenRes
             )
         )
     for result in results:
-        print(result.model_dump_json(include={"proved", "proved_by", "corollary_of", "attempts"}))
+        print(
+            result.model_dump_json(
+                include={"proved", "proved_by", "corollary_of", "attempts", "notes"}
+            )
+        )
     return results
 
 
@@ -957,4 +965,22 @@ def test_s1_flagged_trivial(store: RecordStore) -> None:
 @pytest.mark.live
 def test_s8_flagged_trivial(store: RecordStore) -> None:
     results = _flag_runs(store, S8)
+    assert sum(r.proved for r in results) >= 2
+
+
+# Gemini as the frontier prover: a run without Claude (bead minilab-1e3a18).
+GEMINI_RUN = (Family.gemini, Family.codex)
+
+
+@pytest.mark.live
+def test_s1_flagged_trivial_with_gemini_proving(store: RecordStore) -> None:
+    results = _flag_runs(store, S1, families=GEMINI_RUN)
+    assert all("the frontier prover was gemini" in r.notes for r in results)
+    assert sum(r.proved for r in results) >= 2
+
+
+@pytest.mark.live
+def test_s8_flagged_trivial_with_gemini_proving(store: RecordStore) -> None:
+    results = _flag_runs(store, S8, families=GEMINI_RUN)
+    assert all("the frontier prover was gemini" in r.notes for r in results)
     assert sum(r.proved for r in results) >= 2
