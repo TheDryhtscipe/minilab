@@ -19,7 +19,7 @@ from typing import cast
 import pytest
 from pydantic import JsonValue
 
-from minilab.formalise.audit import AuditResult, HiddenCondition
+from minilab.formalise.audit import AuditedHypothesis, AuditResult, HiddenCondition
 from minilab.formalise.formaliser import FormalOutput, formal_from_source
 from minilab.formalise.vacuity import VacuityResult, WitnessCheck
 from minilab.ledger import Ledger
@@ -354,6 +354,18 @@ def test_proved_mode_refuses_sorry_and_needs_a_proof() -> None:
 # --- the hold rule (bead minilab-224a47) ---
 
 
+HX: dict[str, JsonValue] = {
+    "index": 1,
+    "name": "hx",
+    "label": "hx",
+    "type": "0 < x",
+    "prop": True,
+    "instance": False,
+    "deps": [0],
+}
+"""A hypothesis binder, as the formaliser stage records one."""
+
+
 def clean_audit() -> AuditResult:
     return AuditResult(
         hypotheses=[],
@@ -399,7 +411,7 @@ def formaliser_data(
         "audit": cast(dict[str, JsonValue], a.model_dump(mode="json")),
         "weakenings": cast(list[JsonValue], list(a.weakenings)),
         "vacuity": cast(dict[str, JsonValue], v.model_dump(mode="json")),
-        "binders": [],
+        "binders": cast(list[JsonValue], [HX]),
     }
 
 
@@ -427,20 +439,13 @@ def test_clean_formalisation_has_no_hold_reasons() -> None:
         (
             formaliser_data(
                 vacuity=clean_vacuity().model_copy(
-                    update={
-                        "satisfied_by_witness": False,
-                        "witness": [WitnessCheck(label="hx", state="fails")],
-                    }
+                    update={"witness": [WitnessCheck(label="hx", state="fails")]}
                 )
             ),
             "witness",
         ),
         (
-            formaliser_data(
-                vacuity=clean_vacuity().model_copy(
-                    update={"satisfied_by_witness": False, "unwitnessed": ["v"]}
-                )
-            ),
+            formaliser_data(vacuity=clean_vacuity().model_copy(update={"unwitnessed": ["v"]})),
             "witness",
         ),
         (
@@ -455,7 +460,69 @@ def test_clean_formalisation_has_no_hold_reasons() -> None:
             formaliser_data(vacuity=clean_vacuity().model_copy(update={"witness": []})),
             "witness",
         ),
+        (
+            formaliser_data(
+                vacuity=clean_vacuity().model_copy(update={"satisfied_by_witness": False})
+            ),
+            "witness",
+        ),
+        (
+            formaliser_data(vacuity=clean_vacuity().model_copy(update={"checked": False})),
+            "witness",
+        ),
+        (
+            formaliser_data(vacuity=clean_vacuity().model_copy(update={"timed_out": True})),
+            "witness",
+        ),
+        (formaliser_data(clean_audit().model_copy(update={"judged": False})), "could not be read"),
+        (
+            formaliser_data(
+                clean_audit().model_copy(
+                    update={
+                        "hypotheses": [
+                            AuditedHypothesis(
+                                label="h1", type="0 < x", kind="unjudged", by="checker"
+                            )
+                        ]
+                    }
+                )
+            ),
+            "h1",
+        ),
+        (
+            formaliser_data(
+                clean_audit().model_copy(
+                    update={
+                        "hypotheses": [
+                            AuditedHypothesis(
+                                label="hw", type="x < 1", kind="weakening", by="checker"
+                            )
+                        ]
+                    }
+                )
+            ),
+            "hw",
+        ),
+        (formaliser_data(clean_audit().model_copy(update={"extra": ["h9"]})), "h9"),
+        (formaliser_data(clean_audit().model_copy(update={"reasons": ["odd"]})), "odd"),
+        (formaliser_data(vacuity=clean_vacuity().model_copy(update={"unused": ["h2"]})), "h2"),
+        ({**formaliser_data(), "weakenings": ["x < 1"]}, "x < 1"),
+        (
+            {
+                **formaliser_data(),
+                "vacuity": {
+                    k: v
+                    for k, v in clean_vacuity().model_dump(mode="json").items()
+                    if k != "unwitnessed"
+                },
+            },
+            "could not be read",
+        ),
         ({"rejected": False, "audit": "garbled", "vacuity": None}, "could not be read"),
+        (
+            {"rejected": False, "vacuity": clean_vacuity().model_dump(mode="json")},
+            "could not be read",
+        ),
     ],
 )
 def test_flags_are_hold_reasons(data: dict[str, JsonValue], word: str) -> None:
@@ -475,7 +542,12 @@ def screened_record(
     `source`, as the formaliser stage does.
     """
     if data.get("rejected") is False:
-        data = {**data, "lean_statement": probed(source).lean_statement}
+        formal = probed(source)
+        data = {
+            **data,
+            "lean_statement": formal.lean_statement,
+            "binders": cast(list[JsonValue], [b.model_dump(mode="json") for b in formal.binders]),
+        }
     record = make_record(local)
     store.create(record)
     now = datetime(2026, 11, 26, 13, 0, tzinfo=UTC)
@@ -508,8 +580,27 @@ def run_stage(store: RecordStore, record: Record, backends: Mapping[Family, Fake
     )
 
 
+# What the vacuity linter writes for a theorem with no hypotheses.
+NO_HYPOTHESES = VacuityResult(
+    contradictory=False,
+    satisfied_by_witness=False,
+    witness=[],
+    unused=[],
+    timed_out=False,
+    notes=[],
+)
+
+# Proved by `exact?` (`exact hx`).
+WITH_HYPOTHESIS = """import Mathlib
+
+theorem conjecture (x : ℝ) (hx : 0 < x) : 0 < x := by
+  sorry
+"""
+
+
 def test_unflagged_proof_sets_trivial(store: RecordStore) -> None:
-    record = screened_record(store, EASY, formaliser_data())
+    # EASY has no hypotheses, so the empty witness list is no flag (user decision).
+    record = screened_record(store, EASY, formaliser_data(vacuity=NO_HYPOTHESES))
     run_stage(store, record, fakes({}))
     after = store.load(record.id)
     assert after.status is Status.trivial
@@ -520,6 +611,23 @@ def test_unflagged_proof_sets_trivial(store: RecordStore) -> None:
     assert out.data["proved_by"] in TACTICS
     proof_file = store.root / "runs" / RUN / out.evidence[0]
     assert "sorry" not in proof_file.read_text(encoding="utf-8")
+
+
+def test_proof_with_hypotheses_but_no_witness_is_held(store: RecordStore) -> None:
+    record = screened_record(store, WITH_HYPOTHESIS, formaliser_data(vacuity=NO_HYPOTHESES))
+    run_stage(store, record, fakes({}))
+    after = store.load(record.id)
+    assert after.status is Status.survived
+    data = after.stages[Stage.triviality].data
+    assert data["held"] is True and data["trivial"] is False
+    reasons = data["hold_reasons"]
+    assert isinstance(reasons, list) and any("witness" in str(r) for r in reasons)
+
+
+def test_no_hypotheses_needs_readable_binders() -> None:
+    data = {**formaliser_data(vacuity=NO_HYPOTHESES), "binders": []}
+    assert hold_reasons(data) == []
+    assert any("binders" in r for r in hold_reasons({**data, "binders": "garbled"}))
 
 
 def test_flagged_proof_is_held_not_trivial(store: RecordStore) -> None:
@@ -546,7 +654,8 @@ def test_screen_failure_leaves_status(store: RecordStore) -> None:
     assert data["trivial"] is False
     assert data["held"] is False
     assert data["proof"] is None
-    assert isinstance(data["near_misses"], list)
+    # `nlinarith` compiles with one Lean error: the local model nearly succeeded.
+    assert data["near_misses"] == ["local"]
     assert isinstance(data["attempts"], list) and data["attempts"]
 
 

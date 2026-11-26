@@ -20,9 +20,12 @@ Every candidate proof goes into the formaliser's own file in place of its
 the same text gate, command check, probe, and axiom check as the formaliser
 stage, and no `sorry` anywhere. A candidate counts only if the proved file
 also matches the original: the same definitions (as Lean printed them),
-binders, conclusion, `open`s, statement, and theorems. So a model's proof
-cannot close the theorem early and add a definition, a second theorem, or
-anything else that changes what was proved. The prompts show what Lean
+binders, conclusion, `open`s, statement, and theorems (leaving out the
+equation lemmas Lean makes for a definition when a proof uses it). Lean
+fixes `conjecture`'s type before it reads the proof, so nothing a proof adds
+can change what was proved; this comparison is a second guard, and keeps
+the proved file the one the formaliser stage checked, with no new
+definition or theorem after the proof. The prompts show what Lean
 printed (`lean_view`), never the model-written source.
 
 A Lean time-out on a candidate is that candidate's outcome (`timed_out`),
@@ -31,13 +34,16 @@ not an error. A model failure (`ModelUnavailable`) or a spent budget
 
 `near_misses` (which the scorer counts, `score.py`) names each screen that
 nearly succeeded: a tactic or model proof that timed out, and a model proof
-that Lean refused with exactly one error. Each name appears once.
+that compiled with exactly one Lean error. A proof the text gate or the
+command check refused (a parse error among them) is `refused` and is not a
+near miss. Each name appears once.
 
 `run_triviality_stage` runs the screen on a formalised survivor and writes
 the record's triviality stage. A proof sets the status `trivial`, unless
 the formaliser stage flagged the formalisation (`hold_reasons`): then the
 record stays `survived`, held for the user's review with the proof and the
-reasons, and the prover skips it (user decision on bead minilab-a32a1c).
+reasons (user decision on bead minilab-a32a1c). The prover (Task 13, bead
+minilab-880beb) must skip a held record; nothing before it does.
 """
 
 import json
@@ -48,11 +54,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast
 
-from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError
+from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter, ValidationError
 
 from minilab.formalise.audit import AuditResult
 from minilab.formalise.formaliser import (
     DEFAULT_LEAN_TIMEOUT_S,
+    Binder,
     FormalOutput,
     LeanTimeout,
     extract_lean,
@@ -131,8 +138,8 @@ def with_proof(source: str, tactics: str) -> str:
 
 
 _GENERATED = re.compile(
-    r"\.(?:eq_\d+|eq_def|eq_unfold|congr_eq_\d+|induct|mutual_induct|induct_unfolding"
-    r"|fun_cases|fun_cases_unfolding)$"
+    r"(?:match_\d+\.)?(?:eq_\d+|eq_def|eq_unfold|congr_eq_\d+|induct|mutual_induct"
+    r"|induct_unfolding|fun_cases|fun_cases_unfolding)"
 )
 """The last parts of the equation and induction lemmas Lean makes on demand for
 a definition, the first time a proof uses them (`simp [g]` makes `g.eq_1`).
@@ -145,7 +152,10 @@ def _declared(formal: FormalOutput) -> list[str]:
         name
         for name in formal.theorems
         if not (
-            _GENERATED.search(name) and any(name.startswith(d + ".") for d in formal.definitions)
+            any(
+                name.startswith(d + ".") and _GENERATED.fullmatch(name[len(d) + 1 :])
+                for d in formal.definitions
+            )
         )
     ]
 
@@ -196,8 +206,9 @@ def _check(
         candidate = with_proof(original.source, tactics)
     except ValueError as exc:
         return _Checked(outcome="refused", detail=str(exc))
-    if candidate in cache:
-        return cache[candidate]
+    cached = cache.get(candidate)
+    if cached is not None and cached.outcome != "timed_out":
+        return cached
     try:
         out = formal_from_source(
             candidate, original.family, original.model, timeout_s=timeout_s, proved=True
@@ -430,20 +441,50 @@ def screen(
 # --- the hold rule (bead minilab-224a47) ---
 
 
+_BINDERS: TypeAdapter[list[Binder]] = TypeAdapter(list[Binder])
+
+
+def _complete(raw: JsonValue, model: type[BaseModel]) -> bool:
+    """Whether `raw` is an object that gives every field of `model`, defaults included."""
+    return isinstance(raw, dict) and set(model.model_fields) <= raw.keys()
+
+
 def hold_reasons(formaliser_data: Mapping[str, JsonValue]) -> list[str]:
     """Why a proof of this formalisation must be held for review, not set trivial.
 
-    Reads the formaliser stage's `audit` and `vacuity`. Any weakening or
-    hidden condition the audit found, and any doubt about the falsifier's
-    witness (it failed a hypothesis, left one undecided or not instantiated,
-    gave no value to a variable, or checked no hypothesis at all), is a
-    reason. So is either field failing to parse: the rule fails closed.
-    Empty if the formalisation is clean.
+    Reads the formaliser stage's `audit`, `vacuity`, and `weakenings`, and
+    works from their raw fields, not only from their summaries. A reason is:
+    any hypothesis the audit did not judge `matches` (a weakening among
+    them), any hidden condition, any audit reason or rejection, an
+    unreadable checker reply; contradictory or unused binders, a vacuity
+    check that did not finish, and any doubt about the falsifier's witness
+    (it failed a hypothesis, left one undecided or not instantiated, gave no
+    value to a variable, or checked no hypothesis at all). A theorem with no
+    hypotheses has nothing to check at the witness, so for it an empty
+    witness list is not a reason (user decision on bead minilab-a32a1c);
+    whether it has hypotheses is read from the binders Lean printed
+    (`binders`), never from the linter's list. It fails closed:
+    `audit` or `vacuity` that does not parse, or that leaves out a field
+    (so a default would stand in for it), is a reason too. Empty if the
+    formalisation is clean.
     """
     reasons: list[str] = []
     try:
-        audit = AuditResult.model_validate(formaliser_data.get("audit"))
+        binders = _BINDERS.validate_python(formaliser_data.get("binders"))
     except ValidationError:
+        reasons.append("the formaliser stage's binders could not be read")
+        hypotheses = True
+    else:
+        hypotheses = any(b.prop for b in binders)
+    top = formaliser_data.get("weakenings")
+    if top != []:
+        reasons.append(f"the formaliser stage lists weakenings: {json.dumps(top)[:500]}")
+    raw_audit = formaliser_data.get("audit")
+    try:
+        if not _complete(raw_audit, AuditResult):
+            raise ValueError("a field is missing")
+        audit = AuditResult.model_validate(raw_audit)
+    except (ValidationError, ValueError):
         reasons.append("the formaliser stage's audit could not be read")
     else:
         reasons += [f"the audit found a weakening: {w}" for w in audit.weakenings]
@@ -452,24 +493,34 @@ def hold_reasons(formaliser_data: Mapping[str, JsonValue]) -> list[str]:
             for c in audit.hidden
         ]
         reasons += [
-            f"the audit judged hypothesis {h.label} {h.kind}"
+            f"the audit judged hypothesis {h.label} ({h.type}) {h.kind}"
             for h in audit.hypotheses
-            if h.kind not in ("matches", "weakening")
+            if h.kind != "matches"
         ]
+        if audit.extra:
+            reasons.append("the audit lists extra hypotheses: " + ", ".join(audit.extra))
+        reasons += [f"the audit says: {r}" for r in audit.reasons]
         if not audit.judged:
             reasons.append("the audit's checker reply could not be read")
         if audit.rejected:
             reasons.append("the audit rejected the formalisation")
+    raw_vacuity = formaliser_data.get("vacuity")
     try:
-        vacuity = VacuityResult.model_validate(formaliser_data.get("vacuity"))
-    except ValidationError:
+        if not _complete(raw_vacuity, VacuityResult):
+            raise ValueError("a field is missing")
+        vacuity = VacuityResult.model_validate(raw_vacuity)
+    except (ValidationError, ValueError):
         reasons.append("the formaliser stage's vacuity check, with its witness, could not be read")
     else:
         if not vacuity.checked or vacuity.timed_out:
             reasons.append("the vacuity check did not finish, so the witness was not checked")
         if vacuity.contradictory:
             reasons.append("the hypotheses contradict each other")
-        if not vacuity.satisfied_by_witness:
+        if vacuity.unused:
+            reasons.append(
+                "binders that cannot bear on the conclusion: " + ", ".join(vacuity.unused)
+            )
+        if hypotheses and not vacuity.satisfied_by_witness:
             reasons.append("the falsifier's witness does not satisfy the hypotheses")
         reasons += [
             f"the witness check of {w.label} is {w.state}"
@@ -478,7 +529,7 @@ def hold_reasons(formaliser_data: Mapping[str, JsonValue]) -> list[str]:
         ]
         if vacuity.unwitnessed:
             reasons.append("the witness gave no value to: " + ", ".join(vacuity.unwitnessed))
-        if not vacuity.witness:
+        if hypotheses and not vacuity.witness:
             reasons.append("no hypothesis was checked at the witness")
     return reasons
 
@@ -548,8 +599,9 @@ def run_triviality_stage(
 
     The stage's data: `screened`, `trivial`, `held`, `hold_reasons`,
     `reasons`, `proved_by`, `proof`, `corollary_of`, `near_misses`, and
-    `attempts`. A model failure or a Lean time-out on the re-check raises
-    before anything is written. Return the screen's result, or None if
+    `attempts`. A model failure or a Lean time-out on the re-check raises,
+    leaving the record unchanged (the ledger still holds the charge of
+    each model call that finished). Return the screen's result, or None if
     nothing was screened.
     """
     store = ledger.store
