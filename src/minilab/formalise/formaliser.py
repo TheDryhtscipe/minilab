@@ -390,11 +390,12 @@ def _statement_span(code: str) -> tuple[int, int] | None:
 
 
 def sorry_proof_span(source: str) -> tuple[int, int] | None:
-    """Where `conjecture`'s `:=` starts and its one `sorry` ends, in `source`.
+    """Where `conjecture`'s `:=` starts and its one `sorry` ends, in `strip_comments(source)`.
 
-    None unless the file states `conjecture` and its proof uses `sorry`
-    exactly once after the `:=`. Comments and strings are skipped, as in
-    `source_problems`.
+    The positions are in the text without comments, not in `source`: removing
+    a comment shortens the text. None unless the file states `conjecture` and
+    its proof uses `sorry` exactly once after the `:=`. Strings are skipped,
+    as in `source_problems`.
     """
     _, code = _scan(source)
     span = _statement_span(code)

@@ -67,6 +67,7 @@ from minilab.formalise.formaliser import (
     formal_from_source,
     lean_view,
     sorry_proof_span,
+    strip_comments,
 )
 from minilab.formalise.vacuity import VacuityResult
 from minilab.ledger import Ledger
@@ -122,19 +123,20 @@ class ScreenResult(BaseModel):
 
 
 def with_proof(source: str, tactics: str) -> str:
-    """`source` with `conjecture`'s proof replaced by `tactics`.
+    """`source` without comments, with `conjecture`'s proof replaced by `tactics`.
 
     Everything from the `:=` to the end of the one `sorry` becomes `:= by`
-    and the tactic lines, dedented and indented two spaces. The rest of the
-    file is kept as it was. Raise ValueError if the file has no such
-    `sorry`.
+    and the tactic lines, dedented and indented two spaces. Comments are
+    removed (Lean checks the file without them anyway); the rest is kept as
+    it was. Raise ValueError if the file has no such `sorry`.
     """
+    text = strip_comments(source)
     span = sorry_proof_span(source)
     if span is None:
         raise ValueError("the file has no `conjecture` proved by one `sorry`")
     body = textwrap.dedent(tactics).strip("\n")
     lines = "\n".join(f"  {line}" if line.strip() else "" for line in body.splitlines())
-    return source[: span[0]] + ":= by\n" + lines + source[span[1] :]
+    return text[: span[0]] + ":= by\n" + lines + text[span[1] :]
 
 
 _GENERATED = re.compile(

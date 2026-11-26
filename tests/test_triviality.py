@@ -334,6 +334,22 @@ def test_with_proof_replaces_only_the_sorry() -> None:
     assert proved.rstrip().endswith(INDUCTION_PROOF)
 
 
+def test_with_proof_handles_comments_before_the_theorem() -> None:
+    # Removing a comment shortens the text; the proof must still replace the sorry.
+    source = NEEDS_INDUCTION.replace("def g", "/-- A doc comment\n over two lines. -/\ndef g")
+    proved = with_proof(source, INDUCTION_PROOF)
+    assert "sorry" not in proved
+    assert "def g : ℕ → ℕ\n  | 0 => 1" in proved
+    assert proved.rstrip().endswith(INDUCTION_PROOF)
+
+
+def test_pilot_fixtures_take_a_proof() -> None:
+    for source in (S1, S8):
+        proved = with_proof(source, "simp")
+        assert "sorry" not in proved
+        assert ":= by\n  simp\n" in proved
+
+
 def test_proved_mode_refuses_sorry_and_needs_a_proof() -> None:
     sorry_file = formal_from_source(EASY, Family.claude, "m", timeout_s=LEAN_TIMEOUT, proved=True)
     assert not sorry_file.ok
@@ -706,8 +722,8 @@ def test_stage_refuses_a_lean_file_that_changed(store: RecordStore) -> None:
 def _flag_runs(store: RecordStore, source: str, runs: int = 3) -> list[ScreenResult]:
     families = (Family.claude, Family.codex, Family.local)
     results: list[ScreenResult] = []
+    ledger = make_ledger(store, families)
     for i in range(runs):
-        ledger = make_ledger(store, families)
         record = make_record(f"live{i}")
         store.create(record)
         results.append(
