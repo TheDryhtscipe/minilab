@@ -262,16 +262,24 @@ def test_call_charges_reply_tokens_to_role_stage(store: RecordStore, ledger: Led
     assert charge.record_id == f"{RUN}.a"
 
 
-def test_gemini_refused_for_every_role_but_generate(ledger: Ledger) -> None:
+def test_gemini_refused_for_every_role_but_generate_and_screen(ledger: Ledger) -> None:
+    # Gemini generates, and makes proof attempts in the triviality screen
+    # (Lean checks every proof). Every other role, the screen's corollary
+    # check included, is refused.
     backend = FakeBackend(Family.gemini)
+    allowed = {Role.generate, Role.screen}
     for role in Role:
-        if role is Role.generate:
+        if role in allowed:
             continue
         with pytest.raises(RoleNotAllowed):
             _call(ledger, backend, role=role)
+    with pytest.raises(RoleNotAllowed):
+        _call(ledger, backend, role=Role.corollary)
     assert backend.calls == 0
     _call(ledger, backend, role=Role.generate)
-    assert backend.calls == 1
+    _call(ledger, backend, role=Role.screen)
+    assert backend.calls == 2
+    assert [c.stage for c in ledger.charges()] == [Stage.generator, Stage.triviality]
 
 
 def test_record_of_other_pair_refused_before_call(store: RecordStore, ledger: Ledger) -> None:

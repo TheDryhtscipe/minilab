@@ -23,8 +23,8 @@ from minilab.formalise.audit import AuditedHypothesis, AuditResult, HiddenCondit
 from minilab.formalise.formaliser import FormalOutput, formal_from_source
 from minilab.formalise.vacuity import VacuityResult, WitnessCheck
 from minilab.ledger import Ledger
-from minilab.models.adapter import Budget
-from minilab.models.backends import ModelReply, ModelUnavailable
+from minilab.models.adapter import Budget, Role
+from minilab.models.backends import Backend, ModelReply, ModelUnavailable
 from minilab.records import (
     Family,
     Provenance,
@@ -35,8 +35,11 @@ from minilab.records import (
     Status,
 )
 from minilab.run import MemoryPolicy, RunManifest, save_manifest
+from minilab.scheduler import Pair
+from minilab.screen import triviality
 from minilab.screen.triviality import (
     FRONTIER_ATTEMPTS,
+    LOCAL_ATTEMPTS,
     TACTICS,
     ScreenResult,
     frontier_prover,
@@ -360,9 +363,28 @@ def test_frontier_gets_three_attempts_with_feedback(store: RecordStore) -> None:
     assert [a.screen for a in result.attempts[len(TACTICS) :]] == ["frontier"] * 3
 
 
-def test_frontier_is_codex_when_claude_is_not_in_the_run(store: RecordStore) -> None:
+def test_frontier_is_gemini_when_claude_is_not_in_the_run(store: RecordStore) -> None:
+    # Gemini comes before Codex, which keeps Codex's budget for checking.
     backends = fakes({"prove": [lean_block(INDUCTION_PROOF)]})
     result = run_screen(store, NEEDS_INDUCTION, backends, (Family.codex, Family.gemini))
+    assert result.proved and result.proved_by == "frontier"
+    assert [f for f, _ in calls(backends, "prove")] == [Family.gemini]
+    assert "the frontier prover was gemini" in result.notes
+
+
+def test_gemini_gets_three_attempts_then_the_corollary_check_is_codex(
+    store: RecordStore,
+) -> None:
+    backends = fakes({"prove": [lean_block("simp")], "corollary": [corollary_reply(False)]})
+    result = run_screen(store, NEEDS_INDUCTION, backends, (Family.codex, Family.gemini))
+    assert not result.proved
+    assert [f for f, _ in calls(backends, "prove")] == [Family.gemini] * FRONTIER_ATTEMPTS
+    assert [f for f, _ in calls(backends, "corollary")] == [Family.codex]
+
+
+def test_frontier_is_codex_when_the_run_has_only_codex(store: RecordStore) -> None:
+    backends = fakes({"prove": [lean_block(INDUCTION_PROOF)]})
+    result = run_screen(store, NEEDS_INDUCTION, backends, (Family.codex,))
     assert result.proved and result.proved_by == "frontier"
     assert [f for f, _ in calls(backends, "prove")] == [Family.codex]
 
@@ -371,21 +393,66 @@ def test_frontier_is_codex_when_claude_is_not_in_the_run(store: RecordStore) -> 
     ("families", "prover"),
     [
         ((Family.claude, Family.codex, Family.local), Family.claude),
-        ((Family.codex, Family.claude), Family.claude),
+        ((Family.codex, Family.gemini, Family.claude), Family.claude),
+        ((Family.codex, Family.gemini), Family.gemini),
+        ((Family.gemini, Family.local), Family.gemini),
         ((Family.codex, Family.local), Family.codex),
-        ((Family.gemini, Family.local), None),
+        (("codex",), Family.codex),
+        ((Family.local,), None),
+        ((), None),
     ],
 )
-def test_frontier_prover_choice(families: tuple[Family, ...], prover: Family | None) -> None:
+def test_frontier_prover_choice(families: tuple[Family | str, ...], prover: Family | None) -> None:
     assert frontier_prover(families) is prover
 
 
 def test_no_frontier_family_skips_its_attempts(store: RecordStore) -> None:
     backends = fakes({"prove": [lean_block("simp")]})
-    result = run_screen(store, NEEDS_INDUCTION, backends, (Family.gemini, Family.local))
+    result = run_screen(store, NEEDS_INDUCTION, backends, (Family.local,))
     assert not result.proved
     assert [f for f, _ in calls(backends, "prove")] == [Family.local] * 3
-    assert any("neither Claude nor Codex" in note for note in result.notes)
+    assert any("neither Claude, Gemini nor Codex" in note for note in result.notes)
+
+
+def test_proofs_are_screen_calls_and_the_corollary_check_is_not(
+    store: RecordStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The adapter lets Gemini make `Role.screen` calls only, so the corollary
+    # check must use its own role.
+    seen: list[tuple[Family, Role, str]] = []
+    real_call = triviality.call
+
+    def spy(
+        family: Family | str,
+        role: Role,
+        prompt: str,
+        *,
+        record_id: str | None,
+        pair: Pair,
+        ledger: Ledger,
+        budget: Budget,
+        backends: Mapping[Family, Backend] | None = None,
+    ) -> ModelReply:
+        seen.append((Family(family), role, kind_of(prompt)))
+        return real_call(
+            family,
+            role,
+            prompt,
+            record_id=record_id,
+            pair=pair,
+            ledger=ledger,
+            budget=budget,
+            backends=backends,
+        )
+
+    monkeypatch.setattr(triviality, "call", spy)
+    backends = fakes({"prove": [lean_block("simp")], "corollary": [corollary_reply(False)]})
+    run_screen(store, NEEDS_INDUCTION, backends, (Family.codex, Family.gemini, Family.local))
+    assert seen == (
+        [(Family.local, Role.screen, "prove")] * LOCAL_ATTEMPTS
+        + [(Family.gemini, Role.screen, "prove")] * FRONTIER_ATTEMPTS
+        + [(Family.codex, Role.corollary, "corollary")]
+    )
 
 
 def test_frontier_proof_that_restates_the_theorem_is_used(store: RecordStore) -> None:
