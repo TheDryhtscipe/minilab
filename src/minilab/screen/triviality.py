@@ -12,10 +12,13 @@ minilab-224a47.
    shown its last proof and Lean's errors. They run only if the run's
    manifest has the local model; otherwise a note says they were skipped.
 3. three proof attempts by a frontier model (`frontier_prover`: Claude if
-   the run has it, else Codex), in the same way and with the same prompt.
-   Lean checks every proof, so the formaliser's own family may prove. They
-   are skipped, with a note, if the run has neither.
-4. one checker call (`pick_checker`, never the formaliser's family), asked
+   the run has it, else Gemini, else Codex, which keeps Codex's budget for
+   checking), in the same way and with the same prompt. Lean checks every
+   proof, so the formaliser's own family may prove, and so may Gemini, which
+   otherwise only generates (user decision 2026-11-26). They are skipped,
+   with a note, if the run has none of the three.
+4. one checker call (`pick_checker`, never the formaliser's family, never
+   Gemini; `Role.corollary`, which the adapter refuses to Gemini), asked
    whether the theorem is a corollary of a named Mathlib theorem, with a
    proof. A claim proves nothing until Lean checks the proof.
 
@@ -98,6 +101,10 @@ LOCAL_ATTEMPTS = 3
 
 FRONTIER_ATTEMPTS = 3
 """Proof attempts by the frontier prover (`frontier_prover`)."""
+
+FRONTIER_ORDER: tuple[Family, ...] = (Family.claude, Family.gemini, Family.codex)
+"""The frontier prover is the first of these the run has. Gemini runs with the
+Antigravity CLI's default model (no `--model`)."""
 
 Outcome = Literal["proved", "failed", "timed_out", "refused", "no_proof"]
 
@@ -363,9 +370,10 @@ def _indent(line: str) -> int:
 
 
 def frontier_prover(families: Iterable[Family | str]) -> Family | None:
-    """The frontier model that tries proofs: Claude if in `families`, else Codex, else None."""
+    """The frontier model that tries proofs: Claude if in `families`, else Gemini,
+    else Codex, else None."""
     available = {Family(f) for f in families}
-    for family in (Family.claude, Family.codex):
+    for family in FRONTIER_ORDER:
         if family in available:
             return family
     return None
@@ -464,7 +472,7 @@ def screen(
     prover = frontier_prover(families)
     if prover is None:
         notes.append(
-            f"the run has neither Claude nor Codex, so the {FRONTIER_ATTEMPTS} frontier "
+            f"the run has neither Claude, Gemini nor Codex, so the {FRONTIER_ATTEMPTS} frontier "
             "proof attempts were skipped"
         )
     else:
@@ -480,7 +488,7 @@ def screen(
         return result()
     reply = call(
         checker,
-        Role.screen,
+        Role.corollary,
         _corollary_prompt(formal),
         record_id=record.id,
         pair=record.pair,

@@ -9,7 +9,7 @@ Minilab is a filter-first search loop for cross-domain ML mathematics. Read the 
 - Never write markdown files except README.md, AGENTS.md, and CLAUDE.md. Documentation goes in DOCA.
 - Never read or change `~/dev/sci/experiments/crossconj`. Pilot files in `~/dev/sci/experiments/crossconj-ml` are read only.
 - Run every model call isolated: an empty temporary working directory, no file tools, no web tools, and no MCP. For `claude -p`: no `--bare`, `--tools ""`, `--setting-sources ""`, `--strict-mcp-config`, `--no-session-persistence`, and `ANTHROPIC_*` stripped from the environment (MuninnDB `common` memory `01M3WPMQETWRFJQPDGFY0ZVBJG`).
-- Model roles: Gemini generates only. A checker is never from the family that wrote the thing it checks. Codex budget goes to checking calls before generation.
+- Model roles: Gemini generates, and may make proof attempts in the triviality screen (Lean checks them); it never checks, audits, formalises, or makes the corollary call. A checker is never from the family that wrote the thing it checks. Codex budget goes to checking calls before generation.
 - A kill needs a certificate from library code. A survival needs a coverage report.
 - Benchmark constants: hidden results first posted on arXiv on or after `2026-07-01`; literature date cap `2026-06-30`; at most 8 domain pairs; memory policy `blind`.
 - Tests never call a live model or a live web API by default. Mark live checks `@pytest.mark.live`; they run only with `-m live`.

@@ -22,7 +22,14 @@ from minilab.generate.parse import parse_conjectures
 from minilab.generate.plain import generate_plain, plain_prompt
 from minilab.generate.structured import cross_prompt, generate_structured
 from minilab.ledger import Ledger
-from minilab.models.adapter import Budget, ModelReply, Role, RoleNotAllowed, call
+from minilab.models.adapter import (
+    GEMINI_ROLES,
+    Budget,
+    ModelReply,
+    Role,
+    RoleNotAllowed,
+    call,
+)
 from minilab.records import Family, RecordStore, Stage, Status
 from minilab.run import MemoryPolicy, RunManifest, save_manifest
 
@@ -257,11 +264,12 @@ def test_structured_logs_three_steps(structured_ledger: Ledger) -> None:
 # --- roles ---
 
 
-def test_gemini_allowed_only_for_generate(plain_ledger: Ledger) -> None:
+def test_gemini_allowed_only_for_generate_and_screen_proofs(plain_ledger: Ledger) -> None:
+    # Screen proofs (`Role.screen`) are tested in test_adapter and test_triviality.
     backend = FakeBackend(Family.gemini, in_turn(reply_of(conjecture())))
     backends = {Family.gemini: backend}
     for role in Role:
-        if role is Role.generate:
+        if role in GEMINI_ROLES:
             continue
         with pytest.raises(RoleNotAllowed):
             call(

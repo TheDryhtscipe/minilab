@@ -3,7 +3,10 @@
 `call` enforces the rules every model call must follow (design doc-gmj,
 "Constraints" and "Generator"):
 
-- Gemini generates only. Any other role for `Family.gemini` is refused.
+- Gemini generates, and makes proof attempts in the triviality screen
+  (`Role.screen`; Lean checks every proof, so a bad one proves nothing).
+  Any other role for `Family.gemini` is refused (`GEMINI_ROLES`), the
+  screen's corollary check (`Role.corollary`) included.
 - The pair's token budget is checked before the call. Inside one
   `Ledger.pair_lock` the adapter checks the pair's spend, which counts the
   reservations of calls still in flight, and reserves tokens for this call:
@@ -65,6 +68,7 @@ from minilab.scheduler import Pair, canonical_pair
 
 __all__ = [
     "ENV_ALLOWLIST",
+    "GEMINI_ROLES",
     "ROLE_STAGE",
     "Budget",
     "BudgetExceeded",
@@ -100,6 +104,9 @@ class Role(Enum):
     literature = "literature"
     prove = "prove"
     screen = "screen"
+    """A proof attempt in the triviality screen."""
+    corollary = "corollary"
+    """The triviality screen's corollary check: a claim and its proof."""
     curate = "curate"
     grade = "grade"
 
@@ -115,12 +122,20 @@ ROLE_STAGE: dict[Role, Stage] = {
     Role.literature: Stage.literature,
     Role.prove: Stage.prover,
     Role.screen: Stage.triviality,
+    Role.corollary: Stage.triviality,
     Role.curate: Stage.queue,
     Role.grade: Stage.queue,
 }
 """The stage each role's cost is charged to. Curating and grading the benchmark
 have no pipeline stage of their own; they are charged to the queue. They are
 meant to run under their own run id and manifest, not a benchmark run's ledger."""
+
+GEMINI_ROLES: frozenset[Role] = frozenset({Role.generate, Role.screen})
+"""The roles Gemini may take. `Role.screen` is a proof attempt in the
+triviality screen: Lean checks the proof in proved mode, and the proved file
+must match the original, so a wrong proof cannot mark a record trivial.
+Gemini checks nothing: no encoding, audit, round trip, formalisation,
+literature check, or corollary claim (user decision 2026-11-26)."""
 
 ENV_ALLOWLIST: frozenset[str] = frozenset(
     {
@@ -158,7 +173,7 @@ class BudgetExceeded(Exception):
 
 
 class RoleNotAllowed(Exception):
-    """The family may not take this role (Gemini generates only)."""
+    """The family may not take this role (Gemini only generates and screens proofs)."""
 
 
 class NoChecker(Exception):
@@ -254,7 +269,8 @@ def call(
     """Call `family`'s model in `role`, charge the call to `pair`, and return the reply.
 
     `record_id` is None for a call made before any record exists, such as
-    generation. Raise `RoleNotAllowed` for Gemini in any role but generate;
+    generation. Raise `RoleNotAllowed` for Gemini in a role not in
+    `GEMINI_ROLES`;
     `ValueError` for a family or pair the run's manifest does not list, or a
     record of another run or pair, a backend of another family, or a budget
     larger than the manifest's; `KeyError` for a record id that names no
@@ -266,8 +282,10 @@ def call(
     """
     family = Family(family)
     role = Role(role)
-    if family is Family.gemini and role is not Role.generate:
-        raise RoleNotAllowed(f"gemini generates only; refused role {role.value}")
+    if family is Family.gemini and role not in GEMINI_ROLES:
+        raise RoleNotAllowed(
+            f"gemini only generates and makes screen proofs; refused role {role.value}"
+        )
     pair = canonical_pair(pair)
     if family not in ledger.manifest.families:
         raise ValueError(f"family {family} is not in run {ledger.run_id}'s manifest")
