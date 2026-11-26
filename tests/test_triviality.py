@@ -36,9 +36,12 @@ from minilab.records import (
 )
 from minilab.run import MemoryPolicy, RunManifest, save_manifest
 from minilab.screen.triviality import (
+    FRONTIER_ATTEMPTS,
     TACTICS,
     ScreenResult,
+    frontier_prover,
     hold_reasons,
+    proof_from_reply,
     run_triviality_stage,
     screen,
     with_proof,
@@ -111,8 +114,13 @@ def kind_of(prompt: str) -> str:
     return "other"
 
 
-def fakes(replies: Mapping[str, list[str]]) -> dict[Family, FakeBackend]:
-    return {f: FakeBackend(f, replies) for f in Family}
+def fakes(
+    replies: Mapping[str, list[str]],
+    by_family: Mapping[Family, Mapping[str, list[str]]] | None = None,
+) -> dict[Family, FakeBackend]:
+    """One fake per family, all with `replies` unless `by_family` names that family."""
+    chosen = by_family or {}
+    return {f: FakeBackend(f, chosen.get(f, replies)) for f in Family}
 
 
 def lean_block(text: str) -> str:
@@ -186,6 +194,7 @@ def run_screen(
     backends: Mapping[Family, FakeBackend],
     families: tuple[Family, ...] = tuple(Family),
 ) -> ScreenResult:
+    """Screen `source`, formalised by Claude, in a run with `families`."""
     ledger = make_ledger(store, families)
     record = make_record()
     store.create(record)
@@ -282,7 +291,8 @@ def test_model_proof_cannot_change_the_file(store: RecordStore, proof: str) -> N
     backends = fakes({"prove": [lean_block(proof)], "corollary": [corollary_reply(False)]})
     result = run_screen(store, NEEDS_INDUCTION, backends)
     assert not result.proved
-    assert any(a.outcome == "refused" for a in result.attempts if a.screen == "local")
+    for name in ("local", "frontier"):
+        assert any(a.outcome == "refused" for a in result.attempts if a.screen == name)
 
 
 def test_corollary_is_checked_in_lean(store: RecordStore) -> None:
@@ -311,13 +321,142 @@ def test_corollary_claim_that_fails_in_lean_proves_nothing(store: RecordStore) -
 
 
 def test_no_local_model_in_the_run_skips_its_attempts(store: RecordStore) -> None:
-    backends = fakes(
-        {"prove": [lean_block(INDUCTION_PROOF)], "corollary": [corollary_reply(False)]}
-    )
+    backends = fakes({"prove": [lean_block("simp")], "corollary": [corollary_reply(False)]})
     result = run_screen(store, NEEDS_INDUCTION, backends, (Family.claude, Family.codex))
     assert not result.proved
-    assert calls(backends, "prove") == []
+    assert backends[Family.local].prompts == []
+    assert [f for f, _ in calls(backends, "prove")] == [Family.claude] * FRONTIER_ATTEMPTS
     assert any("local" in note for note in result.notes)
+
+
+# --- the frontier prover ---
+
+
+def test_frontier_proves_after_the_local_model_fails(store: RecordStore) -> None:
+    backends = fakes(
+        {"prove": [lean_block(INDUCTION_PROOF)]},
+        {Family.local: {"prove": [lean_block("simp")]}},
+    )
+    result = run_screen(store, NEEDS_INDUCTION, backends)
+    assert result.proved
+    assert result.proved_by == "frontier"
+    assert result.proof is not None and "induction" in result.proof
+    # Claude formalised it; Lean checks the proof, so Claude may prove it too.
+    assert len(backends[Family.local].prompts) == 3
+    assert [k for k, _ in backends[Family.claude].prompts] == ["prove"]
+    assert calls(backends, "corollary") == []
+    assert [a.screen for a in result.attempts[len(TACTICS) :]] == ["local"] * 3 + ["frontier"]
+
+
+def test_frontier_gets_three_attempts_with_feedback(store: RecordStore) -> None:
+    backends = fakes(
+        {"prove": [lean_block("simp"), lean_block("omega"), lean_block(INDUCTION_PROOF)]}
+    )
+    result = run_screen(store, NEEDS_INDUCTION, backends, (Family.claude, Family.codex))
+    prompts = [p for _, p in calls(backends, "prove")]
+    assert len(prompts) == FRONTIER_ATTEMPTS == 3
+    assert "simp" in prompts[1] and "made no progress" in prompts[1]
+    assert result.proved and result.proved_by == "frontier"
+    assert [a.screen for a in result.attempts[len(TACTICS) :]] == ["frontier"] * 3
+
+
+def test_frontier_is_codex_when_claude_is_not_in_the_run(store: RecordStore) -> None:
+    backends = fakes({"prove": [lean_block(INDUCTION_PROOF)]})
+    result = run_screen(store, NEEDS_INDUCTION, backends, (Family.codex, Family.gemini))
+    assert result.proved and result.proved_by == "frontier"
+    assert [f for f, _ in calls(backends, "prove")] == [Family.codex]
+
+
+@pytest.mark.parametrize(
+    ("families", "prover"),
+    [
+        ((Family.claude, Family.codex, Family.local), Family.claude),
+        ((Family.codex, Family.claude), Family.claude),
+        ((Family.codex, Family.local), Family.codex),
+        ((Family.gemini, Family.local), None),
+    ],
+)
+def test_frontier_prover_choice(families: tuple[Family, ...], prover: Family | None) -> None:
+    assert frontier_prover(families) is prover
+
+
+def test_no_frontier_family_skips_its_attempts(store: RecordStore) -> None:
+    backends = fakes({"prove": [lean_block("simp")]})
+    result = run_screen(store, NEEDS_INDUCTION, backends, (Family.gemini, Family.local))
+    assert not result.proved
+    assert [f for f, _ in calls(backends, "prove")] == [Family.local] * 3
+    assert any("neither Claude nor Codex" in note for note in result.notes)
+
+
+def test_frontier_proof_that_restates_the_theorem_is_used(store: RecordStore) -> None:
+    restated = NEEDS_INDUCTION.replace("sorry", INDUCTION_PROOF)
+    backends = fakes({"prove": [lean_block(restated)]})
+    result = run_screen(store, NEEDS_INDUCTION, backends, (Family.claude, Family.codex))
+    assert result.proved and result.proved_by == "frontier"
+    assert result.proof == INDUCTION_PROOF
+
+
+def test_frontier_model_failure_raises(store: RecordStore) -> None:
+    backends = fakes({})
+    backends[Family.claude].fail = True
+    with pytest.raises(ModelUnavailable):
+        run_screen(store, NEEDS_INDUCTION, backends, (Family.claude, Family.codex))
+
+
+# --- reading a proof from a reply ---
+
+
+@pytest.mark.parametrize(
+    ("reply", "proof"),
+    [
+        (lean_block("simp"), "simp"),
+        (lean_block("by\n  simp\n  ring"), "simp\nring"),
+        ("```lean\nby simp\n```", "simp"),
+        # A restated theorem: only the tactics after its `:= by`.
+        (lean_block(NEEDS_INDUCTION.replace("sorry", "simp [g]")), "simp [g]"),
+        (
+            lean_block(
+                "theorem conjecture (n : ℕ) : 0 < g n := by\n"
+                "  -- induct on n\n  induction n with\n  | zero => simp [g]\n"
+                "  | succ n ih => simp [g]"
+            ),
+            "induction n with\n| zero => simp [g]\n| succ n ih => simp [g]",
+        ),
+        # A `let` in the statement has its own `:=`; the proof starts after the theorem's.
+        (
+            lean_block("theorem conjecture (x : ℝ) : (let y := x; y) = x := by\n  rfl"),
+            "rfl",
+        ),
+        (lean_block("theorem conjecture (x : ℝ) : have y := x; y = x := by\n  rfl"), "rfl"),
+        # Term mode: the term becomes one `exact`.
+        (
+            lean_block("theorem conjecture (x : ℝ) : 0 ≤ x ^ 2 :=\n  sq_nonneg x"),
+            "exact sq_nonneg x",
+        ),
+        # A lemma under another name is restated too.
+        (lean_block("lemma my_lemma (x : ℝ) : 0 ≤ x ^ 2 := by\n  positivity"), "positivity"),
+        ("no code here", "no code here"),
+        # An inline `by`: a continuation line stays more indented than its tactic.
+        (
+            lean_block("by exact Nat.pos_of_ne_zero\n    (by simp)"),
+            "exact Nat.pos_of_ne_zero\n (by simp)",
+        ),
+        (
+            lean_block(
+                "theorem conjecture (n : ℕ) : 0 < g n := by exact Nat.pos_of_ne_zero\n"
+                "    (by induction n <;> simp [g])"
+            ),
+            "exact Nat.pos_of_ne_zero\n  (by induction n <;> simp [g])",
+        ),
+        # A proof with a theorem after it is not a restatement: the checks see it all.
+        (
+            lean_block("simp\n\ntheorem conjecture' : True := trivial"),
+            "simp\ntheorem conjecture' : True := trivial",
+        ),
+    ],
+)
+def test_proof_from_reply(reply: str, proof: str) -> None:
+    assert proof_from_reply(reply).strip("\n") == proof
 
 
 def test_model_failure_raises(store: RecordStore) -> None:
@@ -670,8 +809,8 @@ def test_screen_failure_leaves_status(store: RecordStore) -> None:
     assert data["trivial"] is False
     assert data["held"] is False
     assert data["proof"] is None
-    # `nlinarith` compiles with one Lean error: the local model nearly succeeded.
-    assert data["near_misses"] == ["local"]
+    # `nlinarith` compiles with one Lean error: both models nearly succeeded.
+    assert data["near_misses"] == ["local", "frontier"]
     assert isinstance(data["attempts"], list) and data["attempts"]
 
 
@@ -720,7 +859,8 @@ def test_stage_refuses_a_lean_file_that_changed(store: RecordStore) -> None:
 
 
 def _flag_runs(store: RecordStore, source: str, runs: int = 3) -> list[ScreenResult]:
-    families = (Family.claude, Family.codex, Family.local)
+    # The user's runs have no local model (decision of 2026-11-26, bead minilab-a32a1c).
+    families = (Family.claude, Family.codex)
     results: list[ScreenResult] = []
     ledger = make_ledger(store, families)
     for i in range(runs):

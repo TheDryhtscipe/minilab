@@ -362,13 +362,14 @@ _LET = re.compile(r"(?<![\w.'!?])(?:let|have)(?![\w'!?])")
 _HEADER = re.compile(r"(?<![\w.'!?])(?:theorem|lemma)\s+" + re.escape(THEOREM) + r"(?![\w'!?.])")
 
 
-def _statement_span(code: str) -> tuple[int, int] | None:
+def _statement_span(code: str, header_pattern: re.Pattern[str] = _HEADER) -> tuple[int, int] | None:
     """Where `conjecture`'s statement starts, and where its `:=` is, in `code`.
 
     The `:=` is the first one after the header outside any brackets that no
-    `let` or `have` in the statement claims.
+    `let` or `have` in the statement claims. `header_pattern` finds the
+    header (by default `conjecture`'s).
     """
-    header = _HEADER.search(code)
+    header = header_pattern.search(code)
     if header is None:
         return None
     depth = 0
@@ -405,6 +406,38 @@ def sorry_proof_span(source: str) -> tuple[int, int] | None:
     if len(after) != 1:
         return None
     return span[1], after[0].end()
+
+
+_ANY_HEADER = re.compile(r"(?<![\w.'!?])(?:(?:theorem|lemma)\s+[^\s:({\[⦃]+|example)(?![\w'!?])")
+
+
+_COMMAND_START = re.compile(
+    r"\s*(?:@\[|(?:import|open|namespace|section|variable|universe|noncomputable|def|abbrev"
+    r"|instance|structure|inductive|theorem|lemma|example|private|protected|nonrec"
+    r"|attribute|mutual)(?![\w'!?.]))"
+)
+
+
+def restated_proof(text: str) -> str | None:
+    """The proof after a restated theorem's `:=`, or None if `text` is not a restatement.
+
+    `text` is a restatement if, without comments, it starts with a Lean
+    command (`import`, `def`, `theorem`, ...) and states a theorem. So a
+    tactic proof with a theorem after it is not a restatement, and the checks
+    see all of it. The theorem is `conjecture` if `text` states it, else the
+    first `theorem`, `lemma`, or `example`. Comments are removed. Everything
+    after the `:=` is returned (a leading `by` included, and any command
+    after the proof), with the text before it on its line as spaces, so
+    each line keeps its column.
+    """
+    kept, code = _scan(text)
+    if not _COMMAND_START.match(code):
+        return None
+    span = _statement_span(code) or _statement_span(code, _ANY_HEADER)
+    if span is None:
+        return None
+    line_start = kept.rfind("\n", 0, span[1]) + 1
+    return " " * (span[1] + 2 - line_start) + kept[span[1] + 2 :]
 
 
 def source_problems(source: str, *, proved: bool = False) -> list[str]:
