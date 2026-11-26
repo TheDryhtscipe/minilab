@@ -759,6 +759,7 @@ def test_role_stage_map() -> None:
         Role.literature: Stage.literature,
         Role.prove: Stage.prover,
         Role.screen: Stage.triviality,
+        Role.corollary: Stage.triviality,
         Role.curate: Stage.queue,
         Role.grade: Stage.queue,
     }
