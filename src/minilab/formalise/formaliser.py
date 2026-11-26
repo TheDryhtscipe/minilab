@@ -144,8 +144,10 @@ class FormalOutput(BaseModel):
     the definition as Lean printed it. `opens` are the namespaces whose
     scoped declarations were active at `conjecture`. `theorems` are the
     file's theorems (internal names left out), as Lean's axiom check listed
-    them. `problems` says why the file is not `ok`. `attempts` counts the
-    model calls that led to this file.
+    them. `axioms` are the axioms `conjecture` depends on, as Lean's axiom
+    check listed them (`sorryAx` among them while its proof is `sorry`).
+    `problems` says why the file is not `ok`. `attempts` counts the model
+    calls that led to this file.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -166,6 +168,7 @@ class FormalOutput(BaseModel):
     definition_text: dict[str, str] = {}
     opens: list[str] = []
     theorems: list[str] = []
+    axioms: list[str] = []
     ok: bool
     problems: list[str]
     attempts: int = 1
@@ -934,6 +937,7 @@ def formal_from_source(
         definition_text={d.name: d.text + (CUT if d.truncated else "") for d in raw_defs},
         opens=opens,
         theorems=sorted(result.axioms_by_theorem),
+        axioms=sorted(own) if own is not None else [],
         ok=not problems,
         problems=problems,
         attempts=attempts,
