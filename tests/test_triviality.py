@@ -980,6 +980,10 @@ def test_s1_flagged_trivial_with_gemini_proving(store: RecordStore) -> None:
 
 
 @pytest.mark.live
+@pytest.mark.xfail(
+    reason="2026-11-26: Gemini proved S8 in 0 of 3 screens (Claude 3 of 3); see doc-6yq",
+    strict=False,
+)
 def test_s8_flagged_trivial_with_gemini_proving(store: RecordStore) -> None:
     results = _flag_runs(store, S8, families=GEMINI_RUN)
     assert all("the frontier prover was gemini" in r.notes for r in results)
