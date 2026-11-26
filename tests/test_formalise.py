@@ -978,7 +978,7 @@ def _past_the_text_gate(monkeypatch: pytest.MonkeyPatch, source: str) -> FormalO
     """
     import minilab.formalise.formaliser as formaliser
 
-    def no_problems(_source: str) -> list[str]:
+    def no_problems(_source: str, *, proved: bool = False) -> list[str]:
         return []
 
     monkeypatch.setattr(formaliser, "source_problems", no_problems)

@@ -331,6 +331,41 @@ def test_queue_cli_prints_every_section(store: RecordStore) -> None:
     assert "output law is not unique" in out  # mechanism
 
 
+def test_queue_cli_shows_a_held_proof_and_its_flags(store: RecordStore) -> None:
+    held = _formalised(store, "held")
+    store.write_stage(
+        held,
+        Stage.triviality,
+        _out(
+            {
+                "screened": True,
+                "trivial": False,
+                "held": True,
+                "proved_by": "nlinarith",
+                "proof": "nlinarith [sq_nonneg x]",
+                "hold_reasons": ["the audit found a weakening: h1: x < 1"],
+                "near_misses": [],
+            }
+        ),
+    )
+    plain = _formalised(store, "plain")
+    store.write_stage(
+        plain,
+        Stage.triviality,
+        _out({"screened": True, "trivial": False, "held": False, "proof": None}),
+    )
+
+    result = CliRunner().invoke(app, ["queue", RUN, "--root", str(store.root)])
+
+    assert result.exit_code == 0, result.output
+    items = {chunk.split()[1]: chunk for chunk in result.output.split("\n[")}
+    held_text, plain_text = items[held], items[plain]
+    assert "Held" in held_text
+    assert "nlinarith [sq_nonneg x]" in held_text
+    assert "the audit found a weakening: h1: x < 1" in held_text
+    assert "Held" not in plain_text
+
+
 def test_token_count() -> None:
     assert token_count("") == 0
     assert token_count("0 < x ^ 2 + x") == 7

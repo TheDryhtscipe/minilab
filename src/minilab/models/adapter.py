@@ -99,6 +99,7 @@ class Role(Enum):
     audit = "audit"
     literature = "literature"
     prove = "prove"
+    screen = "screen"
     curate = "curate"
     grade = "grade"
 
@@ -113,6 +114,7 @@ ROLE_STAGE: dict[Role, Stage] = {
     Role.audit: Stage.formaliser,
     Role.literature: Stage.literature,
     Role.prove: Stage.prover,
+    Role.screen: Stage.triviality,
     Role.curate: Stage.queue,
     Role.grade: Stage.queue,
 }
