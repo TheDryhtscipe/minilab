@@ -9,9 +9,13 @@ minilab-224a47.
    searches the library for one lemma that closes the goal; `positivity`
    runs after `intros`. `polyrith` is never used: it calls a web service.
 2. three proof attempts by the local model (`Family.local`), each retry
-   shown its last proof and Lean's errors. They are skipped, with a note, if
-   the run has no local model.
-3. one checker call (`pick_checker`, never the formaliser's family), asked
+   shown its last proof and Lean's errors. They run only if the run's
+   manifest has the local model; otherwise a note says they were skipped.
+3. three proof attempts by a frontier model (`frontier_prover`: Claude if
+   the run has it, else Codex), in the same way and with the same prompt.
+   Lean checks every proof, so the formaliser's own family may prove. They
+   are skipped, with a note, if the run has neither.
+4. one checker call (`pick_checker`, never the formaliser's family), asked
    whether the theorem is a corollary of a named Mathlib theorem, with a
    proof. A claim proves nothing until Lean checks the proof.
 
@@ -32,9 +36,13 @@ A Lean time-out on a candidate is that candidate's outcome (`timed_out`),
 not an error. A model failure (`ModelUnavailable`) or a spent budget
 (`BudgetExceeded`) raises.
 
+A model's reply gives its first Lean block. If the block restates a
+theorem, the text after the theorem's `:=` is used (`proof_from_reply`).
+
 `near_misses` (which the scorer counts, `score.py`) names each screen that
 nearly succeeded: a tactic or model proof that timed out, and a model proof
-that compiled with exactly one Lean error. A proof the text gate or the
+that compiled with exactly one Lean error. The model screens are `local`,
+`frontier`, and `corollary`. A proof the text gate or the
 command check refused (a parse error among them) is `refused` and is not a
 near miss. Each name appears once.
 
@@ -49,7 +57,7 @@ minilab-880beb) must skip a held record; nothing before it does.
 import json
 import re
 import textwrap
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast
@@ -66,6 +74,7 @@ from minilab.formalise.formaliser import (
     fenced,
     formal_from_source,
     lean_view,
+    restated_proof,
     sorry_proof_span,
     strip_comments,
 )
@@ -85,6 +94,10 @@ STARTUP_ALLOWANCE_S = 60.0
 """Seconds added to a tactic's time limit for Lean to start and load Mathlib."""
 
 LOCAL_ATTEMPTS = 3
+"""Proof attempts by the local model, when the run has it."""
+
+FRONTIER_ATTEMPTS = 3
+"""Proof attempts by the frontier prover (`frontier_prover`)."""
 
 Outcome = Literal["proved", "failed", "timed_out", "refused", "no_proof"]
 
@@ -104,9 +117,9 @@ class ScreenAttempt(BaseModel):
 class ScreenResult(BaseModel):
     """What the screen found.
 
-    `proved_by` is a tactic's name, `local`, or `corollary`. `proof` is the
-    proof text that went in place of the `sorry`, and `source` the whole
-    proved file. `corollary_of` is the theorem the checker named, when its
+    `proved_by` is a tactic's name, `local`, `frontier`, or `corollary`.
+    `proof` is the proof text that went in place of the `sorry`, and
+    `source` the whole proved file. `corollary_of` is the theorem the checker named, when its
     proof is the one that worked.
     """
 
@@ -305,13 +318,57 @@ def _parse_corollary(text: str) -> _CorollaryReply | None:
     return None
 
 
-def _model_proof(text: str) -> str:
-    """The tactic proof in a model's reply: its first Lean block, without a leading `by`."""
-    proof = extract_lean(text).strip("\n")
-    stripped = proof.lstrip()
-    if re.match(r"by(?![\w'!?])", stripped):
-        proof = stripped[2:]
-    return proof
+def proof_from_reply(text: str) -> str:
+    """The tactic proof in a model's reply, for `with_proof`.
+
+    The reply's first Lean block (`extract_lean`). If the block restates a
+    theorem (`restated_proof`), only what follows that theorem's `:=` is
+    kept, without comments. A leading `by` is dropped, and each line keeps
+    its column relative to the others, so a continuation line stays a
+    continuation; lines left of a first tactic that follows `by` on its line
+    are continuations of it, and move right of it. A restated theorem whose
+    proof does not start with `by` has a term proof, which becomes `exact`
+    and the term.
+    """
+    block = extract_lean(text)
+    restated = restated_proof(block)
+    lines = [
+        line for line in (block if restated is None else restated).splitlines() if line.strip()
+    ]
+    if not lines:
+        return ""
+    first = lines[0]
+    indent = _indent(first)
+    if re.match(r"by(?![\w'!?])", first[indent:]):
+        lines[0] = first[:indent] + "  " + first[indent + 2 :]
+        if not lines[0].strip():
+            lines = lines[1:]
+        elif len(lines) > 1:
+            column = _indent(lines[0])
+            rest = lines[1:]
+            low = min(_indent(line) for line in rest)
+            if low < column:
+                # Lean reads a line left of the first tactic as part of it, never a
+                # new tactic (a restated `:= by simpa using` with the term below).
+                shift = column + 2 - low
+                lines[1:] = [" " * shift + line for line in rest]
+    elif restated is not None:
+        term = textwrap.dedent("\n".join(lines)).strip()
+        return f"exact {term}" if "\n" not in term else "exact\n" + textwrap.indent(term, "  ")
+    return textwrap.dedent("\n".join(lines)).rstrip()
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def frontier_prover(families: Iterable[Family | str]) -> Family | None:
+    """The frontier model that tries proofs: Claude if in `families`, else Codex, else None."""
+    available = {Family(f) for f in families}
+    for family in (Family.claude, Family.codex):
+        if family in available:
+            return family
+    return None
 
 
 def screen(
@@ -368,12 +425,12 @@ def screen(
         if checked.outcome == "proved":
             return result(name, text, checked.source)
 
-    families = ledger.manifest.families
-    if Family.local in families:
+    def prove(family: Family, name: str, tries: int) -> ScreenResult | None:
+        """`tries` proof attempts by `family`, each retry shown Lean's errors."""
         last: tuple[str, str] | None = None
-        for _ in range(LOCAL_ATTEMPTS):
+        for _ in range(tries):
             reply = call(
-                Family.local,
+                family,
                 Role.screen,
                 _prove_prompt(formal, last),
                 record_id=record.id,
@@ -382,20 +439,39 @@ def screen(
                 budget=budget,
                 backends=backends,
             )
-            proof = _model_proof(reply.text)
+            proof = proof_from_reply(reply.text)
             checked = _check(formal, proof, lean_timeout_s, cache)
             attempts.append(
-                ScreenAttempt(screen="local", outcome=checked.outcome, detail=checked.detail)
+                ScreenAttempt(screen=name, outcome=checked.outcome, detail=checked.detail)
             )
             if checked.outcome == "proved":
-                return result("local", proof, checked.source)
+                return result(name, proof, checked.source)
             if checked.outcome == "timed_out" or checked.lean_errors == 1:
-                miss("local")
+                miss(name)
             last = (proof, checked.detail or "no proof was given")
+        return None
+
+    families = ledger.manifest.families
+    if Family.local in families:
+        found = prove(Family.local, "local", LOCAL_ATTEMPTS)
+        if found is not None:
+            return found
     else:
         notes.append(
             f"the run has no local model, so its {LOCAL_ATTEMPTS} proof attempts were skipped"
         )
+
+    prover = frontier_prover(families)
+    if prover is None:
+        notes.append(
+            f"the run has neither Claude nor Codex, so the {FRONTIER_ATTEMPTS} frontier "
+            "proof attempts were skipped"
+        )
+    else:
+        notes.append(f"the frontier prover was {prover.value}")
+        found = prove(prover, "frontier", FRONTIER_ATTEMPTS)
+        if found is not None:
+            return found
 
     try:
         checker = pick_checker(formal.family, families)
@@ -428,7 +504,7 @@ def screen(
             )
         )
     else:
-        proof = _model_proof(claim.proof)
+        proof = proof_from_reply(claim.proof)
         checked = _check(formal, proof, lean_timeout_s, cache)
         attempts.append(
             ScreenAttempt(screen="corollary", outcome=checked.outcome, detail=checked.detail)
