@@ -62,6 +62,12 @@ other constant in the file depends on `sorryAx` (internal and generated
 names included), and no declaration uses an axiom outside Lean's standard
 three. A Lean time-out
 raises `LeanTimeout`: it is never a verdict.
+
+**Proved mode** (`proved=True`, for the triviality screen, Task 12) checks a
+file whose `conjecture` has a real proof. The file must use `sorry` zero
+times, and no constant may depend on `sorryAx`, `conjecture` included. Every
+other gate is the same: the text gate, the command check, the probe, the
+instance check, and the axiom check.
 """
 
 import json
@@ -136,9 +142,10 @@ class FormalOutput(BaseModel):
     `definition_uses` maps each file definition to the file definitions its
     value (a type's: its constructors) mentions, and `definition_text` to
     the definition as Lean printed it. `opens` are the namespaces whose
-    scoped declarations were active at `conjecture`. `problems` says why the
-    file is not `ok`. `attempts` counts the model calls that led to this
-    file.
+    scoped declarations were active at `conjecture`. `theorems` are the
+    file's theorems (internal names left out), as Lean's axiom check listed
+    them. `problems` says why the file is not `ok`. `attempts` counts the
+    model calls that led to this file.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -158,6 +165,7 @@ class FormalOutput(BaseModel):
     definition_uses: dict[str, list[str]] = {}
     definition_text: dict[str, str] = {}
     opens: list[str] = []
+    theorems: list[str] = []
     ok: bool
     problems: list[str]
     attempts: int = 1
@@ -381,12 +389,31 @@ def _statement_span(code: str) -> tuple[int, int] | None:
     return None
 
 
-def source_problems(source: str) -> list[str]:
+def sorry_proof_span(source: str) -> tuple[int, int] | None:
+    """Where `conjecture`'s `:=` starts and its one `sorry` ends, in `source`.
+
+    None unless the file states `conjecture` and its proof uses `sorry`
+    exactly once after the `:=`. Comments and strings are skipped, as in
+    `source_problems`.
+    """
+    _, code = _scan(source)
+    span = _statement_span(code)
+    if span is None:
+        return None
+    after = [m for m in _SORRY.finditer(code) if m.start() >= span[1]]
+    if len(after) != 1:
+        return None
+    return span[1], after[0].end()
+
+
+def source_problems(source: str, *, proved: bool = False) -> list[str]:
     """Why the source cannot be checked, from its text alone. Empty if none.
 
     Comments and plain string literals are skipped. An interpolated string is
     read as a plain one, so the braces' contents are skipped too;
-    `command_check` refuses interpolated strings.
+    `command_check` refuses interpolated strings. With `proved`, the file
+    must not use `sorry` at all; otherwise it must use it once, as the proof
+    of `conjecture`.
     """
     kept, code = _scan(source)
     problems: list[str] = []
@@ -405,7 +432,9 @@ def source_problems(source: str) -> list[str]:
     if headers != 1:
         problems.append(f"the file must state one theorem named `{THEOREM}`; it states {headers}")
     sorries = [m.start() for m in _SORRY.finditer(code)]
-    if len(sorries) != 1:
+    if proved and sorries:
+        problems.append(f"a proved file must not use `sorry`; it uses it {len(sorries)} times")
+    if not proved and len(sorries) != 1:
         problems.append(
             f"the file must use `sorry` exactly once, as the proof of `{THEOREM}`; "
             f"it uses it {len(sorries)} times"
@@ -413,7 +442,7 @@ def source_problems(source: str) -> list[str]:
     span = _statement_span(code)
     if headers == 1 and span is None:
         problems.append(f"no `:=` ends the statement of `{THEOREM}`")
-    if span is not None and len(sorries) == 1 and sorries[0] < span[1]:
+    if not proved and span is not None and len(sorries) == 1 and sorries[0] < span[1]:
         problems.append(f"the `sorry` must be in the proof of `{THEOREM}`")
     return problems
 
@@ -713,6 +742,7 @@ def formal_from_source(
     *,
     timeout_s: float = DEFAULT_LEAN_TIMEOUT_S,
     attempts: int = 1,
+    proved: bool = False,
 ) -> FormalOutput:
     """Check `source` and probe its `conjecture`.
 
@@ -730,6 +760,9 @@ def formal_from_source(
     written after the colon, with whether the statement depends on
     `sorryAx`. Each binder and the conclusion list the file definitions they
     mention.
+
+    With `proved`, the file must prove `conjecture` without `sorry` (the
+    module's "Proved mode").
 
     Raise LeanTimeout if Lean hits `timeout_s`.
     """
@@ -751,7 +784,7 @@ def formal_from_source(
             attempts=attempts,
         )
 
-    problems = source_problems(source)
+    problems = source_problems(source, proved=proved)
     if problems:
         return refused(problems)
     (problems, arity, parsed), opens = _command_check_run(source, timeout_s)
@@ -806,12 +839,16 @@ def formal_from_source(
     if not problems and probe_errors:
         problems.append("Lean reported errors: " + "; ".join(probe_errors)[:1000])
     own = result.axioms_by_theorem.get(THEOREM)
-    if raw_body is not None and raw_body.theorem and (own is None or SORRY_AXIOM not in own):
-        problems.append(f"`{THEOREM}` must be proved by `sorry` alone")
+    if raw_body is not None and raw_body.theorem:
+        if proved and own is None:
+            problems.append(f"Lean's axiom check did not report `{THEOREM}`")
+        elif not proved and (own is None or SORRY_AXIOM not in own):
+            problems.append(f"`{THEOREM}` must be proved by `sorry` alone")
     sorry_names = {n for found in with_sorry for n in found}
     sorry_names |= {n for n, axioms in result.axioms_by_theorem.items() if SORRY_AXIOM in axioms}
     sorry_names |= {item.name for item in raw_defs if item.sorry}
-    for name in sorted(sorry_names - {THEOREM}):
+    allowed_sorry: set[str] = set() if proved else {THEOREM}
+    for name in sorted(sorry_names - allowed_sorry):
         problems.append(f"`{name}` depends on `sorry`")
     for b in raw_binders:
         for shown in b.foreign:
@@ -862,6 +899,7 @@ def formal_from_source(
         definition_uses={d.name: [u for u in d.uses if u != d.name] for d in raw_defs},
         definition_text={d.name: d.text + (CUT if d.truncated else "") for d in raw_defs},
         opens=opens,
+        theorems=sorted(result.axioms_by_theorem),
         ok=not problems,
         problems=problems,
         attempts=attempts,

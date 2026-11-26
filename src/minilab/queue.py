@@ -16,7 +16,10 @@ The queue reads these fields, which the stages that write them must use:
   `COVERAGE_KEYS`; `data["certificate"]`, a non-empty object;
   `data["mechanism"]`, an object whose `passed` is the boolean `true`.
 - `Stage.triviality`: `data["trivial"]` is `true` if the screen proved it
-  (such a record is `trivial`, but the flag is checked as well).
+  (such a record is `trivial`, but the flag is checked as well). A record
+  the screen proved but the formaliser stage flagged stays `survived` with
+  `data["held"]` true, so it is queued as a survivor; `minilab queue` shows
+  its `proof`, `proved_by`, and `hold_reasons` (bead minilab-224a47).
 - `Stage.formaliser`: `data["roundtrip"]` (text) and `data["audit"]`.
 - `Stage.literature`: the stage's `notes`.
 

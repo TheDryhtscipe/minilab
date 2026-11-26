@@ -311,7 +311,9 @@ def test_corollary_claim_that_fails_in_lean_proves_nothing(store: RecordStore) -
 
 
 def test_no_local_model_in_the_run_skips_its_attempts(store: RecordStore) -> None:
-    backends = fakes({"prove": [lean_block(INDUCTION_PROOF)], "corollary": [corollary_reply(False)]})
+    backends = fakes(
+        {"prove": [lean_block(INDUCTION_PROOF)], "corollary": [corollary_reply(False)]}
+    )
     result = run_screen(store, NEEDS_INDUCTION, backends, (Family.claude, Family.codex))
     assert not result.proved
     assert calls(backends, "prove") == []
@@ -333,9 +335,7 @@ def test_with_proof_replaces_only_the_sorry() -> None:
 
 
 def test_proved_mode_refuses_sorry_and_needs_a_proof() -> None:
-    sorry_file = formal_from_source(
-        EASY, Family.claude, "m", timeout_s=LEAN_TIMEOUT, proved=True
-    )
+    sorry_file = formal_from_source(EASY, Family.claude, "m", timeout_s=LEAN_TIMEOUT, proved=True)
     assert not sorry_file.ok
     proved = formal_from_source(
         with_proof(EASY, "nlinarith [sq_nonneg x]"),
@@ -411,18 +411,14 @@ def test_clean_formalisation_has_no_hold_reasons() -> None:
     ("data", "word"),
     [
         (
-            formaliser_data(
-                clean_audit().model_copy(update={"weakenings": ["x is at most 1"]})
-            ),
+            formaliser_data(clean_audit().model_copy(update={"weakenings": ["x is at most 1"]})),
             "weakening",
         ),
         (
             formaliser_data(
                 clean_audit().model_copy(
                     update={
-                        "hidden": [
-                            HiddenCondition(where="f", condition="x > 0", kind="weakening")
-                        ]
+                        "hidden": [HiddenCondition(where="f", condition="x > 0", kind="weakening")]
                     }
                 )
             ),
@@ -473,7 +469,13 @@ def test_flags_are_hold_reasons(data: dict[str, JsonValue], word: str) -> None:
 def screened_record(
     store: RecordStore, source: str, data: dict[str, JsonValue], local: str = "a"
 ) -> Record:
-    """A survivor with falsifier, literature, and formaliser stages."""
+    """A survivor with falsifier, literature, and formaliser stages.
+
+    An accepted formalisation records the statement Lean printed for
+    `source`, as the formaliser stage does.
+    """
+    if data.get("rejected") is False:
+        data = {**data, "lean_statement": probed(source).lean_statement}
     record = make_record(local)
     store.create(record)
     now = datetime(2026, 11, 26, 13, 0, tzinfo=UTC)

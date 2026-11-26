@@ -76,6 +76,18 @@ def format_item(position: int, item: QueueItem) -> str:
     ]
     if mechanism is not None:
         lines.append(_section("Mechanism", _json(mechanism)))
+    if data(Stage.triviality, "held") is True:
+        proof = data(Stage.triviality, "proof")
+        reasons = data(Stage.triviality, "hold_reasons")
+        listed = reasons if isinstance(reasons, list) else [reasons]
+        lines.append(
+            _section(
+                "Held: the triviality screen proved it, but the formalisation was flagged",
+                f"proved by: {data(Stage.triviality, 'proved_by')}\n"
+                f"proof:\n{proof if isinstance(proof, str) else _json(proof)}\n"
+                "flags:\n" + "\n".join(f"- {r}" for r in listed),
+            )
+        )
     lines.append(
         f"  Score: compression {compression}, near misses {s.near_misses or 'none'}, "
         f"library lemmas {len(s.library_lemmas)}"
