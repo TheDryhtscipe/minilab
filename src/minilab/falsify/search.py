@@ -70,6 +70,7 @@ from minilab.encoding.sandbox import (
     DEFAULT_TIMEOUT_S,
     Call,
     CallResult,
+    EncodingOutput,
     Method,
     Sandboxed,
     SandboxFailure,
@@ -216,28 +217,49 @@ def _sandbox_ok() -> None:
         raise SandboxUnavailable(f"the sandbox cannot run an empty encoding: {output.failure}")
 
 
-def sandbox_calls(source: str, calls: Sequence[Call], timeout_s: float) -> list[CallResult]:
+def sandbox_calls(
+    source: str, calls: Sequence[Call], timeout_s: float, group: int = 1
+) -> list[CallResult]:
     """Make `calls` on `source` in runs of at most BATCH_CALLS, each a fresh sandbox.
 
-    A run that fails as a whole gives each of its calls that failure as an
-    error, once the sandbox is shown to run an empty encoding; if it cannot,
-    raise SandboxUnavailable.
+    If a run fails as a whole (a time-out, a crash, or bad output), one call in
+    it may be the cause, so the run's calls are made again, `group` calls to a
+    sandbox, and each group gets only its own failure. That retry happens only
+    if `source` loads in a sandbox with no calls; if it does not, every call in
+    the run gets the run's failure. If the sandbox cannot run an empty encoding
+    either, raise SandboxUnavailable.
     """
     results: list[CallResult] = []
     checked = False
-    for start in range(0, len(calls), BATCH_CALLS):
-        chunk = calls[start : start + BATCH_CALLS]
+    loads: bool | None = None
+
+    def run(chunk: Sequence[Call]) -> EncodingOutput:
         try:
-            output = run_encoding(source, chunk, timeout_s)
+            return run_encoding(source, chunk, timeout_s)
         except OSError as exc:
             raise SandboxUnavailable(f"the sandbox cannot start: {exc}") from exc
-        if output.failure is not None:
-            if not checked:
-                _sandbox_ok()
-                checked = True
-            results.extend(CallResult(error=output.failure[:2000]) for _ in chunk)
-        else:
+
+    def failed(chunk: Sequence[Call], failure: str) -> list[CallResult]:
+        return [CallResult(error=failure[:2000]) for _ in chunk]
+
+    for start in range(0, len(calls), BATCH_CALLS):
+        chunk = calls[start : start + BATCH_CALLS]
+        output = run(chunk)
+        if output.failure is None:
             results.extend(output.results)
+            continue
+        if not checked:
+            _sandbox_ok()
+            checked = True
+        if len(chunk) > group and loads is None:
+            loads = run([]).failure is None
+        if len(chunk) <= group or not loads:
+            results.extend(failed(chunk, output.failure))
+            continue
+        for at in range(0, len(chunk), group):
+            part = chunk[at : at + group]
+            again = run(part)
+            results.extend(again.results if again.failure is None else failed(part, again.failure))
     return results
 
 
@@ -300,7 +322,7 @@ class SandboxEvaluator:
         calls = [
             Call(method=m, point=x, digits=x.precision_digits) for x in points for m in methods
         ]
-        results = sandbox_calls(self.source, calls, self.timeout_s)
+        results = sandbox_calls(self.source, calls, self.timeout_s, group=len(methods))
         out: list[Evaluation] = []
         for i, x in enumerate(points):
             got = [rebuild(r, x.precision_digits) for r in results[3 * i : 3 * i + 3]]
@@ -453,7 +475,9 @@ def _objective(e: Evaluation) -> float:
 
 
 # Nelder-Mead coefficients: reflection, expansion, contraction, and shrink
-# (the standard values, as in scipy's default).
+# (the standard values, as in scipy's default). The steps are scipy's too, except
+# that ties in the ordering keep their order (a stable sort): many points score
+# PENALTY, so ties are common here.
 _RHO, _CHI, _PSI, _SIGMA = 1.0, 2.0, 0.5, 0.5
 _XATOL, _FATOL = 1e-12, 1e-15
 
@@ -479,7 +503,7 @@ def _nelder_mead(simplex: Vector, max_evaluations: int) -> Steps:
         if asked >= max_evaluations:
             raise _Spent
         asked += 1
-        return (yield v)
+        return (yield v.copy())
 
     sim = simplex.copy()
     n = sim.shape[1]
