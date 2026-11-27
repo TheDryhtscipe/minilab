@@ -3,15 +3,19 @@
 Each run writes one manifest when it starts, at `runs/<run_id>/manifest.json`.
 It fixes what the run may do: its mode, its domain pairs, how it may read
 memory (design doc-gmj, "Memory read policy"), its literature date cap, its
-token budget per pair, and the model families it uses. A manifest is written
-once and never changed.
+token budget per pair, the model families it uses, and the model id each
+family asks for (so each call names the model it requested). A manifest
+is written once and never changed.
 """
 
 import os
+import re
 import tempfile
+from collections.abc import Iterable, Mapping
 from datetime import date
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Annotated, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -29,6 +33,40 @@ class MemoryPolicy(StrEnum):
     """Only records for the same domain pair."""
     all = "all"
     """Every record."""
+
+
+DEFAULT_MODELS: Mapping[Family, str] = MappingProxyType({
+    Family.claude: "claude-opus-5-5",
+    Family.codex: "gpt-6.2-astra",
+    Family.gemini: "gemini-4-neon-high",
+    Family.local: "qwen3.5:4b",
+})
+"""The model id each family runs unless a run's manifest says otherwise (user
+decision 2026-11-26, bead minilab-023786). Change it here for new runs; a saved
+manifest keeps the ids its run used."""
+
+_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]*")
+
+
+class FamilyModel(BaseModel):
+    """The model id one family runs, as passed to its tool's `--model`."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    family: Family
+    model: str
+
+    @field_validator("model")
+    @classmethod
+    def _model_id(cls, value: str) -> str:
+        if not _MODEL_ID.fullmatch(value):
+            raise ValueError(f"not a model id: {value!r}")
+        return value
+
+
+def default_models(families: Iterable[Family]) -> tuple[FamilyModel, ...]:
+    """Return `DEFAULT_MODELS`' id for each of `families`, in their order."""
+    return tuple(FamilyModel(family=f, model=DEFAULT_MODELS[f]) for f in families)
 
 
 class ManifestExists(Exception):
@@ -58,6 +96,8 @@ class RunManifest(BaseModel):
     budget_tokens_per_pair: Annotated[int, Field(strict=True, gt=0)]
     """Tokens in plus tokens out, over every model call for one pair."""
     families: Annotated[tuple[Family, ...], Field(min_length=1)]
+    models: tuple[FamilyModel, ...]
+    """The model id for each family in `families`: exactly one each, no others."""
     started: Annotated[AwareDatetime, Field(strict=True)]
 
     @field_validator("pairs")
@@ -83,6 +123,27 @@ class RunManifest(BaseModel):
         if self.memory_policy is MemoryPolicy.blind and self.memory_before is not None:
             raise ValueError("memory_before needs the pair or all policy; blind reads nothing")
         return self
+
+    @model_validator(mode="after")
+    def _one_model_per_family(self) -> "RunManifest":
+        named: set[Family] = set()
+        for entry in self.models:
+            if entry.family in named:
+                raise ValueError(f"{entry.family} has a model more than once")
+            if entry.family not in self.families:
+                raise ValueError(f"{entry.family} is not in the run's families")
+            named.add(entry.family)
+        for family in self.families:
+            if family not in named:
+                raise ValueError(f"no model for {family}")
+        return self
+
+    def model_of(self, family: Family) -> str:
+        """Return the model id `family` runs; raise `KeyError` if the run lacks it."""
+        for entry in self.models:
+            if entry.family == family:
+                return entry.model
+        raise KeyError(family)
 
 
 def manifest_path(root: Path, run_id: str) -> Path:

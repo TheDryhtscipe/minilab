@@ -1,5 +1,6 @@
 """Tests for the run manifest and the cost ledger (build plan Task 3)."""
 
+import json
 import math
 import multiprocessing
 import os
@@ -17,9 +18,12 @@ from pydantic import ValidationError
 from minilab.ledger import CorruptLedger, Ledger, cost_report
 from minilab.records import Family, Provenance, Record, RecordStore, Stage, Status, TokenCount
 from minilab.run import (
+    DEFAULT_MODELS,
+    FamilyModel,
     ManifestExists,
     MemoryPolicy,
     RunManifest,
+    default_models,
     load_manifest,
     manifest_path,
     save_manifest,
@@ -334,6 +338,9 @@ def _manifest(**changes: object) -> RunManifest:
         "started": _STARTED,
     }
     fields.update(changes)
+    if "models" not in changes:
+        families = cast(list[Family], fields["families"])
+        fields["models"] = default_models(families)
     return RunManifest.model_validate(fields)
 
 
@@ -385,6 +392,64 @@ def test_manifest_pairs_are_canonical_and_unique() -> None:
 def test_manifest_refuses_bad_fields(changes: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         _manifest(**changes)
+
+
+def test_manifest_names_each_familys_model(tmp_path: Path) -> None:
+    manifest = _manifest(models=[
+        {"family": "codex", "model": "gpt-test"}, {"family": "claude", "model": "claude-test"}
+    ])
+    assert manifest.model_of(Family.claude) == "claude-test"
+    assert manifest.model_of(Family.codex) == "gpt-test"
+    with pytest.raises(KeyError):
+        manifest.model_of(Family.gemini)
+    save_manifest(tmp_path, manifest)
+    raw = (tmp_path / "runs" / RUN / "manifest.json").read_text()
+    assert '"model": "gpt-test"' in raw
+    assert load_manifest(tmp_path, RUN) == manifest
+
+
+def test_default_models_are_the_chosen_ids() -> None:
+    assert dict(DEFAULT_MODELS) == {
+        Family.claude: "claude-opus-5-5",
+        Family.codex: "gpt-6.2-astra",
+        Family.gemini: "gemini-4-neon-high",
+        Family.local: "qwen3.5:4b",
+    }
+    assert default_models([Family.gemini, Family.claude]) == (
+        FamilyModel(family=Family.gemini, model="gemini-4-neon-high"),
+        FamilyModel(family=Family.claude, model="claude-opus-5-5"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("models", "message"),
+    [
+        ([{"family": "claude", "model": "c"}], "no model for codex"),
+        ([{"family": "claude", "model": "c"}, {"family": "codex", "model": "x"},
+          {"family": "gemini", "model": "g"}], "gemini is not in the run's families"),
+        ([{"family": "claude", "model": "c"}, {"family": "codex", "model": "x"},
+          {"family": "claude", "model": "d"}], "more than once"),
+        ([{"family": "claude", "model": " "}, {"family": "codex", "model": "x"}], "model"),
+        ([{"family": "claude", "model": "c x"}, {"family": "codex", "model": "x"}], "model"),
+        ([{"family": "claude", "model": "-p"}, {"family": "codex", "model": "x"}], "model"),
+        ([{"family": "claude", "model": "c"}, {"family": "codex", "model": "--model"}],
+         "model"),
+    ],
+)
+def test_manifest_refuses_bad_models(models: list[dict[str, str]], message: str) -> None:
+    with pytest.raises(ValidationError, match=message):
+        _manifest(models=models)
+
+
+def test_manifest_without_models_does_not_load(tmp_path: Path) -> None:
+    """A manifest from before model ids were recorded must not load as if it had them."""
+    save_manifest(tmp_path, _manifest())
+    path = tmp_path / "runs" / RUN / "manifest.json"
+    raw = json.loads(path.read_text())
+    del raw["models"]
+    path.write_text(json.dumps(raw))
+    with pytest.raises(ValidationError, match="models"):
+        load_manifest(tmp_path, RUN)
 
 
 def test_load_manifest_missing_raises(tmp_path: Path) -> None:

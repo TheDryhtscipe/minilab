@@ -127,6 +127,14 @@ class Backend(Protocol):
     @property
     def family(self) -> Family: ...
 
+    @property
+    def model(self) -> str:
+        """The model id the backend asks its tool for (`--model`, or ollama's `model`).
+
+        A reply's `model` is what the tool reported where it reports one (Claude,
+        ollama), else this id."""
+        ...
+
     def run(
         self, prompt: str, *, cwd: Path, env: Mapping[str, str], timeout_s: float
     ) -> ModelReply: ...
@@ -467,7 +475,7 @@ def parse_claude(raw: str, *, prompt: str = "") -> ModelReply:
 class ClaudeBackend:
     family = Family.claude
 
-    def __init__(self, model: str | None = None, binary: str = "claude") -> None:
+    def __init__(self, *, model: str, binary: str = "claude") -> None:
         self.model = model
         self.binary = binary
 
@@ -482,9 +490,7 @@ class ClaudeBackend:
             "--strict-mcp-config",
             "--no-session-persistence",
         ]
-        if self.model is not None:
-            argv += ["--model", self.model]
-        return argv
+        return argv + ["--model", self.model]
 
     def run(
         self, prompt: str, *, cwd: Path, env: Mapping[str, str], timeout_s: float
@@ -590,7 +596,7 @@ def parse_codex(raw: str, *, model: str, prompt: str = "") -> ModelReply:
 class CodexBackend:
     family = Family.codex
 
-    def __init__(self, model: str | None = None, binary: str = "codex") -> None:
+    def __init__(self, *, model: str, binary: str = "codex") -> None:
         self.model = model
         self.binary = binary
 
@@ -608,16 +614,13 @@ class CodexBackend:
         ]
         for feature in CODEX_DISABLED_FEATURES:
             argv += ["--disable", feature]
-        if self.model is not None:
-            argv += ["--model", self.model]
-        return argv + ["-"]
+        return argv + ["--model", self.model, "-"]
 
     def run(
         self, prompt: str, *, cwd: Path, env: Mapping[str, str], timeout_s: float
     ) -> ModelReply:
-        model = self.model or "codex-default"
         return _run_and_parse(
-            self.argv(), lambda out: parse_codex(out, model=model, prompt=prompt),
+            self.argv(), lambda out: parse_codex(out, model=self.model, prompt=prompt),
             stdin=prompt, cwd=cwd, env=env, timeout_s=timeout_s,
         )
 
@@ -819,7 +822,7 @@ def parse_agy(raw: str, *, model: str, nonce: str, prompt: str = "") -> ModelRep
 class GeminiBackend:
     family = Family.gemini
 
-    def __init__(self, model: str | None = None, binary: str | None = None) -> None:
+    def __init__(self, *, model: str, binary: str | None = None) -> None:
         self.model = model
         self.binary = binary or str(Path.home() / ".local" / "bin" / "agy")
 
@@ -834,9 +837,7 @@ class GeminiBackend:
             "--disable-slash-commands",
             "--settings", json.dumps(AGY_SETTINGS),
         ]
-        if self.model is not None:
-            argv += ["--model", self.model]
-        return argv
+        return argv + ["--model", self.model]
 
     def run(
         self, prompt: str, *, cwd: Path, env: Mapping[str, str], timeout_s: float
@@ -887,10 +888,9 @@ class GeminiBackend:
             "XDG_CACHE_HOME": str(home / ".cache"),
             "XDG_STATE_HOME": str(home / ".local" / "state"),
         }
-        model = self.model or "agy-default"
         return _run_and_parse(
             self.argv(),
-            lambda out: parse_agy(out, model=model, nonce=nonce, prompt=prompt),
+            lambda out: parse_agy(out, model=self.model, nonce=nonce, prompt=prompt),
             stdin=message, cwd=cwd, env=own_env, timeout_s=timeout_s,
         )
 
@@ -918,9 +918,9 @@ class LocalBackend:
 
     def __init__(
         self,
-        model: str = "qwen3.5:4b",
-        url: str = "http://127.0.0.1:11434",
         *,
+        model: str,
+        url: str = "http://127.0.0.1:11434",
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.model = model
