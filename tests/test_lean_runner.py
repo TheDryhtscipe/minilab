@@ -6,10 +6,14 @@ runner compiles it with no network and a read-only view of the files it needs.
 """
 
 import json
+import tempfile
 import time
 from pathlib import Path
 
-from minilab.lean.runner import check_lean, lean_project
+import pytest
+
+from minilab.lean import runner
+from minilab.lean.runner import CHECK_PREFIX, check_lean
 
 SMOKE = """import Mathlib.Data.Nat.Basic
 
@@ -50,12 +54,29 @@ theorem spin : f 100000000 = 100000000 := by decide
 """
 
 
-def _checks_left() -> set[Path]:
-    return set(lean_project().glob("MinilabCheck_*.lean"))
+@pytest.fixture
+def made_checks(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """The check files this test's own Lean calls made.
+
+    Other test workers write check files to the same `lean/` project at the same
+    time, so a test can only speak for the files it made itself.
+    """
+    made: list[Path] = []
+    real = tempfile.mkstemp
+
+    def spy(
+        suffix: str | None = None, prefix: str | None = None, dir: Path | None = None
+    ) -> tuple[int, str]:
+        handle, name = real(suffix=suffix, prefix=prefix, dir=dir)
+        if prefix == CHECK_PREFIX:
+            made.append(Path(name))
+        return handle, name
+
+    monkeypatch.setattr(runner.tempfile, "mkstemp", spy)
+    return made
 
 
-def test_smoke_theorem_ok() -> None:
-    before = _checks_left()
+def test_smoke_theorem_ok(made_checks: list[Path]) -> None:
     result = check_lean(SMOKE, timeout_s=120)
     assert result.ok, result.errors
     assert result.errors == []
@@ -63,7 +84,8 @@ def test_smoke_theorem_ok() -> None:
     assert not result.timed_out
     assert result.axioms_by_theorem == {"minilab_smoke_check": []}
     assert result.axioms == []
-    assert _checks_left() == before
+    assert len(made_checks) == 1
+    assert not made_checks[0].exists()
 
 
 def test_sorry_detected() -> None:
@@ -92,8 +114,7 @@ def test_errors_reported_with_line() -> None:
     assert not result.timed_out
 
 
-def test_lean_timeout_is_not_a_verdict() -> None:
-    before = _checks_left()
+def test_lean_timeout_is_not_a_verdict(made_checks: list[Path]) -> None:
     start = time.monotonic()
     result = check_lean(LOOP, timeout_s=5)
     elapsed = time.monotonic() - start
@@ -103,7 +124,8 @@ def test_lean_timeout_is_not_a_verdict() -> None:
     assert result.axioms == []
     assert result.axioms_by_theorem == {}
     assert elapsed < 20
-    assert _checks_left() == before
+    assert len(made_checks) == 1
+    assert not made_checks[0].exists()
 
 
 def test_eval_cannot_write_files(tmp_path: Path) -> None:

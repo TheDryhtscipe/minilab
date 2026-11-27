@@ -21,6 +21,7 @@ dev = [
     "pytest",
     "pyright",
     "ruff",
+    "pytest-xdist>=3.8.0",
 ]
 
 [build-system]
@@ -53,4 +54,7 @@ testpaths = ["tests"]
 markers = [
     "live: calls a live model or web API; run only when asked (-m live)",
 ]
-addopts = "-m 'not live'"
+# Four workers (pytest-xdist): Lean checks dominate the run, and eight workers
+# saved two more minutes but left too little memory free. `-n 0` runs in one
+# process. Bead minilab-81c4fe.
+addopts = "-m 'not live' -n 4"
