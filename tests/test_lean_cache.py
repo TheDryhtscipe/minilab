@@ -5,11 +5,12 @@ result served for the wrong input shows. One compiles real Lean, to check that
 a real result survives the trip through the cache unchanged.
 """
 
+import os
 from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
-from lean_cache import CachedLean, NonceSequence
+from lean_cache import CachedLean, NonceSequence, install_lean_cache, parallel_live_refusal
 
 from minilab.formalise import formaliser, vacuity
 from minilab.lean import runner
@@ -142,6 +143,8 @@ def test_lean_callers_use_the_cache_by_default(request: pytest.FixtureRequest) -
     _skip_if_cache_off(request)
     for module in (formaliser, vacuity, loogle):
         assert isinstance(module.check_lean, CachedLean), module.__name__
+    for module in (formaliser, vacuity):
+        assert isinstance(module.new_nonce, NonceSequence), module.__name__
 
 
 @pytest.mark.lean_uncached
@@ -150,16 +153,45 @@ def test_a_test_can_opt_out_of_the_cache() -> None:
         assert module.check_lean is runner.check_lean, module.__name__
 
 
-def test_nonces_start_again_in_each_test(request: pytest.FixtureRequest) -> None:
-    _skip_if_cache_off(request)
-    # Two tests that check the same files in the same order send Lean the same
-    # text, markers included, so the later one is served from the cache. So
-    # this test's first nonces are those of a fresh sequence.
-    nonces = [formaliser.new_nonce(), formaliser.new_nonce(), vacuity.new_nonce()]
-    fresh = NonceSequence()
-    assert nonces == [fresh(), fresh(), fresh()]
-    assert len(set(nonces)) == 3
-    assert all(len(n) == 16 and int(n, 16) >= 0 for n in nonces)
+def test_each_install_starts_the_nonces_again(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The fixture installs the cache for each test. Two tests that check the
+    # same files in the same order must send Lean the same text, markers
+    # included, so each install starts a fresh nonce sequence.
+    cache = CachedLean(Echo(), tmp_path)
+    install_lean_cache(monkeypatch, cache)
+    first = [formaliser.new_nonce(), formaliser.new_nonce(), vacuity.new_nonce()]
+    install_lean_cache(monkeypatch, cache)
+    again = [formaliser.new_nonce(), formaliser.new_nonce(), vacuity.new_nonce()]
+    assert again == first
+    assert len(set(first)) == 3
+    assert all(len(n) == 16 and int(n, 16) >= 0 for n in first)
+
+
+def test_workers_share_one_cache_directory(
+    lean_cache: CachedLean, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    base = tmp_path_factory.getbasetemp()
+    if os.environ.get("PYTEST_XDIST_WORKER"):
+        # Each worker's base temp is inside the run's; the cache is beside them.
+        assert lean_cache.directory == base.parent / "lean-cache"
+    else:
+        assert lean_cache.directory == base / "lean-cache"
+
+
+@pytest.mark.parametrize(
+    ("markexpr", "workers", "refused"),
+    [
+        ("not live", 4, False),
+        ("live", 4, True),
+        ("live", 0, False),
+        ("live or not live", 4, True),
+        ("", 4, False),
+    ],
+)
+def test_live_tests_run_in_one_process(markexpr: str, workers: int, refused: bool) -> None:
+    assert (parallel_live_refusal(markexpr, workers) is not None) == refused
 
 
 @pytest.mark.lean_uncached

@@ -11,6 +11,13 @@ An entry is keyed by everything `check_lean` takes: the source, the timeout,
 the project, and the options. A result that timed out is never stored. Entries
 are files in one directory that every test worker of the run shares, and each
 entry repeats its key, which is compared before the entry is used.
+
+The key does not cover the runner itself. A test that patches the runner's
+internals (`_lake`, `lean_project`, `shutil.which`, ...) and expects the change
+to reach Lean through the formaliser must be marked `lean_uncached`, or it may
+be served a result from before the patch. The nonces `NonceSequence` gives are
+a public formula, so a fixture that must not know the real marker must not be
+built from them.
 """
 
 import hashlib
@@ -20,10 +27,13 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Protocol
 
+import pytest
 from pydantic import BaseModel, ConfigDict, JsonValue
 
+from minilab.formalise import formaliser, vacuity
 from minilab.lean import runner
 from minilab.lean.runner import DEFAULT_TIMEOUT_S, LeanResult
+from minilab.literature import loogle
 
 
 class LeanCheck(Protocol):
@@ -107,3 +117,31 @@ class NonceSequence:
     def __call__(self) -> str:
         self.count += 1
         return hashlib.sha256(f"minilab test nonce {self.count}".encode()).hexdigest()[:16]
+
+
+
+# The modules that call `check_lean` outside the runner. The runner's own tests
+# import `check_lean` directly, so they always run Lean.
+LEAN_CALLERS = (formaliser, vacuity, loogle)
+# The modules that tag Lean runs with `new_nonce`; see `NonceSequence`.
+NONCE_USERS = (formaliser, vacuity)
+
+
+def install_lean_cache(monkeypatch: pytest.MonkeyPatch, cache: CachedLean) -> None:
+    """Put `cache` in place of `check_lean`, and a fresh `NonceSequence` in place of `new_nonce`."""
+    for module in LEAN_CALLERS:
+        monkeypatch.setattr(module, "check_lean", cache)
+    nonces = NonceSequence()
+    for module in NONCE_USERS:
+        monkeypatch.setattr(module, "new_nonce", nonces)
+
+
+def parallel_live_refusal(markexpr: str, workers: int) -> str | None:
+    """Why a run that selects live tests may not use more than one worker, or None.
+
+    Live tests call real models; several at once risk rate limits, faster
+    spending, and races on the model CLIs' own state.
+    """
+    if workers > 0 and "live" in markexpr and markexpr.strip() != "not live":
+        return "live tests call real models one at a time: add -n 0 to run them"
+    return None

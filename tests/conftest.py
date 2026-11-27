@@ -4,11 +4,9 @@ import os
 from pathlib import Path
 
 import pytest
-from lean_cache import CachedLean, NonceSequence
+from lean_cache import CachedLean, install_lean_cache, parallel_live_refusal
 
-from minilab.formalise import formaliser, vacuity
 from minilab.lean import runner
-from minilab.literature import loogle
 
 _TESTS_DIR = Path(__file__).parent
 
@@ -31,13 +29,6 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
 
 # --- The Lean result cache (bead minilab-81c4fe; see lean_cache.py) ---------------------------
 
-# The modules that call `check_lean` outside the runner. The runner's own tests
-# import `check_lean` directly, so they always run Lean.
-_LEAN_CALLERS = (formaliser, vacuity, loogle)
-# The modules that tag Lean runs with `new_nonce`; see `NonceSequence`.
-_NONCE_USERS = (formaliser, vacuity)
-
-
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
         "--no-lean-cache",
@@ -50,6 +41,12 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers", "lean_uncached: run Lean for every check this test makes, never the cache"
     )
+    workers = config.getoption("numprocesses", default=0)
+    refusal = parallel_live_refusal(
+        str(config.getoption("markexpr", default="")), workers if isinstance(workers, int) else 0
+    )
+    if refusal is not None:
+        raise pytest.UsageError(refusal)
 
 
 @pytest.fixture(scope="session")
@@ -71,8 +68,4 @@ def _cache_lean(
         return
     if request.node.get_closest_marker("lean_uncached") is not None:
         return
-    for module in _LEAN_CALLERS:
-        monkeypatch.setattr(module, "check_lean", lean_cache)
-    nonces = NonceSequence()
-    for module in _NONCE_USERS:
-        monkeypatch.setattr(module, "new_nonce", nonces)
+    install_lean_cache(monkeypatch, lean_cache)
