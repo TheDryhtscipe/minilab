@@ -605,7 +605,7 @@ def command_check(source: str, *, timeout_s: float = DEFAULT_LEAN_TIMEOUT_S) -> 
 def _command_check_run(source: str, timeout_s: float) -> tuple[CommandCheck, list[str]]:
     """`command_check`, and the namespaces whose scoped declarations are active at `conjecture`."""
     text = checked_source(source).encode("utf-8")
-    marker = f"MINILAB_CMD_{secrets.token_hex(8)}_"
+    marker = f"MINILAB_CMD_{new_nonce()}_"
     result = check_lean(
         _command_check(text.decode("utf-8"), marker), timeout_s, options=CHECK_OPTIONS
     )
