@@ -91,6 +91,20 @@ def format_item(position: int, item: QueueItem) -> str:
                 "flags:\n" + "\n".join(f"- {r}" for r in listed),
             )
         )
+    if data(Stage.prover, "held") is True:
+        proof = data(Stage.prover, "proof")
+        reasons = data(Stage.prover, "hold_reasons")
+        listed = reasons if isinstance(reasons, list) else ["(the reasons could not be read)"]
+        weakened = data(Stage.prover, "weakened_statement")
+        lines.append(
+            _section(
+                "Held: the prover proved it, but the proof is not of the statement as "
+                "formalised, or the formalisation was flagged",
+                (f"statement proved:\n{weakened}\n" if isinstance(weakened, str) else "")
+                + f"proof:\n{proof if isinstance(proof, str) else _json(proof)}\n"
+                "flags:\n" + "\n".join(f"- {r}" for r in listed),
+            )
+        )
     lines.append(
         f"  Score: compression {compression}, near misses {s.near_misses or 'none'}, "
         f"library lemmas {len(s.library_lemmas)}"

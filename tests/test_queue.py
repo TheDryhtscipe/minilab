@@ -366,6 +366,38 @@ def test_queue_cli_shows_a_held_proof_and_its_flags(store: RecordStore) -> None:
     assert "Held" not in plain_text
 
 
+def test_queue_cli_shows_a_prover_held_proof(store: RecordStore) -> None:
+    # Bead minilab-880beb: a proof that needed an added hypothesis is held.
+    held = _formalised(store, "pheld")
+    store.write_stage(
+        held,
+        Stage.triviality,
+        _out({"screened": True, "trivial": False, "held": False, "proof": None}),
+    )
+    store.write_stage(
+        held,
+        Stage.prover,
+        _out(
+            {
+                "attempted": True,
+                "proved": False,
+                "held": True,
+                "weakened": True,
+                "weakened_statement": "theorem conjecture (x : ℝ) (h1 : x < 1) : x ^ 2 < x",
+                "proof": "nlinarith",
+                "hold_reasons": ["the proof needs added hypotheses: h1 : x < 1"],
+            }
+        ),
+    )
+
+    result = CliRunner().invoke(app, ["queue", RUN, "--root", str(store.root)])
+
+    assert result.exit_code == 0, result.output
+    assert "Held: the prover proved it" in result.output
+    assert "theorem conjecture (x : ℝ) (h1 : x < 1) : x ^ 2 < x" in result.output
+    assert "the proof needs added hypotheses: h1 : x < 1" in result.output
+
+
 def test_token_count() -> None:
     assert token_count("") == 0
     assert token_count("0 < x ^ 2 + x") == 7

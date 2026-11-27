@@ -4,7 +4,8 @@
 "Constraints" and "Generator"):
 
 - Gemini generates, and makes proof attempts in the triviality screen
-  (`Role.screen`; Lean checks every proof, so a bad one proves nothing).
+  (`Role.screen`) and the prover loop (`Role.prove`). Lean checks every
+  proof, so a bad one proves nothing.
   Any other role for `Family.gemini` is refused (`GEMINI_ROLES`), the
   screen's corollary check (`Role.corollary`) included.
 - The pair's token budget is checked before the call. Inside one
@@ -130,12 +131,15 @@ ROLE_STAGE: dict[Role, Stage] = {
 have no pipeline stage of their own; they are charged to the queue. They are
 meant to run under their own run id and manifest, not a benchmark run's ledger."""
 
-GEMINI_ROLES: frozenset[Role] = frozenset({Role.generate, Role.screen})
+GEMINI_ROLES: frozenset[Role] = frozenset({Role.generate, Role.screen, Role.prove})
 """The roles Gemini may take. `Role.screen` is a proof attempt in the
 triviality screen: Lean checks the proof in proved mode, and the proved file
 must match the original, so a wrong proof cannot mark a record trivial.
 Gemini checks nothing: no encoding, audit, round trip, formalisation,
-literature check, or corollary claim (user decision 2026-11-26)."""
+literature check, or corollary claim (user decision 2026-11-26). `Role.prove`
+is a proof attempt in the prover loop, checked the same way; a proof that adds
+hypotheses goes to the audit, whose checker is never Gemini (user decision on
+bead minilab-880beb, 2026-11-26)."""
 
 ENV_ALLOWLIST: frozenset[str] = frozenset(
     {
@@ -173,7 +177,7 @@ class BudgetExceeded(Exception):
 
 
 class RoleNotAllowed(Exception):
-    """The family may not take this role (Gemini only generates and screens proofs)."""
+    """The family may not take this role (Gemini only generates and makes proof attempts)."""
 
 
 class NoChecker(Exception):
@@ -284,7 +288,7 @@ def call(
     role = Role(role)
     if family is Family.gemini and role not in GEMINI_ROLES:
         raise RoleNotAllowed(
-            f"gemini only generates and makes screen proofs; refused role {role.value}"
+            f"gemini only generates and makes proof attempts; refused role {role.value}"
         )
     pair = canonical_pair(pair)
     if family not in ledger.manifest.families:
