@@ -221,10 +221,10 @@ def _print_outcome(outcome: RunOutcome, root: Path) -> None:
 
 
 def _drive(store: RecordStore, run_id: str) -> RunOutcome:
-    memory = MemoryClient(load_manifest(store.root, run_id), McpTransport())
     try:
+        memory = MemoryClient(load_manifest(store.root, run_id), McpTransport())
         return drive(store, run_id, memory=memory)
-    except (RunBusy, BenchmarkRefused, FileNotFoundError, ValueError) as exc:
+    except (RunBusy, BenchmarkRefused, FileNotFoundError) as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
 

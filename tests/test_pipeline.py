@@ -335,26 +335,28 @@ def test_run_resume_after_failure(tmp_path: Path) -> None:
     assert len(made) == 2
     assert stages.calls == []
 
-    # On resume, Gemini's batch runs again; Claude's and Codex's do not. Then a
-    # model failure halfway through a record's stages stops the run again.
+    # On resume, the existing records run first; a model failure halfway
+    # through the second one's stages stops the run before Gemini's batch.
     gemini_id = f"{RUN}.g-gemini-info-4"
     stages.fail[(made[1].id, Stage.literature)] = ModelUnavailable("codex usage limit")
     second = drive(store, RUN, runners=runners, generator=generator)
     assert not second.finished
+    assert len(generator.calls) == 3
+    assert next_stage(store.load(made[0].id)) is None
+    halted = store.load(made[1].id)
+    assert halted.status is Status.survived
+    assert Stage.literature not in halted.stages
+
+    # A second resume finishes: Gemini's batch runs again, Claude's and Codex's
+    # do not, and every stage of every record is written exactly once.
+    third = drive(store, RUN, runners=runners, generator=generator)
+    assert third.finished
     assert [c[1] for c in generator.calls] == [
         Family.claude,
         Family.codex,
         Family.gemini,
         Family.gemini,
     ]
-    halted = store.load(made[1].id)
-    assert halted.status is Status.survived
-    assert Stage.literature not in halted.stages
-
-    # A second resume finishes: every stage of every record written exactly once.
-    third = drive(store, RUN, runners=runners, generator=generator)
-    assert third.finished
-    assert len(generator.calls) == 4
     assert len(stages.written) == len(set(stages.written))
     records = store.list(RUN)
     assert {r.id for r in records} == {made[0].id, made[1].id, gemini_id}
@@ -734,3 +736,170 @@ def test_cli_pairs_file(tmp_path: Path) -> None:
     path.write_text(json.dumps([["optimisation", "not-a-domain"]]))
     with pytest.raises(ValueError):
         choose_pairs(str(path), count=1, state_path=tmp_path / "s.json", seed=0)
+
+
+# --- guards found by review ------------------------------------------------------------
+
+
+def test_logged_batch_with_no_records_is_not_rerun(tmp_path: Path) -> None:
+    # A reply that could not be read makes no records; the batch is still done.
+    store = start(tmp_path, manifest(families=(Family.claude, Family.local)))
+    generator = FakeGenerator([])
+    drive(store, RUN, runners={}, generator=generator)
+    drive(store, RUN, runners={}, generator=generator)
+    assert len(generator.calls) == 1
+
+
+def test_a_record_that_stopped_the_run_goes_last(tmp_path: Path) -> None:
+    store = start(tmp_path, manifest(families=(Family.claude, Family.codex)))
+    stages = FakeStages()
+    generator = FakeGenerator(["survive", "survive"])
+    drive(store, RUN, runners={}, generator=generator)
+    first, second = store.list(RUN)
+    for _ in range(3):
+        stages.fail[(first.id, Stage.encoding)] = ModelUnavailable("call timed out")
+        result = drive(store, RUN, runners=stages.runners(), generator=generator)
+        assert result.stopped is not None
+    # Without the reordering, the first record would fail first every time.
+    assert next_stage(store.load(second.id)) is None
+    assert drive(store, RUN, runners=stages.runners(), generator=generator).finished
+
+
+def test_runner_that_writes_nothing_is_a_bug(tmp_path: Path) -> None:
+    store = start(tmp_path, manifest(families=(Family.claude, Family.local)))
+    drive(store, RUN, runners={}, generator=FakeGenerator(["survive"]))
+    runners = dict(FakeStages().runners())
+    runners[Stage.encoding] = lambda record_id, ctx: None
+    with pytest.raises(RuntimeError, match="without writing"):
+        drive(store, RUN, runners=runners, generator=FakeGenerator([]))
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param("SearchFailed", id="search"),
+        pytest.param("CertificationFailed", id="certification"),
+        pytest.param("CertificateUnavailable", id="certificate"),
+        pytest.param("LeanTimeout", id="lean-timeout"),
+        pytest.param("NoChecker", id="no-checker"),
+        pytest.param("NoFormaliser", id="no-formaliser"),
+    ],
+)
+def test_record_failures_skip_the_record(tmp_path: Path, error: str) -> None:
+    from minilab import pipeline
+
+    kind = next(k for k in pipeline.SKIP_RECORD if k.__name__ == error)
+    store = start(tmp_path, manifest(families=(Family.claude, Family.codex)))
+    stages = FakeStages()
+    generator = FakeGenerator(["survive", "survive"])
+    drive(store, RUN, runners={}, generator=generator)
+    first, second = store.list(RUN)
+    stages.fail[(first.id, Stage.falsifier)] = kind("failed")
+    result = drive(store, RUN, runners=stages.runners(), generator=generator)
+    assert result.stopped is None
+    assert [s.record_id for s in result.skipped] == [first.id]
+    assert next_stage(store.load(second.id)) is None
+
+
+@pytest.mark.parametrize("error", ["SandboxUnavailable", "LeanUnavailable"])
+def test_tool_failures_stop_the_run(tmp_path: Path, error: str) -> None:
+    from minilab import pipeline
+
+    kind = next(k for k in pipeline.STOP_RUN if k.__name__ == error)
+    store = start(tmp_path, manifest(families=(Family.claude, Family.codex)))
+    stages = FakeStages()
+    generator = FakeGenerator(["survive", "survive"])
+    drive(store, RUN, runners={}, generator=generator)
+    first, second = store.list(RUN)
+    stages.fail[(first.id, Stage.encoding)] = kind("tool down")
+    result = drive(store, RUN, runners=stages.runners(), generator=generator)
+    assert result.stopped is not None and "tool down" in result.stopped
+    assert Stage.encoding not in store.load(second.id).stages
+
+
+def test_ambiguous_parent_whose_child_was_lost_gets_it(tmp_path: Path) -> None:
+    store = start(tmp_path, manifest(families=(Family.claude, Family.local)))
+    drive(store, RUN, runners={}, generator=FakeGenerator(["survive"]))
+    (record,) = store.list(RUN)
+    sharper: dict[str, JsonValue] = {
+        "statement": "outcome:survive, sharper",
+        "objects": ["x"],
+        "assumptions": ["x > 0"],
+        "domain_of_validity": "x > 0",
+        "instance_family": "x: a rational",
+    }
+    # The encoding stage wrote the parent, then the process died before make_child.
+    store.write_stage(
+        record.id, Stage.encoding, out(agreed=False, sharper=sharper), status=Status.ambiguous
+    )
+    result = drive(store, RUN, runners=FakeStages().runners(), generator=FakeGenerator([]))
+    assert result.finished
+    children = [r for r in store.list(RUN) if r.provenance.parents == [record.id]]
+    assert len(children) == 1
+    assert children[0].status is Status.survived
+
+
+def test_scorer_waits_until_the_record_is_done(tmp_path: Path) -> None:
+    from minilab.literature.filter import LiteratureOutput, LiteratureUnchecked
+
+    store = start(tmp_path, manifest(families=(Family.claude, Family.local)))
+    stages = FakeStages()
+    drive(store, RUN, runners={}, generator=FakeGenerator(["proved"]))
+    (record,) = store.list(RUN)
+    stages.fail[(record.id, Stage.literature)] = LiteratureUnchecked(
+        LiteratureOutput.model_construct(notes="down")
+    )
+    drive(store, RUN, runners=stages.runners(), generator=FakeGenerator([]))
+    assert Stage.scorer not in store.load(record.id).stages
+    drive(store, RUN, runners=stages.runners(), generator=FakeGenerator([]))
+    done = store.load(record.id)
+    assert done.status is Status.proved
+    assert done.stages[Stage.scorer].data["kind"] == "proved"
+
+
+def test_missing_settings_refuse_to_drive(tmp_path: Path) -> None:
+    store = start(tmp_path, manifest(families=(Family.claude, Family.local)))
+    (tmp_path / "runs" / RUN / "driver" / "settings.json").unlink()
+    with pytest.raises(FileNotFoundError):
+        drive(store, RUN, runners={}, generator=FakeGenerator([]))
+
+
+def test_benchmark_is_checked_again_on_resume(tmp_path: Path) -> None:
+    from minilab import pipeline
+
+    m = manifest(literature_before=BENCHMARK_LITERATURE_CAP)
+    store = RecordStore(tmp_path)
+    pipeline_isolation = pipeline.load_isolation
+    start_run(store, m, DriverSettings(benchmark=True))
+    try:
+        pipeline.load_isolation = lambda: {  # type: ignore[assignment]
+            **ISOLATED,
+            "gemini": {"status": "normal runs only", "benchmark": False},
+        }
+        with pytest.raises(BenchmarkRefused, match="gemini"):
+            drive(store, RUN, runners={}, generator=FakeGenerator([]))
+    finally:
+        pipeline.load_isolation = pipeline_isolation
+
+
+def test_memory_client_must_hold_the_runs_manifest(tmp_path: Path) -> None:
+    m = manifest(policy=MemoryPolicy.pair, families=(Family.claude, Family.local))
+    store = start(tmp_path, m)
+    wider = MemoryClient(m.model_copy(update={"memory_policy": MemoryPolicy.all}), SpyTransport())
+    with pytest.raises(ValueError, match="manifest"):
+        drive(store, RUN, runners={}, generator=FakeGenerator([]), memory=wider)
+
+
+def test_superseded_memories_are_dropped(tmp_path: Path) -> None:
+    m = manifest(policy=MemoryPolicy.all, families=(Family.claude, Family.local))
+    spy = SpyTransport(
+        [
+            {
+                "id": "a",
+                "content": memory_content("old.r1", "old form"),
+                "annotations": {"superseded_by": "b"},
+            },
+            {"id": "b", "content": memory_content("old.r1", "new form")},
+        ]
+    )
+    assert [e.statement for e in MemoryClient(m, spy).recall(PAIR)] == ["new form"]

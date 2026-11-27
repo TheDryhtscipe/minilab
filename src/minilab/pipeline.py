@@ -35,6 +35,11 @@ What stops what:
   `RunOutcome.skipped`. A later `drive` tries it again.
 - Anything else is a bug and is raised.
 
+Each call runs the existing records before it generates, so a generating
+family at its usage limit does not hold up records already made. A record
+that stopped the run is put last on the next call (`driver/stalled.json`),
+so one record that keeps failing does not starve the others. An ambiguous
+record whose child a crash left unstored gets it stored (`make_child`).
 Only one driver may work on a run at a time (`run_lock`).
 """
 
@@ -52,7 +57,12 @@ from typing import Annotated, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
-from minilab.encoding.agree import SandboxUnavailable, run_encoding_stage
+from minilab.encoding.agree import (
+    SandboxUnavailable,
+    child_id,
+    make_child,
+    run_encoding_stage,
+)
 from minilab.falsify.search import CertificateUnavailable
 from minilab.falsify.stage import CertificationFailed, SearchFailed, run_falsifier_stage
 from minilab.formalise.formaliser import LeanTimeout, NoFormaliser
@@ -78,7 +88,14 @@ from minilab.records import (
     Status,
     check_run_id,
 )
-from minilab.run import MemoryPolicy, RunManifest, load_manifest, manifest_path, save_manifest
+from minilab.run import (
+    ManifestExists,
+    MemoryPolicy,
+    RunManifest,
+    load_manifest,
+    manifest_path,
+    save_manifest,
+)
 from minilab.scheduler import Pair, canonical_pair
 from minilab.screen.triviality import run_triviality_stage
 
@@ -181,7 +198,11 @@ def _settings_path(root: Path, run_id: str) -> Path:
 
 
 def load_settings(store: RecordStore, run_id: str) -> DriverSettings:
-    """Read a run's driver settings (written by `start_run`)."""
+    """Read a run's driver settings (written by `start_run`).
+
+    Raise `FileNotFoundError` if the run has none: a default would quietly
+    turn off a benchmark run's checks.
+    """
     return DriverSettings.model_validate_json(_settings_path(store.root, run_id).read_bytes())
 
 
@@ -202,8 +223,7 @@ class StageContext:
         backends: Mapping[Family, Backend] | None = None,
     ) -> "StageContext":
         ledger = Ledger(store, run_id)
-        path = _settings_path(store.root, run_id)
-        settings = load_settings(store, run_id) if path.exists() else DriverSettings()
+        settings = load_settings(store, run_id)
         return cls(ledger, Budget.from_manifest(ledger.manifest), backends, settings)
 
 
@@ -348,14 +368,18 @@ def start_run(store: RecordStore, manifest: RunManifest, settings: DriverSetting
     """Save a new run's manifest and driver settings. Nothing is generated yet.
 
     A benchmark run is checked first (`check_benchmark`); a refused run
-    leaves nothing on disk. Raise `ManifestExists` if the run already exists.
+    leaves nothing on disk. The settings are written before the manifest,
+    so a run with a manifest always has its settings. Raise `ManifestExists`
+    if the run already exists.
     """
     if settings.benchmark:
         check_benchmark(manifest)
-    save_manifest(store.root, manifest)
+    if manifest_path(store.root, manifest.run_id).exists():
+        raise ManifestExists(manifest.run_id)
     path = _settings_path(store.root, manifest.run_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     _write_json(path, settings.model_dump_json(indent=2))
+    save_manifest(store.root, manifest)
 
 
 def _write_json(path: Path, text: str) -> None:
@@ -495,8 +519,10 @@ def _sync_memory(store: RecordStore, run_id: str, memory: MemoryClient | None) -
 
 
 def _score_queue(store: RecordStore, run_id: str) -> None:
+    """Score each queue item that is done. A record with a stage still to run is
+    not scored yet, so its score is never frozen before its proof exists."""
     for item in queue_items(store, run_id):
-        if Stage.scorer in item.record.stages:
+        if Stage.scorer in item.record.stages or next_stage(item.record) is not None:
             continue
         data = cast(dict[str, JsonValue], item.score.model_dump(mode="json"))
         store.write_stage(
@@ -504,6 +530,43 @@ def _score_queue(store: RecordStore, run_id: str) -> None:
             Stage.scorer,
             StageOutput(written_at=datetime.now(UTC), data={**data, "kind": item.kind.value}),
         )
+
+
+def _stalled_path(root: Path, run_id: str) -> Path:
+    return _driver_dir(root, run_id) / "stalled.json"
+
+
+def _read_stalled(root: Path, run_id: str) -> set[str]:
+    path = _stalled_path(root, run_id)
+    if not path.exists():
+        return set()
+    raw: JsonValue = json.loads(path.read_text(encoding="utf-8"))
+    return {item for item in raw if isinstance(item, str)} if isinstance(raw, list) else set()
+
+
+def _write_stalled(root: Path, run_id: str, stalled: set[str]) -> None:
+    _write_json(_stalled_path(root, run_id), json.dumps(sorted(stalled)))
+
+
+def _recover_child(store: RecordStore, record: Record) -> bool:
+    """Store an ambiguous record's sharper child if a crash left it unstored.
+
+    The encoding stage writes the parent, then stores the child; `make_child`
+    makes no model call and returns an existing child, so this is safe to
+    repeat. Return True if a child was stored now.
+    """
+    encoding = record.stages.get(Stage.encoding)
+    if record.status is not Status.ambiguous or encoding is None:
+        return False
+    if "sharper" not in encoding.data:
+        return False
+    try:
+        store.load(child_id(record))
+        return False
+    except KeyError:
+        pass
+    make_child(store, record.id)
+    return True
 
 
 class _Stop(Exception):
@@ -561,11 +624,19 @@ def _run_records(
     outcome: RunOutcome,
 ) -> None:
     run_id = ctx.ledger.run_id
-    blocked: set[str] = set()
+    # Skipped and waiting records stay put for the rest of this drive call.
+    blocked: set[str] = {s.record_id for s in outcome.skipped} | set(outcome.waiting)
+    stalled = _read_stalled(store.root, run_id)
     while True:
         progressed = False
-        for listed in store.list(run_id):
+        # Records that stopped an earlier call go last, so one record that
+        # keeps failing does not hold up the others on every resume.
+        listed_records = sorted(store.list(run_id), key=lambda r: (r.id in stalled, r.id))
+        for listed in listed_records:
             if listed.id in blocked or canonical_pair(listed.pair) in outcome.over_budget:
+                continue
+            if _recover_child(store, listed):
+                progressed = True
                 continue
             record = listed
             while (stage := next_stage(record)) is not None:
@@ -589,6 +660,8 @@ def _run_records(
                     )
                     break
                 except STOP_RUN as exc:
+                    stalled.add(record.id)
+                    _write_stalled(store.root, run_id, stalled)
                     raise _Stop(f"{stage.value} on {record.id} failed: {exc}") from exc
                 except SKIP_RECORD as exc:
                     skipped = Skipped(
@@ -601,6 +674,9 @@ def _run_records(
                     )
                     break
                 progressed = True
+                if record.id in stalled:
+                    stalled.discard(record.id)
+                    _write_stalled(store.root, run_id, stalled)
                 after = store.load(record.id)
                 if stage not in after.stages:
                     raise RuntimeError(
@@ -634,13 +710,17 @@ def drive(
         ctx = StageContext.for_run(store, run_id, backends)
         if ctx.settings.benchmark:
             check_benchmark(load_manifest(store.root, run_id))
-        if memory is not None and memory.manifest.run_id != run_id:
-            raise ValueError(f"the memory client is for run {memory.manifest.run_id}")
+        if memory is not None and memory.manifest != ctx.ledger.manifest:
+            raise ValueError(f"the memory client's manifest is not run {run_id}'s manifest")
         outcome = RunOutcome(run_id=run_id, finished=False)
         _log_event(store.root, run_id, event="drive-start")
+        chosen = default_runners() if runners is None else runners
         try:
+            # Records first, so a generator family at its usage limit does not
+            # hold up the records that already exist.
+            _run_records(store, ctx, chosen, outcome)
             _generate(store, ctx, generator or default_generator, memory, outcome.over_budget)
-            _run_records(store, ctx, default_runners() if runners is None else runners, outcome)
+            _run_records(store, ctx, chosen, outcome)
         except _Stop as stop:
             outcome.stopped = str(stop)
             _log_event(store.root, run_id, event="stopped", reason=outcome.stopped)

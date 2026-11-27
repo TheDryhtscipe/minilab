@@ -270,6 +270,9 @@ class MemoryClient:
         for item in memories:
             if not isinstance(item, dict):
                 continue
+            annotations = item.get("annotations")
+            if isinstance(annotations, dict) and annotations.get("superseded_by"):
+                continue
             content = item.get("content")
             earlier = _parse(content) if isinstance(content, str) else None
             if earlier is None or earlier.run_id == self.manifest.run_id:
