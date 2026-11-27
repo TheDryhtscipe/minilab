@@ -22,6 +22,7 @@ from typer.testing import CliRunner
 from minilab.cli import app
 from minilab.memory import (
     VAULT,
+    McpTransport,
     MemoryClient,
     MemoryReadRefused,
     MemoryUnavailable,
@@ -903,3 +904,33 @@ def test_superseded_memories_are_dropped(tmp_path: Path) -> None:
         ]
     )
     assert [e.statement for e in MemoryClient(m, spy).recall(PAIR)] == ["new form"]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://example.org/mcp",
+        "https://10.0.0.5:8750/mcp",
+        "http://127.0.0.1.evil.example/mcp",
+        "http://localhost@evil.example/mcp",
+        "http://evil.example/127.0.0.1/mcp",
+        "ftp://127.0.0.1/mcp",
+        "127.0.0.1:8750/mcp",
+    ],
+)
+def test_memory_transport_refuses_a_non_loopback_url(
+    url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(ValueError, match="loopback"):
+        McpTransport(url)
+    monkeypatch.setenv("MUNINN_MCP_URL", url)
+    with pytest.raises(ValueError, match="loopback"):
+        McpTransport()
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["http://127.0.0.1:8750/mcp", "http://localhost:8750/mcp", "http://[::1]:8750/mcp"],
+)
+def test_memory_transport_accepts_a_loopback_url(url: str) -> None:
+    assert McpTransport(url).url == url
