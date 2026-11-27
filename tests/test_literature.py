@@ -617,7 +617,7 @@ def test_unreadable_judge_reply_is_not_not_found(store: RecordStore, tmp_path: P
 SRC = Path(minilab.__file__).parent
 THIRD_PARTY = {"pydantic", "mpmath", "flint", "numpy", "scipy", "httpx", "typer", "minilab"}
 NETWORK_STDLIB = {"urllib", "http", "socket", "ftplib", "smtplib", "webbrowser", "xmlrpc", "ssl"}
-HTTPX_MODULES = {"literature/http.py", "models/backends.py"}
+HTTPX_MODULES = {"literature/http.py", "memory.py", "models/backends.py"}
 LOOPBACK = {"127.0.0.1", "localhost"}
 
 

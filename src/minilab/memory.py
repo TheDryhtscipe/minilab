@@ -63,6 +63,7 @@ RECORD_TAG = "minilab-record"
 
 DEFAULT_MCP_URL = "http://127.0.0.1:8750/mcp"
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _TOKEN_FILE = Path("~/.muninn/mcp.token")
 _TIMEOUT_S = 10.0
 _STATEMENT = "Statement: "
@@ -80,6 +81,22 @@ class MemoryTransport(Protocol):
     """Calls one MuninnDB tool and returns the JSON object it answered with."""
 
     def call_tool(self, name: str, arguments: dict[str, JsonValue]) -> dict[str, JsonValue]: ...
+
+
+def _loopback_url(url: str) -> str:
+    """`url` if it is http or https on this machine; otherwise `ValueError`.
+
+    The bearer token goes to this address, and a run must not reach the network beyond its
+    allowed hosts, so the MuninnDB endpoint has to be on loopback.
+    """
+    parsed = httpx.URL(url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.userinfo
+        or parsed.host not in _LOOPBACK_HOSTS
+    ):
+        raise ValueError(f"MuninnDB URL must be http or https on a loopback host, not {url!r}")
+    return url
 
 
 def _token() -> str | None:
@@ -103,7 +120,9 @@ class McpTransport:
         http: httpx.BaseTransport | None = None,
         timeout_s: float = _TIMEOUT_S,
     ) -> None:
-        self.url = url or os.environ.get("MUNINN_MCP_URL", "").strip() or DEFAULT_MCP_URL
+        self.url = _loopback_url(
+            url or os.environ.get("MUNINN_MCP_URL", "").strip() or DEFAULT_MCP_URL
+        )
         self._http = http
         self._timeout_s = timeout_s
 
