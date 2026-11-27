@@ -6,10 +6,12 @@ Search may suggest a kill; only a certificate makes one (design doc-gmj,
 1. **Cold starts.** `starts` fresh samples from the encoding's sampler, each
    drawn from its own seed.
 2. **Local optimisation.** From each start that is in the domain and meets
-   every assumption, Nelder-Mead (`scipy.optimize.minimize`) on the margin,
-   with a penalty outside the domain. Every run starts cold from its own
-   sample: nothing carries from one run to the next. The optimiser only
-   suggests points; a certificate is computed afresh by the library checker.
+   every assumption, Nelder-Mead on the margin, with a penalty outside the
+   domain. Every run starts cold from its own sample: nothing carries from
+   one run to the next. The runs go in step: each round, every run that has
+   not finished asks for one point, and one batch evaluates them all
+   (decision doc-2nx). The optimiser only suggests points; a certificate is
+   computed afresh by the library checker.
 3. **Boundary sampling.** From valid points, rays in random directions: each
    ray is followed until it leaves the domain, then bisected to the last valid
    point before the edge.
@@ -23,15 +25,14 @@ encodings (decision doc-j6t). With no kill, the result carries a
 
 An encoding runs in this process (`LocalEvaluator`, for library and test
 encodings) or in the sandbox (`SandboxEvaluator`, for model-written ones).
-The sandbox evaluates a batch of points in one child process, so samples and
-boundary rays are batched; the local optimiser asks for one point at a time,
-so each of its steps is one child process.
+The sandbox evaluates a batch of points in one child process, so samples,
+boundary rays, and each round of the local runs are batched.
 """
 
 import json
 import math
 import random
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from functools import partial
@@ -42,7 +43,6 @@ import mpmath
 import numpy as np
 import numpy.typing as npt
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from scipy.optimize import minimize  # pyright: ignore[reportMissingTypeStubs, reportUnknownVariableType]
 
 from minilab.certify import (
     Certificate,
@@ -452,33 +452,113 @@ def _objective(e: Evaluation) -> float:
     return max(-PENALTY, min(PENALTY, float(e.margin)))
 
 
-def _local(
-    tracker: _Tracker, layout: Layout, steps: npt.NDArray[np.float64], max_evaluations: int
-) -> int:
-    """Run Nelder-Mead from the layout's own point; return the points it asked for."""
-    x0 = layout.vector()
+# Nelder-Mead coefficients: reflection, expansion, contraction, and shrink
+# (the standard values, as in scipy's default).
+_RHO, _CHI, _PSI, _SIGMA = 1.0, 2.0, 0.5, 0.5
+_XATOL, _FATOL = 1e-12, 1e-15
+
+Vector = npt.NDArray[np.float64]
+Steps = Generator[Vector, float]
+
+
+class _Spent(Exception):
+    """A Nelder-Mead run has asked for all the points its budget allows."""
+
+
+def _nelder_mead(simplex: Vector, max_evaluations: int) -> Steps:
+    """Nelder-Mead from `simplex`, one point at a time.
+
+    The generator yields each point it wants scored and takes the score
+    through `send`. It stops after `max_evaluations` points, or once the
+    simplex has shrunk below the tolerances.
+    """
     asked = 0
 
-    def f(v: npt.NDArray[np.float64]) -> float:
+    def ask(v: Vector) -> Generator[Vector, float, float]:
         nonlocal asked
+        if asked >= max_evaluations:
+            raise _Spent
         asked += 1
-        x = layout.build(v)
-        if x is None:
-            return PENALTY
-        return _objective(tracker.evaluate([x])[0])
+        return (yield v)
 
-    simplex = np.vstack([x0] + [x0 + np.eye(len(x0))[i] * steps[i] for i in range(len(x0))])
-    minimize(
-        f,
-        x0,
-        method="Nelder-Mead",
-        options={
-            "maxfev": max_evaluations,
-            "initial_simplex": simplex,
-            "xatol": 1e-12,
-            "fatol": 1e-15,
-        },
-    )
+    sim = simplex.copy()
+    n = sim.shape[1]
+    try:
+        fsim = np.empty(n + 1, dtype=np.float64)
+        for j in range(n + 1):
+            fsim[j] = yield from ask(sim[j])
+        while True:
+            order = np.argsort(fsim, kind="stable")
+            sim, fsim = sim[order], fsim[order]
+            if (
+                float(np.max(np.abs(sim[1:] - sim[0]))) <= _XATOL
+                and float(np.max(np.abs(fsim[1:] - fsim[0]))) <= _FATOL
+            ):
+                return
+            centre = sim[:-1].mean(axis=0)
+            worst = sim[-1]
+            xr = (1 + _RHO) * centre - _RHO * worst
+            fr = yield from ask(xr)
+            if fr < fsim[0]:
+                xe = (1 + _RHO * _CHI) * centre - _RHO * _CHI * worst
+                fe = yield from ask(xe)
+                sim[-1], fsim[-1] = (xe, fe) if fe < fr else (xr, fr)
+                continue
+            if fr < fsim[-2]:
+                sim[-1], fsim[-1] = xr, fr
+                continue
+            if fr < fsim[-1]:
+                xc = (1 + _PSI * _RHO) * centre - _PSI * _RHO * worst
+                fc = yield from ask(xc)
+                if fc <= fr:
+                    sim[-1], fsim[-1] = xc, fc
+                    continue
+            else:
+                xc = (1 - _PSI) * centre + _PSI * worst
+                fc = yield from ask(xc)
+                if fc < fsim[-1]:
+                    sim[-1], fsim[-1] = xc, fc
+                    continue
+            for j in range(1, n + 1):
+                sim[j] = sim[0] + _SIGMA * (sim[j] - sim[0])
+                fsim[j] = yield from ask(sim[j])
+    except _Spent:
+        return
+
+
+def _local(
+    tracker: _Tracker,
+    runs: Sequence[tuple[Layout, Vector]],
+    max_evaluations: int,
+) -> int:
+    """Run Nelder-Mead from each layout's own point, all runs in step.
+
+    Each round, every run that has not finished asks for one point, and one
+    tracker batch evaluates them, in the order of `runs`. Return the number of
+    points the runs asked for.
+    """
+    live: list[tuple[Layout, Steps, Vector]] = []
+    for layout, steps in runs:
+        x0 = layout.vector()
+        simplex = np.vstack([x0] + [x0 + np.eye(len(x0))[i] * steps[i] for i in range(len(x0))])
+        gen = _nelder_mead(simplex, max_evaluations)
+        try:
+            live.append((layout, gen, next(gen)))
+        except StopIteration:
+            continue
+    asked = 0
+    while live:
+        asked += len(live)
+        built = [layout.build(v) for layout, _, v in live]
+        scored = iter(tracker.evaluate([x for x in built if x is not None]))
+        following: list[tuple[Layout, Steps, Vector]] = []
+        for (layout, gen, _), x in zip(live, built, strict=True):
+            value = PENALTY if x is None else _objective(next(scored))
+            try:
+                following.append((layout, gen, gen.send(value)))
+            except StopIteration:
+                continue
+        live = following
     return asked
 
 
@@ -592,12 +672,14 @@ def search(evaluator: Evaluator, budget: SearchBudget, rng: random.Random) -> Se
     dimensions = 0
     asked = 0
     if budget.local_evaluations > 0:
+        runs: list[tuple[Layout, Vector]] = []
         for e in valid_starts:
             layout = Layout.of(e.point, integral)
             if not layout.coords:
                 continue
             dimensions = max(dimensions, len(layout.coords))
-            asked += _local(tracker, layout, _steps(layout, spread), budget.local_evaluations)
+            runs.append((layout, _steps(layout, spread)))
+        asked = _local(tracker, runs, budget.local_evaluations)
     else:
         dimensions = max((len(coordinates(x)) for x in samples), default=0)
     edge = _boundary(tracker, valid_starts, integral, spread, budget.boundary_rays, rng)

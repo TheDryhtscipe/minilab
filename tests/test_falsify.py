@@ -14,7 +14,7 @@ sandbox.
 import inspect
 import json
 import random
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from fractions import Fraction
 from functools import partial
@@ -32,7 +32,7 @@ from minilab.encoding.sandbox import EncodingOutput, Sandboxed, SandboxFailure
 from minilab.falsify.coverage import CoverageReport
 from minilab.falsify.mechanism import check_mechanism
 from minilab.falsify.reformulate import check_reformulation, reformulate_and_attack
-from minilab.falsify.search import LocalEvaluator, SearchBudget, attack
+from minilab.falsify.search import Evaluation, LocalEvaluator, SearchBudget, attack, search
 from minilab.falsify.stage import CertificationFailed, run_falsifier_stage
 from minilab.ledger import Ledger
 from minilab.models.adapter import Budget, ModelReply, ModelUnavailable, default_backends
@@ -377,6 +377,40 @@ def test_sampling_alone_misses_the_planted_violation() -> None:
     assert not result.killed
     assert result.coverage.worst_margin is not None
     assert Fraction(result.coverage.worst_margin) > 0
+
+
+class CountingEvaluator(LocalEvaluator):
+    """A LocalEvaluator that records the size of every batch it is asked to evaluate."""
+
+    def __init__(self, enc: Planted) -> None:
+        super().__init__(enc)
+        self.batches: list[int] = []
+
+    def evaluate(self, points: Sequence[Instance]) -> list[Evaluation]:
+        self.batches.append(len(points))
+        return super().evaluate(points)
+
+
+def test_local_searches_run_in_step_one_batch_per_round() -> None:
+    # A sandboxed encoding costs one child process per batch, so the local searches
+    # must share batches: one round of every live search per call, not one point.
+    evaluator = CountingEvaluator(Planted())
+    outcome = search(
+        evaluator,
+        SearchBudget(starts=8, local_evaluations=60, boundary_rays=0),
+        random.Random(1),
+    )
+    assert 8 * 30 < outcome.local_evaluations <= 8 * 60
+    # One batch for the starts, then at most one per round of local steps.
+    assert len(evaluator.batches) <= 1 + 60
+    assert max(evaluator.batches[1:]) == 8
+
+
+def test_local_search_is_repeatable() -> None:
+    budget = SearchBudget(starts=8, local_evaluations=60, boundary_rays=0)
+    first = search(LocalEvaluator(Planted()), budget, random.Random(3))
+    second = search(LocalEvaluator(Planted()), budget, random.Random(3))
+    assert [e.point for e in first.evaluations] == [e.point for e in second.evaluations]
 
 
 def test_float_violation_without_certificate_is_not_a_kill() -> None:
