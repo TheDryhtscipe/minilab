@@ -19,7 +19,12 @@ import pytest
 from pydantic import JsonValue
 
 from minilab.formalise.audit import AuditResult
-from minilab.formalise.formaliser import STANDARD_AXIOMS, FormalOutput, formal_from_source
+from minilab.formalise.formaliser import (
+    STANDARD_AXIOMS,
+    FormalOutput,
+    LeanTimeout,
+    formal_from_source,
+)
 from minilab.formalise.vacuity import VacuityResult, WitnessCheck
 from minilab.ledger import Ledger
 from minilab.models.adapter import GEMINI_ROLES, Budget, Role
@@ -646,3 +651,80 @@ def test_no_prover_family_writes_an_unattempted_stage(store: RecordStore) -> Non
     assert result is not None and not result.proved and result.prover is None
     assert calls(backends, "prove") == []
     assert store.load(record.id).status is Status.survived
+
+
+# --- found in review ---
+
+PAD = " ∧ ".join(["(1 : ℕ) = 1"] * 160)
+"""Long enough that Lean's printed conclusion is cut (the probe keeps 1500 characters)."""
+
+CUT_FALSE = f"""import Mathlib
+
+theorem conjecture (x : ℕ) : {PAD} ∧ x = x + 1 := by
+  sorry
+"""
+
+
+def test_cut_statement_cannot_be_restated(store: RecordStore) -> None:
+    # The two conclusions print the same once cut, so only the refusal stops this.
+    assert probed(CUT_FALSE).conclusion_truncated
+    record = screened_record(store, CUT_FALSE)
+    swapped = f"theorem conjecture (x : ℕ) : {PAD} ∧ x = x := by\n  simp"
+    backends = fakes({Family.claude: {"prove": [lean_block(swapped)]}})
+    result = run_stage(store, record, backends, ProverBudget(max_attempts=1))
+    assert result is not None and not result.proved and not result.held
+    assert result.attempts[0].outcome == "refused"
+    assert "too long" in result.attempts[0].detail
+    assert store.load(record.id).status is Status.survived
+
+
+def test_every_attempt_timed_out_raises_and_writes_nothing(
+    store: RecordStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = loop.formal_from_source
+
+    def slow(
+        source: str,
+        family: Family | str,
+        model: str,
+        *,
+        timeout_s: float = LEAN_TIMEOUT,
+        attempts: int = 1,
+        proved: bool = False,
+    ) -> FormalOutput:
+        if proved:
+            raise LeanTimeout("Lean hit its time limit")
+        return real(source, family, model, timeout_s=timeout_s, attempts=attempts, proved=proved)
+
+    monkeypatch.setattr(loop, "formal_from_source", slow)
+    record = screened_record(store, NEEDS_INDUCTION)
+    path = store.root / "runs" / RUN / "records" / f"{record.id}.json"
+    before = path.read_bytes()
+    backends = fakes({Family.claude: {"prove": [lean_block(INDUCTION_PROOF)]}})
+    with pytest.raises(LeanTimeout):
+        run_stage(store, record, backends, ProverBudget(max_attempts=2))
+    assert path.read_bytes() == before
+
+
+def test_added_hypothesis_with_changed_conclusion_is_refused(store: RecordStore) -> None:
+    record = screened_record(store, FALSE)
+    changed = "theorem conjecture (x : ℝ) (hx : 0 < x) (h1 : x < 1) : 0 < x := by\n  exact hx"
+    backends = fakes({Family.claude: {"prove": [lean_block(changed)]}})
+    result = run_stage(store, record, backends, ProverBudget(max_attempts=1))
+    assert result is not None and not result.held and not result.proved
+    assert result.attempts[0].outcome == "refused"
+    assert "conclusion" in result.attempts[0].detail
+    assert calls(backends, "audit") == []
+
+
+def test_gemini_weakened_proof_is_audited_by_codex(store: RecordStore) -> None:
+    record = screened_record(store, FALSE)
+    backends = fakes(
+        {
+            Family.gemini: {"prove": [lean_block(WEAKENED)]},
+            Family.codex: {"audit": [audit_reply(hx="matches", h1="weakening")]},
+        }
+    )
+    result = run_stage(store, record, backends, families=(Family.gemini, Family.codex))
+    assert result is not None and result.held and result.prover is Family.gemini
+    assert [f for f, _ in calls(backends, "audit")] == [Family.codex]

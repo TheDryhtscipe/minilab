@@ -22,7 +22,10 @@ A reply is read in one of two ways:
 - a reply whose first Lean block restates `theorem conjecture` (or `lemma
   conjecture`) replaces the file's whole `conjecture` declaration with the
   restated one, from its header to the end of the block. This is how the
-  model adds hypotheses.
+  model adds hypotheses. A restatement is refused when Lean's printed
+  statement was cut (a binder type or the conclusion over the probe's length
+  limit): the comparison below reads only the printed text, so two different
+  statements could look the same.
 
 Lean checks the candidate in proved mode (`formal_from_source` with
 `proved=True`): the text gate, the command check, the probe, no `sorry`
@@ -41,8 +44,9 @@ statement with the original (`statement_mismatch`):
   binder, an added declaration): `refused`.
 
 A Lean time-out on a candidate is that attempt's outcome (`timed_out`), never
-a verdict. A model failure (`ModelUnavailable`) or a spent pair budget
-(`BudgetExceeded`) raises.
+a verdict. If every attempt timed out, `run_prover_stage` raises `LeanTimeout`
+and writes nothing, so the prover can run again. A model failure
+(`ModelUnavailable`) or a spent pair budget (`BudgetExceeded`) raises.
 
 `run_prover_stage` runs the loop on a screened survivor and writes the
 record's prover stage. The status it sets (user decisions on bead
@@ -200,8 +204,8 @@ def added_binders(original: FormalOutput, proved: FormalOutput) -> list[Binder] 
     is a hypothesis (a proposition, not an instance binder).
     """
 
-    def key(b: Binder) -> tuple[str, str, bool, bool]:
-        return (b.name, b.type, b.prop, b.instance)
+    def key(b: Binder) -> tuple[str, str, bool, bool, bool]:
+        return (b.name, b.type, b.prop, b.instance, b.truncated)
 
     wanted = [key(b) for b in original.binders]
     matched = 0
@@ -315,10 +319,22 @@ def _why(checked: _Checked) -> str:
     return "Lean refused it:\n\n" + fenced(checked.detail, "")
 
 
+def _cut(formal: FormalOutput) -> bool:
+    """Whether Lean's printed statement of `formal` was cut, so two different
+    statements could print the same."""
+    return formal.conclusion_truncated or any(b.truncated for b in formal.binders)
+
+
 def _candidate(formal: FormalOutput, block: str, proof: str) -> tuple[str | None, _Checked | None]:
     """The file to check for a reply, or why there is none."""
     restated = _restated(formal, block)
     if restated is not None:
+        if _cut(formal):
+            return None, _Checked(
+                outcome="refused",
+                detail="the statement is too long for its printed text to be compared in full, "
+                "so it may not be restated; give only the tactic proof",
+            )
         return restated, None
     if not proof.strip():
         return None, _Checked(outcome="no_proof", detail="no proof was given")
@@ -509,9 +525,10 @@ def run_prover_stage(
     The stage's data: `attempted`, `proved`, `held`, `hold_reasons`,
     `weakened`, `added_hypotheses`, `weakened_statement`, `audit`,
     `reasons`, `prover`, `model`, `proof`, `axioms`, `attempts`, `tokens`,
-    and `stopped`. A model failure, a spent pair budget, or a Lean time-out
-    on the re-check raises, leaving the record unchanged (the ledger still
-    holds each finished call's charge). Return the result, or None if the
+    and `stopped`. A model failure, a spent pair budget, a Lean time-out
+    on the re-check, or Lean timing out on every proof attempt raises,
+    leaving the record unchanged (the ledger still holds each finished
+    call's charge). Return the result, or None if the
     record was skipped.
     """
     store = ledger.store
@@ -551,6 +568,11 @@ def run_prover_stage(
         backends=backends,
         lean_timeout_s=lean_timeout_s,
     )
+    if result.attempts and all(a.outcome == "timed_out" for a in result.attempts):
+        raise LeanTimeout(
+            f"Lean timed out on all {len(result.attempts)} of the prover's proofs for "
+            f"{record_id}; the record is unchanged, so the prover can run again"
+        )
     if result.proved or result.held:
         flags = hold_reasons(formaliser.data)
         if flags:
