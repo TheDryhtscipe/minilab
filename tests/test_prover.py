@@ -40,7 +40,7 @@ from minilab.prove.loop import (
     run_prover_stage,
 )
 from minilab.records import Family, Provenance, Record, RecordStore, Stage, StageOutput, Status
-from minilab.run import MemoryPolicy, RunManifest, save_manifest
+from minilab.run import DEFAULT_MODELS, MemoryPolicy, RunManifest, default_models, save_manifest
 
 RUN = "prv"
 PAIR = ("information-theory", "optimisation")
@@ -85,6 +85,7 @@ class FakeBackend:
 
     def __init__(self, family: Family, replies: Mapping[str, list[str]], tokens: int = 10) -> None:
         self.family = family
+        self.model = DEFAULT_MODELS[family]
         self.replies = {k: list(v) for k, v in replies.items()}
         self.tokens = tokens
         self.prompts: list[tuple[str, str]] = []
@@ -177,6 +178,7 @@ def make_ledger(store: RecordStore, families: tuple[Family, ...] = tuple(Family)
             literature_before=None,
             budget_tokens_per_pair=BUDGET.tokens_per_pair,
             families=families,
+            models=default_models(families),
             started=datetime(2026, 11, 26, 12, 0, tzinfo=UTC),
         ),
     )
