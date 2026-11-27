@@ -35,7 +35,7 @@ from minilab.records import (
     StageOutput,
     Status,
 )
-from minilab.run import MemoryPolicy, RunManifest, save_manifest
+from minilab.run import MemoryPolicy, RunManifest, default_models, save_manifest
 from minilab.score import score, token_count
 
 RUN = "run-1"
@@ -183,6 +183,7 @@ def ledger(store: RecordStore) -> Ledger:
             literature_before=None,
             budget_tokens_per_pair=300_000,
             families=(Family.claude, Family.codex),
+            models=default_models((Family.claude, Family.codex)),
             started=T0,
         ),
     )

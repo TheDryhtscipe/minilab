@@ -42,8 +42,9 @@ from typing import Literal
 import httpx
 from pydantic import BaseModel
 
-from minilab.models.adapter import ModelUnavailable, default_backends, isolated_run
+from minilab.models.adapter import ModelUnavailable, backends_for, isolated_run
 from minilab.records import Family
+from minilab.run import DEFAULT_MODELS
 
 REPO = Path(__file__).resolve().parent.parent
 ISOLATION = REPO / "src" / "minilab" / "models" / "isolation.json"
@@ -160,7 +161,7 @@ def probe(families: list[Family]) -> ProbeReport:
             "",
         ),
     }
-    backends = default_backends()
+    backends = backends_for({f: DEFAULT_MODELS[f] for f in families})
     probed: list[tuple[Family, datetime, dict[str, Attempt], str | None]] = []
     try:
         for family in families:

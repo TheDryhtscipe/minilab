@@ -79,6 +79,7 @@ __all__ = [
     "Role",
     "RoleNotAllowed",
     "call",
+    "backends_for",
     "default_backends",
     "isolated_run",
     "pick_checker",
@@ -204,13 +205,20 @@ def scrubbed_env() -> dict[str, str]:
     return {name: value for name, value in os.environ.items() if name in ENV_ALLOWLIST}
 
 
-def default_backends() -> dict[Family, Backend]:
-    return {
-        Family.claude: ClaudeBackend(),
-        Family.codex: CodexBackend(),
-        Family.gemini: GeminiBackend(),
-        Family.local: LocalBackend(),
+def backends_for(models: Mapping[Family, str]) -> dict[Family, Backend]:
+    """Build a backend for each family in `models`, asking for its model id."""
+    makers: dict[Family, Callable[[str], Backend]] = {
+        Family.claude: lambda model: ClaudeBackend(model=model),
+        Family.codex: lambda model: CodexBackend(model=model),
+        Family.gemini: lambda model: GeminiBackend(model=model),
+        Family.local: lambda model: LocalBackend(model=model),
     }
+    return {family: makers[family](model) for family, model in models.items()}
+
+
+def default_backends(manifest: RunManifest) -> dict[Family, Backend]:
+    """Build a backend for each of the manifest's families, asking for its model id."""
+    return backends_for({f: manifest.model_of(f) for f in manifest.families})
 
 
 def _remove_dir(path: Path) -> None:
@@ -272,7 +280,8 @@ def call(
     generation. Raise `RoleNotAllowed` for Gemini in a role not in
     `GEMINI_ROLES`;
     `ValueError` for a family or pair the run's manifest does not list, or a
-    record of another run or pair, a backend of another family, or a budget
+    record of another run or pair, a backend of another family or of a model
+    other than the one the manifest names, or a budget
     larger than the manifest's; `KeyError` for a record id that names no
     stored record; `BudgetExceeded` if the pair's spend is at or over the
     budget; and `ModelUnavailable` if the tool fails (`ModelNotStarted` if it
@@ -303,11 +312,16 @@ def call(
             f"budget {budget.tokens_per_pair} is larger than run {ledger.run_id}'s "
             f"{ledger.manifest.budget_tokens_per_pair} tokens per pair"
         )
-    backend = (backends if backends is not None else default_backends()).get(family)
+    backend = (backends if backends is not None else default_backends(ledger.manifest)).get(family)
     if backend is None:
         raise ModelNotStarted(f"no backend for family {family}")
     if backend.family != family:
         raise ValueError(f"the backend for {family} is a {backend.family} backend")
+    if backend.model != ledger.manifest.model_of(family):
+        raise ValueError(
+            f"the {family} backend runs {backend.model}, but run {ledger.run_id}'s "
+            f"manifest names {ledger.manifest.model_of(family)}"
+        )
     stage = ROLE_STAGE[role]
     reserve = min(estimate_tokens(prompt) + budget.reserve_output_tokens, MAX_TOKENS)
     with ledger.pair_lock(pair):

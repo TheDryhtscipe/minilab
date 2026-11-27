@@ -31,7 +31,7 @@ from minilab.models.adapter import (
     call,
 )
 from minilab.records import Family, RecordStore, Stage, Status
-from minilab.run import MemoryPolicy, RunManifest, save_manifest
+from minilab.run import DEFAULT_MODELS, MemoryPolicy, RunManifest, default_models, save_manifest
 
 RUN = "run-1"
 PAIR = ("optimisation", "information-theory")
@@ -65,6 +65,7 @@ class FakeBackend:
 
     def __init__(self, family: Family, reply: Reply) -> None:
         self.family = family
+        self.model = DEFAULT_MODELS[family]
         self.reply = reply
         self.prompts: list[str] = []
         self.replies: list[str] = []
@@ -101,6 +102,7 @@ def make_ledger(root: Path, mode: Literal["plain", "structured"]) -> Ledger:
             literature_before=None,
             budget_tokens_per_pair=1_000_000,
             families=tuple(Family),
+            models=default_models(tuple(Family)),
             started=datetime(2026, 11, 25, 12, 0, tzinfo=UTC),
         ),
     )
