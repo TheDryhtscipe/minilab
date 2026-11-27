@@ -15,7 +15,7 @@ logged as one JSON line in `runs/<run_id>/generator/dropped.jsonl`.
 
 import hashlib
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast
@@ -84,6 +84,32 @@ def json_instructions(n: int) -> str:
     return f"State at most {n} conjectures.\n\n{JSON_INSTRUCTIONS}"
 
 
+MAX_EARLIER = 20
+"""At most this many earlier statements go into a prompt."""
+
+MAX_EARLIER_CHARS = 400
+"""Each earlier statement is cut to this many characters."""
+
+
+def earlier_section(earlier: Sequence[str]) -> str:
+    """The prompt paragraph that lists earlier runs' conjectures, or "" if none.
+
+    The driver passes statements only when the run's memory policy allows
+    reads (design doc-gmj, "Memory read policy"). With none, the prompt is
+    the same as without this paragraph, so a `blind` run's prompts do not
+    change.
+    """
+    items = [" ".join(s.split())[:MAX_EARLIER_CHARS] for s in earlier[:MAX_EARLIER]]
+    items = [item for item in items if item]
+    if not items:
+        return ""
+    listed = "\n".join(f"- {item}" for item in items)
+    return (
+        "Earlier runs already proposed these conjectures. Do not repeat them; "
+        f"propose different ones.\n\n{listed}\n\n"
+    )
+
+
 def retry_prompt(prompt: str, failure: str) -> str:
     return (
         prompt
@@ -123,6 +149,7 @@ class Generation:
         ledger: Ledger,
         budget: Budget,
         backends: Mapping[Family, Backend] | None,
+        earlier: Sequence[str] = (),
     ) -> None:
         family = Family(family)
         if family not in GENERATOR_FAMILIES:
@@ -141,6 +168,7 @@ class Generation:
         self.budget = budget
         self.backends = backends
         self.steps: list[Step] = []
+        self.earlier: tuple[str, ...] = tuple(earlier)
 
     @property
     def run_id(self) -> str:
