@@ -50,7 +50,7 @@ from minilab.records import (
     StageOutput,
     Status,
 )
-from minilab.run import MemoryPolicy, RunManifest, save_manifest
+from minilab.run import DEFAULT_MODELS, MemoryPolicy, RunManifest, default_models, save_manifest
 
 FIXTURES = Path(__file__).parent / "fixtures"
 S8 = (FIXTURES / "pilot" / "s8.lean").read_text(encoding="utf-8")
@@ -100,6 +100,7 @@ class FakeBackend:
 
     def __init__(self, family: Family, replies: Mapping[str, list[str]]) -> None:
         self.family = family
+        self.model = DEFAULT_MODELS[family]
         self.replies = {k: list(v) for k, v in replies.items()}
         self.prompts: list[tuple[str, str]] = []
         self.fail = False
@@ -191,6 +192,7 @@ def make_ledger(store: RecordStore, families: tuple[Family, ...] = tuple(Family)
             literature_before=None,
             budget_tokens_per_pair=1_000_000,
             families=families,
+            models=default_models(families),
             started=datetime(2026, 11, 25, 12, 0, tzinfo=UTC),
         ),
     )

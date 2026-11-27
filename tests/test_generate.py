@@ -31,7 +31,7 @@ from minilab.models.adapter import (
     call,
 )
 from minilab.records import Family, RecordStore, Stage, Status
-from minilab.run import MemoryPolicy, RunManifest, save_manifest
+from minilab.run import DEFAULT_MODELS, MemoryPolicy, RunManifest, default_models, save_manifest
 
 RUN = "run-1"
 PAIR = ("optimisation", "information-theory")
@@ -65,6 +65,7 @@ class FakeBackend:
 
     def __init__(self, family: Family, reply: Reply) -> None:
         self.family = family
+        self.model = DEFAULT_MODELS[family]
         self.reply = reply
         self.prompts: list[str] = []
         self.replies: list[str] = []
@@ -101,6 +102,7 @@ def make_ledger(root: Path, mode: Literal["plain", "structured"]) -> Ledger:
             literature_before=None,
             budget_tokens_per_pair=1_000_000,
             families=tuple(Family),
+            models=default_models(tuple(Family)),
             started=datetime(2026, 11, 25, 12, 0, tzinfo=UTC),
         ),
     )
@@ -349,3 +351,31 @@ def test_parse_accepts_bare_list_and_prose_around_json() -> None:
     assert failures == [] and [c.statement for c in items] == [GOOD["statement"]]
     with pytest.raises(ValueError):
         parse_conjectures(json.dumps({"conjectures": []}))
+
+
+def test_earlier_statements_go_into_the_final_prompt_only(structured_ledger: Ledger) -> None:
+    # The driver passes earlier runs' statements under the pair and all memory
+    # policies (minilab-9f5db8). With none, the prompt is unchanged, so a blind
+    # run's prompts are what they were before this option existed.
+    assert plain_prompt(PAIR, 3, ()) == plain_prompt(PAIR, 3)
+    assert "Earlier runs" not in plain_prompt(PAIR, 3)
+    prompt = plain_prompt(PAIR, 3, ["H(p) <= log 2 for all p", "  "])
+    assert "Earlier runs already proposed" in prompt
+    assert "- H(p) <= log 2 for all p" in prompt
+    # One bullet more than without: the blank statement is dropped.
+    assert prompt.count("\n- ") == plain_prompt(PAIR, 3).count("\n- ") + 1
+
+    backend = FakeBackend(Family.claude, in_turn("elicited", "abstracted", reply_of(GOOD)))
+    generate_structured(
+        PAIR,
+        Family.claude,
+        1,
+        ledger=structured_ledger,
+        budget=BUDGET,
+        backends={Family.claude: backend},
+        earlier=["an earlier claim"],
+    )
+    elicit, abstract, cross = backend.prompts
+    assert "an earlier claim" not in elicit and "an earlier claim" not in abstract
+    assert "- an earlier claim" in cross
+    assert cross == cross_prompt(PAIR, "abstracted", 1, ["an earlier claim"])
