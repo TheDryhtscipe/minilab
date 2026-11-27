@@ -42,7 +42,7 @@ from minilab.literature.pdf import PdfUnavailable, pdf_text
 from minilab.models.adapter import Budget
 from minilab.models.backends import ModelReply
 from minilab.records import Family, Provenance, Record, RecordStore, Stage, Status
-from minilab.run import MemoryPolicy, RunManifest, save_manifest
+from minilab.run import DEFAULT_MODELS, MemoryPolicy, RunManifest, default_models, save_manifest
 
 FIXTURES = Path(__file__).parent / "fixtures"
 LIT = FIXTURES / "literature"
@@ -328,6 +328,7 @@ class FakeBackend:
 
     def __init__(self, family: Family, queries: str, judge: str) -> None:
         self.family = family
+        self.model = DEFAULT_MODELS[family]
         self.queries = queries
         self.judge = judge
         self.prompts: list[str] = []
@@ -404,6 +405,7 @@ def make_ledger(store: RecordStore, before: date | None) -> Ledger:
             literature_before=before,
             budget_tokens_per_pair=1_000_000,
             families=tuple(Family),
+            models=default_models(tuple(Family)),
             started=datetime(2026, 11, 25, 12, 0, tzinfo=UTC),
         ),
     )

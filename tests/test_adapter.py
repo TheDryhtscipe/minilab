@@ -20,6 +20,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+import minilab.models.adapter as adapter_module
 import minilab.models.backends as backends_module
 from minilab.ledger import Ledger
 from minilab.models.adapter import (
@@ -33,6 +34,7 @@ from minilab.models.adapter import (
     Role,
     RoleNotAllowed,
     call,
+    default_backends,
     pick_checker,
     scrubbed_env,
 )
@@ -51,7 +53,7 @@ from minilab.models.backends import (
     run_command,
 )
 from minilab.records import Family, Provenance, Record, RecordStore, Stage
-from minilab.run import MemoryPolicy, RunManifest, save_manifest
+from minilab.run import DEFAULT_MODELS, MemoryPolicy, RunManifest, default_models, save_manifest
 
 RUN = "run-1"
 PAIR = ("information-theory", "optimisation")
@@ -72,6 +74,7 @@ class FakeBackend:
         action: Callable[[Path], None] | None = None,
     ) -> None:
         self.family = family
+        self.model = DEFAULT_MODELS[family]
         self.tokens_in = tokens_in
         self.tokens_out = tokens_out
         self.fail = fail
@@ -137,6 +140,7 @@ def ledger(store: RecordStore) -> Ledger:
             literature_before=None,
             budget_tokens_per_pair=100,
             families=tuple(Family),
+            models=default_models(Family),
             started=datetime(2026, 11, 24, 12, 0, tzinfo=UTC),
         ),
     )
@@ -576,14 +580,14 @@ def test_run_command_nonzero_exit_and_missing_binary(tmp_path: Path) -> None:
 
 
 def test_backend_command_lines_carry_isolation_flags() -> None:
-    claude = ClaudeBackend().argv()
+    claude = ClaudeBackend(model="claude-test").argv()
     for flag in ("-p", "--tools", "--setting-sources", "--strict-mcp-config",
                  "--no-session-persistence"):
         assert flag in claude
     assert "--bare" not in claude
     assert claude[claude.index("--tools") + 1] == ""
     assert claude[claude.index("--setting-sources") + 1] == ""
-    codex = CodexBackend().argv()
+    codex = CodexBackend(model="gpt-test").argv()
     for flag in ("--ignore-user-config", "--ignore-rules", "--ephemeral", "--json",
                  "--skip-git-repo-check"):
         assert flag in codex
@@ -592,7 +596,7 @@ def test_backend_command_lines_carry_isolation_flags() -> None:
     for feature in ("shell_tool", "unified_exec", "browser_use", "computer_use", "apps",
                     "plugins"):
         assert feature in codex
-    agy = GeminiBackend().argv()
+    agy = GeminiBackend(model="gemini-test").argv()
     assert agy[agy.index("--input-format") + 1] == "stream-json"
     assert agy[agy.index("--output-format") + 1] == "stream-json"
     assert not any(a.startswith(("-p", "--print", "--prompt")) for a in agy)
@@ -604,7 +608,66 @@ def test_backend_command_lines_carry_isolation_flags() -> None:
         assert f"{action}(*)" in settings["permissions"]["deny"]
     assert "--dangerously-skip-permissions" not in agy
     assert agy[agy.index("--output-format") + 1] == "stream-json"
-    assert LocalBackend().model == "qwen3.5:4b"
+    assert codex[-3:] == ["--model", "gpt-test", "-"]
+
+
+def test_default_backends_pass_the_manifests_model_ids(ledger: Ledger) -> None:
+    ids = {f: f"{f.value}-not-the-default" for f in Family}
+    manifest = RunManifest.model_validate({
+        **ledger.manifest.model_dump(),
+        "models": [{"family": f, "model": m} for f, m in ids.items()],
+    })
+    built = default_backends(manifest)
+    assert set(built) == set(Family)
+    for family in (Family.claude, Family.codex, Family.gemini):
+        backend = built[family]
+        assert isinstance(backend, ClaudeBackend | CodexBackend | GeminiBackend)
+        argv = backend.argv()
+        assert argv.count("--model") == 1
+        assert argv[argv.index("--model") + 1] == ids[family]
+    local = built[Family.local]
+    assert isinstance(local, LocalBackend)
+    assert local.model == ids[Family.local]
+
+
+def test_default_backends_only_build_the_manifests_families(store: RecordStore) -> None:
+    manifest = RunManifest(
+        run_id="run-3", mode="plain", pairs=(PAIR,), memory_policy=MemoryPolicy.blind,
+        memory_before=None, literature_before=None, budget_tokens_per_pair=100,
+        families=(Family.codex,), models=default_models([Family.codex]),
+        started=datetime(2026, 11, 24, 12, 0, tzinfo=UTC),
+    )
+    assert set(default_backends(manifest)) == {Family.codex}
+
+
+@pytest.mark.parametrize("backend", [ClaudeBackend, CodexBackend, GeminiBackend, LocalBackend])
+def test_backends_need_a_model(backend: type[object]) -> None:
+    with pytest.raises(TypeError):
+        backend()
+
+
+def test_call_refuses_a_backend_for_another_model(ledger: Ledger) -> None:
+    backend = FakeBackend(Family.claude)
+    backend.model = "claude-some-other-model"
+    with pytest.raises(ValueError, match="claude-some-other-model"):
+        _call(ledger, backend)
+    assert backend.calls == 0
+    assert ledger.entries() == []
+
+
+def test_call_without_backends_uses_the_manifests_models(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[RunManifest] = []
+
+    def fake_defaults(manifest: RunManifest) -> dict[Family, FakeBackend]:
+        seen.append(manifest)
+        return {Family.claude: FakeBackend(Family.claude)}
+
+    monkeypatch.setattr(adapter_module, "default_backends", fake_defaults)
+    call(Family.claude, Role.encode, "prompt", record_id=None, pair=PAIR, ledger=ledger,
+         budget=Budget(tokens_per_pair=100, reserve_output_tokens=10))
+    assert seen == [ledger.manifest]
 
 
 # --- Charging failed calls -----------------------------------------------------------------
@@ -702,6 +765,7 @@ def test_family_not_in_manifest_refused_before_call(store: RecordStore) -> None:
             literature_before=None,
             budget_tokens_per_pair=100,
             families=(Family.claude,),
+            models=default_models([Family.claude]),
             started=datetime(2026, 11, 24, 12, 0, tzinfo=UTC),
         ),
     )
@@ -779,6 +843,7 @@ from minilab.models.adapter import Budget, BudgetExceeded, ModelReply, Role, cal
 
 class Slow:
     family = Family.claude
+    model = "claude-opus-5-5"
     def run(self, prompt, *, cwd, env, timeout_s):
         began = time.time()
         time.sleep(1.0)
@@ -1183,11 +1248,11 @@ sys.exit(1)
 
 def test_claude_backend_end_to_end(tmp_path: Path) -> None:
     env = scrubbed_env()
-    ok = ClaudeBackend(binary=_tool(tmp_path, "claude_ok", _CLAUDE_OK))
+    ok = ClaudeBackend(model="claude-test", binary=_tool(tmp_path, "claude_ok", _CLAUDE_OK))
     reply = ok.run("hi", cwd=tmp_path, env=env, timeout_s=10)
     assert reply == ModelReply(text="got hi", tokens_in=111, tokens_out=4, estimated=False,
                                model="claude-fake")
-    fail = ClaudeBackend(binary=_tool(tmp_path, "claude_fail", _CLAUDE_FAIL))
+    fail = ClaudeBackend(model="claude-test", binary=_tool(tmp_path, "claude_fail", _CLAUDE_FAIL))
     with pytest.raises(ModelUnavailable, match="exit 1") as caught:
         fail.run("hi", cwd=tmp_path, env=env, timeout_s=10)
     assert (caught.value.tokens_in, caught.value.tokens_out) == (500, 60)
@@ -1199,7 +1264,7 @@ def test_codex_backend_end_to_end(tmp_path: Path) -> None:
     reply = ok.run("hi", cwd=tmp_path, env=env, timeout_s=10)
     assert reply == ModelReply(text="got hi", tokens_in=30, tokens_out=8, estimated=False,
                                model="gpt-fake")
-    fail = CodexBackend(binary=_tool(tmp_path, "codex_fail", _CODEX_FAIL))
+    fail = CodexBackend(model="gpt-fake", binary=_tool(tmp_path, "codex_fail", _CODEX_FAIL))
     with pytest.raises(ModelUnavailable, match="exit 1"):
         fail.run("hi", cwd=tmp_path, env=env, timeout_s=10)
 
@@ -1210,7 +1275,7 @@ def test_gemini_backend_end_to_end(tmp_path: Path) -> None:
     reply = ok.run("-hi", cwd=tmp_path, env=env, timeout_s=10)
     assert reply == ModelReply(text="got -hi", tokens_in=12, tokens_out=5, estimated=False,
                                model="gemini-fake")
-    fail = GeminiBackend(binary=_tool(tmp_path, "agy_fail", _AGY_FAIL))
+    fail = GeminiBackend(model="gemini-fake", binary=_tool(tmp_path, "agy_fail", _AGY_FAIL))
     with pytest.raises(ModelUnavailable, match="quota exceeded"):
         fail.run("hi", cwd=tmp_path, env=env, timeout_s=10)
 
@@ -1223,13 +1288,13 @@ def test_gemini_backend_end_to_end(tmp_path: Path) -> None:
 )
 def test_gemini_backend_sends_the_prompt_on_stdin_intact(tmp_path: Path, prompt: str) -> None:
     # Over stdin the prompt has no command-line size limit, and it reaches agy unchanged.
-    backend = GeminiBackend(binary=_tool(tmp_path, "agy_ok", _AGY_OK))
+    backend = GeminiBackend(model="gemini-fake", binary=_tool(tmp_path, "agy_ok", _AGY_OK))
     reply = backend.run(prompt, cwd=tmp_path, env=scrubbed_env(), timeout_s=30)
     assert reply.text == "got " + prompt
 
 
 def test_gemini_backend_fails_a_call_in_which_a_tool_ran(tmp_path: Path) -> None:
-    backend = GeminiBackend(binary=_tool(tmp_path, "agy_ok", _AGY_OK))
+    backend = GeminiBackend(model="gemini-fake", binary=_tool(tmp_path, "agy_ok", _AGY_OK))
     env = {**scrubbed_env(), "FAKE_AGY_TOOL_STATES": json.dumps(["ACTIVE", "ERROR"])}
     assert backend.run("hi", cwd=tmp_path, env=env, timeout_s=10).text == "got hi"
     env["FAKE_AGY_TOOL_STATES"] = json.dumps(["ACTIVE", "DONE"])
@@ -1244,7 +1309,7 @@ def test_gemini_backend_fails_a_call_in_which_a_tool_ran(tmp_path: Path) -> None
 
 
 def test_gemini_backend_counts_denied_tools_with_a_fresh_nonce(tmp_path: Path) -> None:
-    backend = GeminiBackend(binary=_tool(tmp_path, "agy_ok", _AGY_OK))
+    backend = GeminiBackend(model="gemini-fake", binary=_tool(tmp_path, "agy_ok", _AGY_OK))
     env = {**scrubbed_env(), "FAKE_AGY_TOOL_STATES": json.dumps(["ACTIVE", "ERROR"])}
     assert backend.run("hi", cwd=tmp_path, env=env, timeout_s=10).tools_denied == 1
     first = (tmp_path / ".agents" / "hooks.json").read_text()
@@ -1260,12 +1325,14 @@ def test_gemini_backend_will_not_run_inside_a_repository(tmp_path: Path, marker:
     ran = tmp_path / "ran"
     tool = _tool(tmp_path, "agy", f"open({str(ran)!r}, 'w').write('x')\n" + _AGY_OK)
     with pytest.raises(ModelNotStarted, match="repository"):
-        GeminiBackend(binary=tool).run("hi", cwd=call_dir, env=scrubbed_env(), timeout_s=10)
+        GeminiBackend(model="gemini-fake", binary=tool).run(
+            "hi", cwd=call_dir, env=scrubbed_env(), timeout_s=10
+        )
     assert not ran.exists()
 
 
 def test_gemini_backend_hook_denies_every_tool(tmp_path: Path) -> None:
-    backend = GeminiBackend(binary=_tool(tmp_path, "agy_ok", _AGY_OK))
+    backend = GeminiBackend(model="gemini-fake", binary=_tool(tmp_path, "agy_ok", _AGY_OK))
     backend.run("hi", cwd=tmp_path, env=scrubbed_env(), timeout_s=10)
     hooks = json.loads((tmp_path / ".agents" / "hooks.json").read_text())
     [named] = hooks.values()
@@ -1288,12 +1355,15 @@ def test_gemini_backend_will_not_start_without_its_hook(tmp_path: Path) -> None:
     marker = tmp_path / "ran"
     tool = _tool(tmp_path, "agy", f"open({str(marker)!r}, 'w').write('x')\n" + _AGY_OK)
     with pytest.raises(ModelNotStarted, match="hook"):
-        GeminiBackend(binary=tool).run("hi", cwd=tmp_path, env=scrubbed_env(), timeout_s=10)
+        GeminiBackend(model="gemini-fake", binary=tool).run(
+            "hi", cwd=tmp_path, env=scrubbed_env(), timeout_s=10
+        )
     assert not marker.exists()
 
 
 def test_failed_tool_charged_with_its_reported_usage(ledger: Ledger, tmp_path: Path) -> None:
-    backend = ClaudeBackend(binary=_tool(tmp_path, "claude_fail", _CLAUDE_FAIL))
+    tool = _tool(tmp_path, "claude_fail", _CLAUDE_FAIL)
+    backend = ClaudeBackend(model=DEFAULT_MODELS[Family.claude], binary=tool)
     with pytest.raises(ModelUnavailable):
         call(Family.claude, Role.encode, "prompt", record_id=None, pair=PAIR, ledger=ledger,
              budget=Budget(tokens_per_pair=100), backends={Family.claude: backend})
@@ -1308,7 +1378,7 @@ def test_agy_refusals_not_started_and_not_charged(
     # json.dumps would escape a lone surrogate, so the backend must refuse it itself.
     marker = tmp_path / "ran"
     tool = _tool(tmp_path, "agy", f"open({str(marker)!r}, 'w').write('x')\n" + _AGY_OK)
-    backend = GeminiBackend(binary=tool)
+    backend = GeminiBackend(model=DEFAULT_MODELS[Family.gemini], binary=tool)
     with pytest.raises(ModelNotStarted):
         call(Family.gemini, Role.generate, prompt, record_id=None, pair=PAIR, ledger=ledger,
              budget=Budget(tokens_per_pair=100), backends={Family.gemini: backend})
@@ -1325,7 +1395,9 @@ def test_local_backend_parses_reply(tmp_path: Path) -> None:
         return httpx.Response(200, json={"response": "hello", "model": "qwen-fake",
                                          "prompt_eval_count": 6, "eval_count": 2})
 
-    backend = LocalBackend(transport=httpx.MockTransport(handler))
+    backend = LocalBackend(
+        model=DEFAULT_MODELS[Family.local], transport=httpx.MockTransport(handler)
+    )
     reply = backend.run("hi", cwd=tmp_path, env={}, timeout_s=10)
     assert reply == ModelReply(text="hello", tokens_in=6, tokens_out=2, estimated=False,
                                model="qwen-fake")
@@ -1356,7 +1428,8 @@ def test_local_backend_ignores_proxy_variables(
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        backend = LocalBackend(url=f"http://127.0.0.1:{server.server_port}")
+        url = f"http://127.0.0.1:{server.server_port}"
+        backend = LocalBackend(model=DEFAULT_MODELS[Family.local], url=url)
         reply = backend.run("hi", cwd=tmp_path, env={}, timeout_s=10)
     finally:
         server.shutdown()
@@ -1369,7 +1442,9 @@ def test_local_backend_timeout(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("slow", request=request)
 
-    backend = LocalBackend(transport=httpx.MockTransport(handler))
+    backend = LocalBackend(
+        model=DEFAULT_MODELS[Family.local], transport=httpx.MockTransport(handler)
+    )
     with pytest.raises(ModelUnavailable, match="timed out"):
         backend.run("hi", cwd=tmp_path, env={}, timeout_s=0.1)
 
@@ -1532,6 +1607,7 @@ sys.stdout.write("x" * (1 << 20))
 
     class Flood:
         family = Family.claude
+        model = DEFAULT_MODELS[Family.claude]
 
         def run(
             self, prompt: str, *, cwd: Path, env: Mapping[str, str], timeout_s: float

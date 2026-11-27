@@ -34,7 +34,7 @@ from minilab.records import (
     StageOutput,
     Status,
 )
-from minilab.run import MemoryPolicy, RunManifest, save_manifest
+from minilab.run import DEFAULT_MODELS, MemoryPolicy, RunManifest, default_models, save_manifest
 from minilab.scheduler import Pair
 from minilab.screen import triviality
 from minilab.screen.triviality import (
@@ -93,6 +93,7 @@ class FakeBackend:
 
     def __init__(self, family: Family, replies: Mapping[str, list[str]]) -> None:
         self.family = family
+        self.model = DEFAULT_MODELS[family]
         self.replies = {k: list(v) for k, v in replies.items()}
         self.prompts: list[tuple[str, str]] = []
         self.fail = False
@@ -170,6 +171,7 @@ def make_ledger(store: RecordStore, families: tuple[Family, ...] = tuple(Family)
             literature_before=None,
             budget_tokens_per_pair=1_000_000,
             families=families,
+            models=default_models(families),
             started=datetime(2026, 11, 26, 12, 0, tzinfo=UTC),
         ),
     )

@@ -103,8 +103,8 @@ FRONTIER_ATTEMPTS = 3
 """Proof attempts by the frontier prover (`frontier_prover`)."""
 
 FRONTIER_ORDER: tuple[Family, ...] = (Family.claude, Family.gemini, Family.codex)
-"""The frontier prover is the first of these the run has. Gemini runs with the
-Antigravity CLI's default model (no `--model`)."""
+"""The frontier prover is the first of these the run has. Each runs the model id
+its run's manifest names (`RunManifest.models`)."""
 
 Outcome = Literal["proved", "failed", "timed_out", "refused", "no_proof"]
 
