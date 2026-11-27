@@ -53,8 +53,8 @@ near miss. Each name appears once.
 the record's triviality stage. A proof sets the status `trivial`, unless
 the formaliser stage flagged the formalisation (`hold_reasons`): then the
 record stays `survived`, held for the user's review with the proof and the
-reasons (user decision on bead minilab-a32a1c). The prover (Task 13, bead
-minilab-880beb) must skip a held record; nothing before it does.
+reasons (user decision on bead minilab-a32a1c). The prover
+(`minilab.prove.loop`) skips a held record.
 """
 
 import json
@@ -182,8 +182,10 @@ def _declared(formal: FormalOutput) -> list[str]:
     ]
 
 
-def _mismatch(original: FormalOutput, proved: FormalOutput) -> list[str]:
-    """The parts of the statement that differ between the two files."""
+def statement_mismatch(original: FormalOutput, proved: FormalOutput) -> list[str]:
+    """The parts of the statement that differ between the two files: any of
+    `definitions`, `definition text`, `binders`, `conclusion`, `opens`,
+    `statement`, and `theorems`. Empty if they state the same theorem."""
 
     def binders(formal: FormalOutput) -> list[tuple[str, str, bool, bool]]:
         return [(b.name, b.type, b.prop, b.instance) for b in formal.binders]
@@ -239,7 +241,7 @@ def _check(
         checked = _Checked(outcome="timed_out", detail=str(exc))
     else:
         if out.ok:
-            differ = _mismatch(original, out)
+            differ = statement_mismatch(original, out)
             if differ:
                 checked = _Checked(
                     outcome="refused",
@@ -638,7 +640,7 @@ def _unscreened(reasons: list[str]) -> dict[str, JsonValue]:
     }
 
 
-def _formal(
+def stored_formal(
     record: Record, data: Mapping[str, JsonValue], root: Path, timeout_s: float
 ) -> FormalOutput | str:
     """The formaliser's file, probed again; or why its statement cannot be trusted."""
@@ -717,7 +719,7 @@ def run_triviality_stage(
         )
         return None
 
-    formal = _formal(record, data, store.root, lean_timeout_s)
+    formal = stored_formal(record, data, store.root, lean_timeout_s)
     if isinstance(formal, str):
         store.write_stage(
             record.id, Stage.triviality, StageOutput(written_at=now, data=_unscreened([formal]))
