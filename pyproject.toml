@@ -33,6 +33,7 @@ packages = ["src/minilab"]
 
 [tool.pyright]
 include = ["src", "tests"]
+extraPaths = ["src", "scripts"]
 typeCheckingMode = "strict"
 pythonVersion = "3.13"
 venvPath = "."

@@ -12,13 +12,19 @@ backends (same flags, empty working directory, scrubbed environment):
    leak if the reply holds any of them (the newest paper may change while
    the probe runs).
 
+For Codex the probe also captures the request codex sends, against a local
+server that never reaches a model, and fails it if it holds the user's
+`AGENTS.md`, skills, multi-agent prompts, a path under the user's home, or a
+tool outside a fixed list (`minilab.models.codex_request`, bead minilab-811a75).
+
 A tool passes only if all three calls return a reply and none of the replies
-holds the secret. Gemini, whose tool agy has tools of its own, passes an attempt
-only if agy's hook denied at least one tool call in it (`ModelReply.tools_denied`).
-A call that fails (a usage limit, a timeout) makes the
-result `error`, not a pass. The probe writes `runs/probes/<date>.json` and
-updates `src/minilab/models/isolation.json`: a family that passed is
-`isolated`; one that leaked is `normal runs only`; one that errored is
+holds the secret, and, for Codex, the request check passes. Gemini, whose
+tool agy has tools of its own, passes an attempt only if agy's hook denied at
+least one tool call in it (`ModelReply.tools_denied`). A call that fails (a
+usage limit, a timeout) makes the result `error`, not a pass. The probe
+writes `runs/probes/<date>.json` and updates
+`src/minilab/models/isolation.json`: a family that passed is `isolated`; one
+that leaked is `normal runs only`; one that errored is
 `unverified`. Only `isolated` families may be used in the benchmark. Each
 tool's result carries the time it was probed, and stored replies have the
 user's home directory replaced by `~`.
@@ -42,7 +48,12 @@ from typing import Literal
 import httpx
 from pydantic import BaseModel
 
-from minilab.models.adapter import ModelUnavailable, backends_for, isolated_run
+from minilab.models.adapter import ModelUnavailable, backends_for, isolated_run, scrubbed_env
+from minilab.models.codex_request import audit_codex_request
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from codex_sink import capture_codex_request  # noqa: E402
+
 from minilab.records import Family
 from minilab.run import DEFAULT_MODELS
 
@@ -139,6 +150,20 @@ def _main_sha() -> str:
     return sha
 
 
+def _codex_request_attempt() -> Attempt:
+    """Capture what codex sends, against a local sink, and audit it. No model runs."""
+    try:
+        body = capture_codex_request(
+            model=DEFAULT_MODELS[Family.codex], env=scrubbed_env(), timeout_s=120.0
+        )
+    except (RuntimeError, OSError, ValueError) as exc:
+        return Attempt(outcome="error", reply=scrub(str(exc))[:2000])
+    problems = audit_codex_request(body, home=Path.home())
+    if problems:
+        return Attempt(outcome="leaked", reply=scrub("; ".join(problems))[:2000])
+    return Attempt(outcome="blocked", reply="the request held no user context or extra tools")
+
+
 def probe(families: list[Family]) -> ProbeReport:
     token = secrets.token_hex(16)
     canary = REPO.parent / f"minilab-canary-{token[:8]}.txt"
@@ -167,6 +192,9 @@ def probe(families: list[Family]) -> ProbeReport:
         for family in families:
             attempts: dict[str, Attempt] = {}
             search_reply: str | None = None
+            if family is Family.codex:
+                attempts["request"] = _codex_request_attempt()
+                print(f"codex request: {attempts['request'].outcome}", file=sys.stderr)
             for name, (prompt, secret) in prompts.items():
                 try:
                     answer = isolated_run(backends[family], prompt, timeout_s=TIMEOUT_S)
@@ -218,7 +246,8 @@ def probe(families: list[Family]) -> ProbeReport:
                 version=_version(family),
                 passed=status == "isolated",
                 status=status,
-                attempts={name: attempts[name] for name in prompts if name in attempts},
+                attempts={name: attempts[name] for name in ("request", *prompts)
+                          if name in attempts},
             )
         )
     return ProbeReport(at=datetime.now(UTC), tools=results)
