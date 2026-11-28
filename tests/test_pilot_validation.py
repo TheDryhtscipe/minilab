@@ -17,9 +17,11 @@ S1 are hand-built survivor records run through `drive` with the real
 formaliser and triviality stages. Offline tests use scripted model replies;
 only the `live` tests call a model.
 
-The pilot has one hand-built encoding per conjecture, so both encodings in a
-kill check are the same source under two family labels. That checks the
-two-encoding gate, not the independence of two real encodings.
+The pilot has one hand-built encoding per conjecture, so in most kill checks
+both encodings are the same source under two family labels. A mixed pair (the
+encoding with its domain check removed, next to the real one) checks that a
+kill needs both encodings to accept. Nothing here checks how independent two
+real encodings are.
 """
 
 import json
@@ -46,6 +48,7 @@ from minilab.pipeline import DriverSettings, StageContext, default_runners, driv
 from minilab.records import Family, Provenance, Record, RecordStore, Stage, StageOutput, Status
 from minilab.run import DEFAULT_MODELS, MemoryPolicy, RunManifest, default_models
 from minilab.scheduler import Pair
+from minilab.screen.triviality import hold_reasons
 
 PILOT = Path(__file__).parent / "fixtures" / "pilot"
 RUN = "pilot"
@@ -89,11 +92,21 @@ def test_warm_start_artefact_rejected_as_a_kill() -> None:
     assert "upper bound on the margin" in result.reason
 
 
-def test_grid_gap_rejected_as_a_kill() -> None:
-    cert = load("grid_gap")
-    assert isinstance(cert, IntervalCertificate)
+@pytest.mark.parametrize("digits", [16, 15])
+def test_grid_gap_rejected_as_a_kill(digits: int) -> None:
+    stored = load("grid_gap")
+    assert isinstance(stored, IntervalCertificate)
+    # The stored certificate asks for 16 digits, where even a plain mpf margin
+    # is already positive. At 15 digits a plain mpf margin still shows the
+    # float artefact, so only the ball arithmetic and the repeat at more
+    # digits reject it.
+    point = stored.point.model_copy(update={"precision_digits": digits})
+    cert = stored.model_copy(update={"digits": digits, "point": point})
     c, a1, b = (_scalar(cert.point, k) for k in ("c", "a1", "b"))
     assert rho_float(c, a1, b) > 0.25  # the float grid shows a violation here
+    if digits == 15:
+        with mpmath.mp.workdps(15):
+            assert Y2Encoding().margin(cert.point) < 0  # plain precision is fooled
     with mpmath.mp.workdps(100):
         assert Y2Encoding().margin(cert.point) > 0  # at 100 digits there is none
     result = check_kill(*two(Y2), cert, assumptions=2)
@@ -118,6 +131,16 @@ def test_out_of_domain_point_rejected_as_a_kill() -> None:
     # encodings accept the same certificate as a kill.
     loose = source_of("s7", "AnyDomain", ANY_DOMAIN)
     assert check_kill(*two(loose), cert, assumptions=2).accepted
+    # A kill needs both encodings: one that accepts is not enough, in
+    # either position.
+    for first, second, refusing in (
+        (Sandboxed(loose, Family.claude), Sandboxed(S7, Family.codex), "second"),
+        (Sandboxed(S7, Family.claude), Sandboxed(loose, Family.codex), "first"),
+    ):
+        mixed = check_kill(first, second, cert, assumptions=2)
+        assert not mixed.accepted
+        assert f"the {refusing} encoding refuses" in mixed.reason
+        assert "outside the domain" in mixed.reason
 
 
 @pytest.mark.parametrize("name", ["s7_counterexample", "s7prime_counterexample"])
@@ -167,12 +190,13 @@ def kind_of(prompt: str) -> str:
 
 
 class ScriptedBackend:
-    """Replies by the kind of prompt, in order; records every prompt it is sent."""
+    """Replies by the kind of prompt from a queue that every family shares, so
+    the order of replies does not depend on which family a stage picks."""
 
-    def __init__(self, family: Family, replies: Mapping[str, Sequence[str]]) -> None:
+    def __init__(self, family: Family, replies: dict[str, list[str]]) -> None:
         self.family = family
         self.model = DEFAULT_MODELS[family]
-        self.replies = {k: list(v) for k, v in replies.items()}
+        self.replies = replies
         self.prompts: list[tuple[str, str]] = []
 
     def run(
@@ -189,7 +213,8 @@ class ScriptedBackend:
 
 
 def scripted(replies: Mapping[str, Sequence[str]]) -> dict[Family, ScriptedBackend]:
-    return {f: ScriptedBackend(f, replies) for f in FAMILIES}
+    shared = {k: list(v) for k, v in replies.items()}
+    return {f: ScriptedBackend(f, shared) for f in FAMILIES}
 
 
 def lean_block(source: str) -> str:
@@ -234,12 +259,26 @@ def no_generation(
     return []
 
 
-def survivor(store: RecordStore, local: str, statement: str, assumptions: list[str]) -> str:
+S1_WITNESS: dict[str, JsonValue] = {
+    "values": {"n": "2", "q": "0.5", "p": ["0.3", "0.7"], "r": ["0.5", "0.5"]},
+    "precision_digits": 30,
+}
+"""A point that satisfies all five of S1's hypotheses, as the falsifier's worst point."""
+
+
+def survivor(
+    store: RecordStore,
+    local: str,
+    statement: str,
+    assumptions: list[str],
+    witness: dict[str, JsonValue] | None = None,
+) -> str:
     """A hand-built pilot record that has passed encoding, falsifier, and literature.
 
-    The falsifier's coverage has no worst point: the pilot encodings take
-    vectors and matrices that the Lean theorems do not name, so there is no
-    witness to instantiate, and the formaliser stage says so in its notes.
+    `witness` is the falsifier's worst point, which the formaliser's vacuity
+    check instantiates. S8 has none: its theorem takes a channel matrix,
+    which a witness cannot give, so the formaliser stage notes that no
+    witness was instantiated, and a proof of it is held, never trivial.
     """
     record = Record(
         id=f"{RUN}.{local}",
@@ -259,7 +298,7 @@ def survivor(store: RecordStore, local: str, statement: str, assumptions: list[s
         "dimensions": 0,
         "starts": 0,
         "worst_margin": None,
-        "worst_point": None,
+        "worst_point": witness,
         "uncovered": [],
     }
     store.write_stage(
@@ -287,6 +326,19 @@ def formalise_through_driver(
     assert outcome.skipped == []
 
 
+S8_VERDICTS: dict[str, tuple[str, str | None]] = {
+    "hW": ("matches", "assumption 1"),
+    "hp": ("matches", "assumption 2"),
+}
+S1_VERDICTS: dict[str, tuple[str, str | None]] = {
+    "hq0": ("matches", "assumption 1"),
+    "hq1": ("matches", "assumption 1"),
+    "hp": ("matches", "assumption 2"),
+    "hr": ("matches", "assumption 3"),
+    "hrpos": ("matches", "assumption 4"),
+}
+
+
 def test_s8_kkt_hypothesis_flagged_through_the_driver(tmp_path: Path) -> None:
     store = RecordStore(tmp_path)
     start(store)
@@ -296,14 +348,13 @@ def test_s8_kkt_hypothesis_flagged_through_the_driver(tmp_path: Path) -> None:
     # hKKT and from nothing else in the stage.
     control = survivor(store, "s8control", S8_STATEMENT, S8_ASSUMPTIONS)
     assert flagged < control  # the driver runs records in id order
-    verdicts = {"hW": ("matches", "assumption 1"), "hp": ("matches", "assumption 2")}
     backends = scripted(
         {
             "formalise": [lean_block(S8_LEAN)] * 2,
             "roundtrip": ["For every channel W ..."] * 2,
             "audit": [
-                audit_reply({**verdicts, "hKKT": ("begs_question", None)}),
-                audit_reply({**verdicts, "hKKT": ("matches", "assumption 2")}),
+                audit_reply({**S8_VERDICTS, "hKKT": ("begs_question", None)}),
+                audit_reply({**S8_VERDICTS, "hKKT": ("matches", "assumption 2")}),
             ],
         }
     )
@@ -316,29 +367,54 @@ def test_s8_kkt_hypothesis_flagged_through_the_driver(tmp_path: Path) -> None:
     assert all("hKKT" in str(r) for r in reasons), reasons
     audit = data["audit"]
     assert isinstance(audit, dict) and audit["extra"] == ["hKKT"]
+    hypotheses = audit["hypotheses"]
+    assert isinstance(hypotheses, list)
+    kkt = [h for h in hypotheses if isinstance(h, dict) and h.get("label") == "hKKT"]
+    assert kkt == [kkt[0]] and kkt[0]["kind"] == "begs_question" and kkt[0]["by"] == "checker"
     assert data["lean_statement"] is None
     assert store.load(flagged).status is Status.survived
 
     control_data = store.load(control).stages[Stage.formaliser].data
     assert control_data["rejected"] is False, control_data["reasons"]
 
-    # The audit was asked by a checker, never by Gemini, and saw hKKT.
-    audits = [(f, p) for f, b in backends.items() for k, p in b.prompts if k == "audit"]
+    # The audit was asked by a checker, never by Gemini.
+    audits = [f for f, b in backends.items() for k, _ in b.prompts if k == "audit"]
     assert len(audits) == 2
-    assert all(f is not Family.gemini for f, _ in audits)
-    assert all("hKKT" in p for _, p in audits)
+    assert Family.gemini not in audits
 
     # Then the triviality stage leaves the refused formalisation unscreened,
-    # with no model call (a call would fail: nothing is scripted). Only the
-    # flagged record is given a triviality runner here; the control would
-    # need a live prover.
-    store_control = store.load(control)
-    assert Stage.triviality not in store_control.stages
+    # with no model call (a call would fail: nothing is scripted). The runner
+    # is called for the flagged record alone, because the control would need
+    # a live prover.
+    assert Stage.triviality not in store.load(control).stages
     triviality = default_runners()[Stage.triviality]
     triviality(flagged, StageContext.for_run(store, RUN, scripted({})))
     screen = store.load(flagged).stages[Stage.triviality].data
     assert screen["screened"] is False
     assert screen["trivial"] is False
+    why = screen["reasons"]
+    assert isinstance(why, list) and "rejected the formalisation" in str(why[0])
+
+
+def test_s1_formalisation_is_clean_through_the_driver(tmp_path: Path) -> None:
+    """With the witness and a clean audit, nothing would hold a proof of S1
+    back, so the live screen can set it trivial."""
+    store = RecordStore(tmp_path)
+    start(store)
+    record_id = survivor(store, "s1", S1_STATEMENT, S1_ASSUMPTIONS, S1_WITNESS)
+    backends = scripted(
+        {
+            "formalise": [lean_block(S1_LEAN)],
+            "roundtrip": ["the theorem in English"],
+            "audit": [audit_reply(S1_VERDICTS)],
+        }
+    )
+    formalise_through_driver(store, backends)
+    data = store.load(record_id).stages[Stage.formaliser].data
+    assert data["rejected"] is False, data["reasons"]
+    vacuity = data["vacuity"]
+    assert isinstance(vacuity, dict) and vacuity["satisfied_by_witness"] is True
+    assert hold_reasons(data) == []
 
 
 # --- the triviality screen through the driver (live) ---
@@ -348,9 +424,18 @@ NEEDED = 2
 
 
 def screened_through_driver(
-    store: RecordStore, lean: str, audit_kinds: Mapping[str, tuple[str, str | None]], *, s1: bool
-) -> list[dict[str, JsonValue]]:
-    """Formalise RUNS copies with scripted models, then screen them with live ones."""
+    store: RecordStore,
+    lean: str,
+    audit_kinds: Mapping[str, tuple[str, str | None]],
+    *,
+    s1: bool,
+) -> list[str]:
+    """Formalise RUNS copies with scripted models, then screen them with live ones.
+
+    The copies are screened one after another in one `drive` call. If the
+    deterministic tactic battery proves the theorem, all three pass together,
+    so "2 of 3" then means one result, not three tries of a model.
+    """
     start(store)
     ids = [
         survivor(
@@ -358,6 +443,7 @@ def screened_through_driver(
             f"{'s1' if s1 else 's8'}{i}",
             S1_STATEMENT if s1 else S8_STATEMENT,
             S1_ASSUMPTIONS if s1 else S8_ASSUMPTIONS,
+            S1_WITNESS if s1 else None,
         )
         for i in range(RUNS)
     ]
@@ -380,41 +466,40 @@ def screened_through_driver(
     )
     assert outcome.stopped is None, outcome.stopped
     assert outcome.skipped == [], outcome.skipped
-    screens = [store.load(r).stages[Stage.triviality].data for r in ids]
-    for data in screens:
+    for record_id in ids:
+        data = store.load(record_id).stages[Stage.triviality].data
         shown = ("trivial", "held", "proved_by", "corollary_of")
-        print(json.dumps({k: data.get(k) for k in shown}))
-    return screens
+        print(record_id, json.dumps({k: data.get(k) for k in shown}))
+    return ids
 
 
-def flagged(data: Mapping[str, JsonValue]) -> bool:
-    """The screen proved it: `trivial`, or `held` for review because the
-    formaliser stage had doubts (here, no witness)."""
-    return data["screened"] is True and data["proved_by"] is not None
+def screen_of(store: RecordStore, record_id: str) -> dict[str, JsonValue]:
+    return store.load(record_id).stages[Stage.triviality].data
 
 
 @pytest.mark.live
 def test_s1_flagged_trivial_through_the_driver(tmp_path: Path) -> None:
-    kinds: dict[str, tuple[str, str | None]] = {
-        "hq0": ("matches", "assumption 1"),
-        "hq1": ("matches", "assumption 1"),
-        "hp": ("matches", "assumption 2"),
-        "hr": ("matches", "assumption 3"),
-        "hrpos": ("matches", "assumption 4"),
-    }
-    screens = screened_through_driver(RecordStore(tmp_path), S1_LEAN, kinds, s1=True)
-    assert sum(flagged(d) for d in screens) >= NEEDED
+    store = RecordStore(tmp_path)
+    ids = screened_through_driver(store, S1_LEAN, S1_VERDICTS, s1=True)
+    trivial = [r for r in ids if screen_of(store, r)["trivial"] is True]
+    assert len(trivial) >= NEEDED
+    assert all(store.load(r).status is Status.trivial for r in trivial)
 
 
 @pytest.mark.live
 def test_s8_flagged_trivial_through_the_driver(tmp_path: Path) -> None:
-    # The audit states hKKT as a weakening, so the formalisation is screened
-    # (and any proof is held for review, not set trivial).
-    kinds: dict[str, tuple[str, str | None]] = {
-        "hW": ("matches", "assumption 1"),
-        "hp": ("matches", "assumption 2"),
-        "hKKT": ("weakening", None),
-    }
-    screens = screened_through_driver(RecordStore(tmp_path), S8_LEAN, kinds, s1=False)
-    assert sum(flagged(d) for d in screens) >= NEEDED
-    assert all(d["trivial"] is False for d in screens)
+    """A counterfactual: on the real path the audit refuses hKKT and S8 is never
+    screened (the offline test above). Here the audit states hKKT as a
+    weakening, so the screen runs as a second line of defence; a proof is
+    held for review, not set trivial."""
+    store = RecordStore(tmp_path)
+    kinds = {**S8_VERDICTS, "hKKT": ("weakening", None)}
+    ids = screened_through_driver(store, S8_LEAN, kinds, s1=False)
+    screens = [screen_of(store, r) for r in ids]
+    proved = [d for d in screens if d["screened"] is True and d["proved_by"] is not None]
+    assert len(proved) >= NEEDED
+    for data in proved:
+        assert data["trivial"] is False and data["held"] is True
+        holds = data["hold_reasons"]
+        assert isinstance(holds, list)
+        assert any("hKKT" in str(h) and "weakening" in str(h) for h in holds), holds
