@@ -322,6 +322,10 @@ def format_report(report: CostReport) -> str:
         f"Run {report.run_id}",
         f"  reviewed survivors: {report.reviewed_survivors}",
         f"  total tokens: {report.total_tokens:,} ({report.unattributed_tokens:,} with no record)",
+    ]
+    if report.failed_tokens:
+        lines.append(f"  of which failed calls: {report.failed_tokens:,} tokens")
+    lines += [
         f"  machine hours: {report.machine_hours:.2f}; review hours: {report.review_hours:.2f}",
         f"  tokens per reviewed survivor: {per(report.tokens_per_reviewed_survivor, 'tokens')}",
         f"  hours per reviewed survivor: {per(report.hours_per_reviewed_survivor, 'hours')}",

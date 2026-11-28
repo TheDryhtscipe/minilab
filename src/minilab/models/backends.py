@@ -99,14 +99,28 @@ class ModelUnavailable(Exception):
 
     `tokens_in` and `tokens_out` are the counts the tool reported for the
     failed call, or None where it reported none.
+
+    `output` is the tool's stdout (or ollama's answer body) when it ended the
+    call itself: it exited, or answered with an error or with output that does
+    not parse. It is None when the call was cut off by a timeout, a signal, or
+    the output cap. Stdout leaves out stderr and any reasoning the model did
+    not print, so it can be less than the call spent. Where the tool reported
+    no output count, the adapter charges an estimate of `output` in place of
+    the call's whole output reservation.
     """
 
     def __init__(
-        self, message: str, *, tokens_in: int | None = None, tokens_out: int | None = None
+        self,
+        message: str,
+        *,
+        tokens_in: int | None = None,
+        tokens_out: int | None = None,
+        output: str | None = None,
     ) -> None:
         super().__init__(message)
         self.tokens_in = tokens_in
         self.tokens_out = tokens_out
+        self.output = output
 
 
 class ModelNotStarted(ModelUnavailable):
@@ -123,6 +137,10 @@ class ModelReply(BaseModel):
     tokens_out: int = Field(ge=0)
     estimated: bool
     """True if either count was estimated because the tool did not report it."""
+    tokens_in_estimated: bool = False
+    """True if `tokens_in` was estimated."""
+    tokens_out_estimated: bool = False
+    """True if `tokens_out` was estimated."""
     model: str
     tools_denied: int = Field(default=0, ge=0)
     """Tool calls the tool's own guard denied during the call (agy only)."""
@@ -166,11 +184,15 @@ class OutputTooLarge(ModelUnavailable):
 
 
 class ToolExit(ModelUnavailable):
-    """The tool started and exited non-zero. `stdout` is what it printed."""
+    """The tool started and exited non-zero. `stdout` is what it printed.
 
-    def __init__(self, message: str, *, stdout: str) -> None:
+    `returncode` is negative when a signal killed the tool.
+    """
+
+    def __init__(self, message: str, *, stdout: str, returncode: int) -> None:
         super().__init__(message)
         self.stdout = stdout
+        self.returncode = returncode
 
 
 def _killpg(pgid: int) -> None:
@@ -256,9 +278,10 @@ def run_command(
             _drain_then_close(proc, read=False)
     out = out_b.decode("utf-8", errors="replace")
     err = err_b.decode("utf-8", errors="replace")
-    if proc.returncode != 0:
+    code = proc.wait()  # Already reaped; this only reads the exit status.
+    if code != 0:
         raise ToolExit(
-            f"{tool}: exit {proc.returncode}: {_tail(err) or _tail(out)}", stdout=out
+            f"{tool}: exit {code}: {_tail(err) or _tail(out)}", stdout=out, returncode=code
         )
     return out
 
@@ -361,7 +384,13 @@ def _run_and_parse(
     env: Mapping[str, str],
     timeout_s: float,
 ) -> ModelReply:
-    """Run the tool and parse its output. On a non-zero exit, keep any usage it reported."""
+    """Run the tool and parse its output. On a non-zero exit, keep any usage it reported.
+
+    When the tool ended the call itself, the `ModelUnavailable` raised carries
+    its stdout as `output`. An exit code of 128 or more counts as a signal, not
+    as the tool ending the call, since a wrapper such as the codex launcher
+    reports a child killed by a signal as 128 + n.
+    """
     try:
         out = run_command(argv, stdin=stdin, cwd=cwd, env=env, timeout_s=timeout_s)
     except ToolExit as exc:
@@ -371,11 +400,20 @@ def _run_and_parse(
             tokens_in, tokens_out = parsed.tokens_in, parsed.tokens_out
             message = f"{exc}; {parsed}"
         else:
-            tokens_in = None if reply.estimated else reply.tokens_in
-            tokens_out = None if reply.estimated else reply.tokens_out
+            tokens_in = None if reply.tokens_in_estimated else reply.tokens_in
+            tokens_out = None if reply.tokens_out_estimated else reply.tokens_out
             message = str(exc)
-        raise ModelUnavailable(message, tokens_in=tokens_in, tokens_out=tokens_out) from exc
-    return parse(out)
+        raise ModelUnavailable(
+            message,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            output=exc.stdout if 0 < exc.returncode < 128 else None,
+        ) from exc
+    try:
+        return parse(out)
+    except ModelUnavailable as exc:
+        exc.output = out
+        raise
 
 
 def _load_json(raw: str, tool: str) -> JsonValue:
@@ -422,6 +460,8 @@ def _reply(
         tokens_in=estimate_tokens(prompt) if tokens_in is None else tokens_in,
         tokens_out=estimate_tokens(text) if tokens_out is None else tokens_out,
         estimated=estimated,
+        tokens_in_estimated=tokens_in is None,
+        tokens_out_estimated=tokens_out is None,
         model=model,
     )
 
@@ -1080,11 +1120,14 @@ class LocalBackend:
                     json={"model": self.model, "prompt": prompt, "stream": False},
                     timeout=timeout_s,
                 )
-                response.raise_for_status()
-            reply = _OllamaReply.model_validate_json(response.content)
         except httpx.TimeoutException as exc:
             raise ModelUnavailable(f"ollama: timed out after {timeout_s} s") from exc
-        except (httpx.HTTPError, ValidationError) as exc:
+        except httpx.HTTPError as exc:
             raise ModelUnavailable(f"ollama: {exc}") from exc
+        try:
+            response.raise_for_status()
+            reply = _OllamaReply.model_validate_json(response.content)
+        except (httpx.HTTPError, ValidationError) as exc:
+            raise ModelUnavailable(f"ollama: {exc}", output=response.text) from exc
         return _reply(reply.response, reply.prompt_eval_count, reply.eval_count, reply.model,
                       prompt)

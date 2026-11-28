@@ -88,8 +88,11 @@ class Charge(_Entry):
     """One model call's cost.
 
     `estimated` is true when the tool did not report its token counts and the
-    adapter estimated them. `reservation` names the reservation this charge
-    settles, if any.
+    adapter estimated them. `failed` is true when the call started but no reply
+    reached the run: the tool failed, or its reply was refused (a usage-limit
+    message, a tool step that ran). A charge logged before this field existed
+    loads as false.
+    `reservation` names the reservation this charge settles, if any.
     """
 
     kind: Literal["charge"] = "charge"
@@ -101,6 +104,7 @@ class Charge(_Entry):
     tokens_out: Annotated[StrictInt, Field(ge=0, le=MAX_TOKENS)]
     seconds: Annotated[float, Field(strict=True, ge=0, le=MAX_SECONDS, allow_inf_nan=False)]
     estimated: StrictBool
+    failed: StrictBool = False
     reservation: ReservationId | None = None
 
     @field_validator("pair")
@@ -170,7 +174,8 @@ def _counted_charges(entries: builtins.list[AnyEntry]) -> builtins.list[Charge]:
     """Return the charges, plus each open reservation as an estimated charge of its tokens.
 
     An open reservation's call may have run and spent tokens that were never
-    charged, so it counts as spend wherever costs are added up.
+    charged, so it counts as spend wherever costs are added up. No reply of
+    its reached the run, so it counts as a failed call.
     """
     counted = [entry for entry in entries if isinstance(entry, Charge)]
     for held in _open_reservations(entries).values():
@@ -185,6 +190,7 @@ def _counted_charges(entries: builtins.list[AnyEntry]) -> builtins.list[Charge]:
                 tokens_out=0,
                 seconds=0.0,
                 estimated=True,
+                failed=True,
                 reservation=held.id,
             )
         )
@@ -278,10 +284,13 @@ class Ledger:
         tokens_out: int,
         seconds: float,
         estimated: bool,
+        failed: bool = False,
         record_id: str | None = None,
         reservation: str | None = None,
     ) -> None:
         """Log one model call's tokens and its duration in seconds.
+
+        `failed` marks a call that started but gave no reply.
 
         If `reservation` is given, the charge settles that reservation: from
         then on the charge counts and the reservation does not.
@@ -303,6 +312,7 @@ class Ledger:
             tokens_out=tokens_out,
             seconds=seconds,
             estimated=estimated,
+            failed=failed,
             reservation=reservation,
         )
         self._check_target(entry)
@@ -541,7 +551,9 @@ class CostReport(BaseModel):
     survivors, proved results, and certified kills.
 
     A reservation left open (its call crashed before it was charged) counts
-    as an estimated charge of the tokens it reserved, with no duration.
+    as an estimated, failed charge of the tokens it reserved, with no duration.
+    `failed_tokens` is the part of `total_tokens` charged to failed calls; it
+    stays in the total and in the per-survivor figures.
 
     `family_cost_share` is each charged family's share of the run's tokens; it
     is empty when the run has charged no tokens.
@@ -556,6 +568,8 @@ class CostReport(BaseModel):
     total_tokens: int
     unattributed_tokens: int
     """Tokens charged with no record, such as generation calls."""
+    failed_tokens: int
+    """Tokens charged to calls that started but gave no reply."""
     machine_hours: float
     review_hours: float
     tokens_per_reviewed_survivor: float | None
@@ -590,6 +604,7 @@ def cost_report(store: RecordStore, ledger: Ledger, run_id: str) -> CostReport:
 
     total_tokens = sum(charge.tokens for charge in charges)
     unattributed = sum(charge.tokens for charge in charges if charge.record_id is None)
+    failed = sum(charge.tokens for charge in charges if charge.failed)
     machine_hours = sum(charge.seconds for charge in charges) / 3600
     review_hours = sum(review.minutes for review in reviews) / 60
 
@@ -614,6 +629,7 @@ def cost_report(store: RecordStore, ledger: Ledger, run_id: str) -> CostReport:
         reviewed_survivors=count,
         total_tokens=total_tokens,
         unattributed_tokens=unattributed,
+        failed_tokens=failed,
         machine_hours=machine_hours,
         review_hours=review_hours,
         tokens_per_reviewed_survivor=per(total_tokens),
