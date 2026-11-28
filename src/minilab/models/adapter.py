@@ -25,10 +25,14 @@
 - Every call that started is charged to its pair, including a failed one.
   A call that failed after the tool started (any exception from the backend)
   is charged as an estimate: input is the larger of the tokens the tool
-  reported and the prompt's estimate; output is what the tool reported or,
-  if it reported none, the call's output allowance
-  (`Budget.reserve_output_tokens`), so that a failed call never frees the
-  output it reserved. Then the exception is raised again. A call that failed before the
+  reported and the prompt's estimate; output is what the tool reported. If
+  it reported none, output is an estimate of what the tool printed, at most
+  the reservation, when the tool ended the call itself (an error answer, not
+  a timeout or a signal) within `Budget.early_failure_s` and printed
+  something; otherwise it is the call's output allowance
+  (`Budget.reserve_output_tokens`), so that a failure that may have spent
+  more than it printed never frees the output it reserved. The charge is
+  marked failed. Then the exception is raised again. A call that failed before the
   tool started (`ModelNotStarted`) used nothing: its reservation is released
   and it is not charged. If the charge or the release itself fails, the
   reservation stays open and keeps counting as spend.
@@ -192,12 +196,18 @@ class Budget(BaseModel):
     `reserve_output_tokens` is the output each call reserves on top of its
     prompt's estimate while it runs. A call that writes more than this can
     push the pair further over its budget when other calls run beside it.
+
+    `early_failure_s` is how soon a failed call must end for its output to be
+    charged as an estimate of what the tool printed, not as the whole
+    reservation (see `call`). A later failure may have spent its time
+    generating output it never printed.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     tokens_per_pair: int = Field(gt=0)
     reserve_output_tokens: int = Field(default=32_000, ge=0, le=MAX_TOKENS)
+    early_failure_s: float = Field(default=30.0, ge=0, allow_inf_nan=False)
 
     @classmethod
     def from_manifest(cls, manifest: RunManifest) -> "Budget":
@@ -293,8 +303,11 @@ def call(
     `ModelUnavailable`. Any exception the backend raises after the tool
     started is charged as a failed, estimated call and raised again: input is
     the larger of the reported count and the prompt estimate; output is the
-    reported count, else an estimate of what the tool printed if it ended the
-    call itself, else the whole output reservation. No record is written.
+    count the backend gives (for the output cap, an estimate of the bytes
+    read), else an estimate of the tool's stdout, at most the output
+    reservation, if the tool ended the call itself within
+    `budget.early_failure_s` and printed something, else the whole output
+    reservation. No record is written.
     """
     family = Family(family)
     role = Role(role)
@@ -353,10 +366,11 @@ def call(
         reported_in = exc.tokens_in if isinstance(exc, ModelUnavailable) else None
         reported_out = exc.tokens_out if isinstance(exc, ModelUnavailable) else None
         printed = exc.output if isinstance(exc, ModelUnavailable) else None
+        seconds = time.monotonic() - started
         if reported_out is not None:
             tokens_out = reported_out
-        elif printed is not None:
-            tokens_out = min(estimate_tokens(printed), MAX_TOKENS)
+        elif printed is not None and printed.strip() and seconds <= budget.early_failure_s:
+            tokens_out = min(estimate_tokens(printed), budget.reserve_output_tokens)
         else:
             tokens_out = budget.reserve_output_tokens
         try:
@@ -366,7 +380,7 @@ def call(
                 family=family,
                 tokens_in=max(reported_in or 0, estimate_tokens(prompt)),
                 tokens_out=tokens_out,
-                seconds=time.monotonic() - started,
+                seconds=seconds,
                 estimated=True,
                 failed=True,
                 record_id=record_id,

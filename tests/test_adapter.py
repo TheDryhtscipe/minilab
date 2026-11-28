@@ -733,6 +733,47 @@ def test_tool_that_ended_on_its_own_is_charged_what_it_printed(big_ledger: Ledge
     assert charge.estimated and charge.failed
 
 
+def test_slow_failure_is_charged_its_reservation(big_ledger: Ledger) -> None:
+    # Past the early-failure limit the tool may have spent minutes reasoning without printing.
+    error = ModelUnavailable("codex: stream disconnected", output="x" * 40)
+    with pytest.raises(ModelUnavailable):
+        call(Family.codex, Role.encode, "prompt", record_id=None, pair=PAIR, ledger=big_ledger,
+             budget=Budget(tokens_per_pair=100_000, reserve_output_tokens=32_000,
+                           early_failure_s=0.0),
+             backends={Family.codex: FakeBackend(Family.codex, error=error)})
+    [charge] = big_ledger.charges()
+    assert charge.tokens_out == 32_000
+
+
+@pytest.mark.parametrize("printed", ["", " \n"], ids=["empty", "blank"])
+def test_failure_with_nothing_printed_is_charged_its_reservation(
+    big_ledger: Ledger, printed: str
+) -> None:
+    # Claude buffers its JSON to the end; a crash prints nothing however much it spent.
+    error = ModelUnavailable("claude: exit 1", output=printed)
+    with pytest.raises(ModelUnavailable):
+        call(Family.claude, Role.encode, "prompt", record_id=None, pair=PAIR, ledger=big_ledger,
+             budget=Budget(tokens_per_pair=100_000, reserve_output_tokens=32_000),
+             backends={Family.claude: FakeBackend(Family.claude, error=error)})
+    [charge] = big_ledger.charges()
+    assert charge.tokens_out == 32_000
+
+
+def test_printed_estimate_is_capped_at_the_reservation(ledger: Ledger) -> None:
+    # A large error page is not model output; it costs no more than the call reserved.
+    error = ModelUnavailable("ollama: 503", output="x" * 400_000)
+    with pytest.raises(ModelUnavailable):
+        call(Family.claude, Role.encode, "prompt", record_id=None, pair=PAIR, ledger=ledger,
+             budget=Budget(tokens_per_pair=100, reserve_output_tokens=50),
+             backends={Family.claude: FakeBackend(Family.claude, error=error)})
+    [charge] = ledger.charges()
+    assert charge.tokens_out == 50
+
+
+def test_early_failure_limit_defaults_to_30_seconds() -> None:
+    assert Budget(tokens_per_pair=1).early_failure_s == 30.0
+
+
 def test_reported_output_beats_the_printed_estimate(ledger: Ledger) -> None:
     error = ModelUnavailable("claude: exit 1", tokens_in=5, tokens_out=3, output="x" * 400)
     with pytest.raises(ModelUnavailable):
