@@ -88,8 +88,10 @@ class Charge(_Entry):
     """One model call's cost.
 
     `estimated` is true when the tool did not report its token counts and the
-    adapter estimated them. `failed` is true when the call started but gave no
-    reply; a charge logged before this field existed loads as false.
+    adapter estimated them. `failed` is true when the call started but no reply
+    reached the run: the tool failed, or its reply was refused (a usage-limit
+    message, a tool step that ran). A charge logged before this field existed
+    loads as false.
     `reservation` names the reservation this charge settles, if any.
     """
 

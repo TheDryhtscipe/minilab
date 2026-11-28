@@ -803,6 +803,33 @@ def test_tool_killed_by_a_signal_is_charged_its_reservation(
     assert _codex_charge(big_ledger, tmp_path, "codex_killed", _CODEX_KILLED) == 32_000
 
 
+_CODEX_EXIT_1_OUTPUT_COUNT_ONLY = """
+import json, sys
+sys.stdin.read()
+print(json.dumps({"type": "item.completed",
+                  "item": {"type": "agent_message", "text": "an answer"}}))
+print(json.dumps({"type": "turn.completed", "usage": {"output_tokens": 8000}}))
+sys.exit(1)
+"""
+
+
+def test_reported_output_count_survives_a_missing_input_count(
+    big_ledger: Ledger, tmp_path: Path
+) -> None:
+    # The tool reported its output but not its input; the output count must stand.
+    assert _codex_charge(big_ledger, tmp_path, "codex_half", _CODEX_EXIT_1_OUTPUT_COUNT_ONLY) == (
+        8000
+    )
+
+
+def test_exit_code_from_a_signal_in_a_wrapper_keeps_the_reservation(
+    big_ledger: Ledger, tmp_path: Path
+) -> None:
+    # The codex wrapper reports a child killed by a signal it ignores as exit 128 + n.
+    body = "import sys\nsys.stdin.read()\nprint('{}')\nsys.exit(141)"
+    assert _codex_charge(big_ledger, tmp_path, "codex_sigpipe", body) == 32_000
+
+
 def test_tool_timeout_keeps_no_output(tmp_path: Path) -> None:
     tool = _tool(tmp_path, "slow", "import time\nprint('partial', flush=True)\ntime.sleep(30)")
     with pytest.raises(ModelUnavailable, match="timed out") as caught:
