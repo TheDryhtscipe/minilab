@@ -21,8 +21,12 @@ The isolation flags for each tool:
   in place of Claude Code's. Never `--bare`, which bills the API key, not the
   subscription (MuninnDB `common` memory `01M3WPMQETWRFJQPDGFY0ZVBJG`).
 - Codex (`codex exec`): the user's `config.toml` and rules are not loaded (so
-  no MCP servers), a read-only sandbox, web search disabled, and every tool
-  feature that reaches outside the prompt turned off, including the shell.
+  no MCP servers), a read-only sandbox, web search disabled, every tool
+  feature that reaches outside the prompt turned off, including the shell, no
+  multi-agent tools or skill catalog, and an empty `HOME` and `CODEX_HOME` per
+  call holding only a copy of the login, so the user's `AGENTS.md` and skills
+  never load. What codex then sends is checked by
+  `minilab.models.codex_request` (bead minilab-811a75).
 - Gemini (Antigravity CLI, `agy --input-format stream-json`): a session-only
   `--settings` object that denies file, URL, command, and MCP actions, keeps
   the agent inside its empty workspace, and never spends paid credits; a
@@ -38,6 +42,7 @@ Whether each tool really is isolated is checked live by
 `scripts/probe_isolation.py`, not assumed from these flags.
 """
 
+import fcntl
 import json
 import math
 import os
@@ -520,8 +525,27 @@ CODEX_DISABLED_FEATURES: tuple[str, ...] = (
     "skill_search",
     "skill_mcp_dependency_install",
     "tool_suggest",
+    "goals",
+    "memories",
+    "sleep_tool",
 )
-"""Codex features that give the model a way out of the prompt (checked on codex-cli 0.153)."""
+"""Codex features that give the model a way out of the prompt, or tools and
+context it does not need (checked on codex-cli 0.172)."""
+
+CODEX_CONFIG: tuple[str, ...] = (
+    'web_search="disabled"',
+    "agents.enabled=false",
+    "skills.include_instructions=false",
+    "skills.bundled.enabled=false",
+    'model_reasoning_effort="medium"',
+)
+"""`-c` overrides for every call. They turn off the multi-agent tools and
+prompts and the skill catalog, which no feature flag covers (bead
+minilab-811a75). `--ignore-user-config` leaves the effort at the model's
+default, `low`, so the effort is set here (user decision 2026-11-28: medium to
+start)."""
+
+_LOGIN_LOCK = ".minilab-auth.lock"
 
 
 def parse_codex(raw: str, *, model: str, prompt: str = "") -> ModelReply:
@@ -596,9 +620,14 @@ def parse_codex(raw: str, *, model: str, prompt: str = "") -> ModelReply:
 class CodexBackend:
     family = Family.codex
 
-    def __init__(self, *, model: str, binary: str = "codex") -> None:
+    def __init__(
+        self, *, model: str, binary: str = "codex", config: Sequence[str] = ()
+    ) -> None:
         self.model = model
         self.binary = binary
+        self.config = tuple(config)
+        """Extra `-c key=value` overrides, after the isolation flags. Only the
+        request sink (`minilab.models.codex_request`) passes any."""
 
     def argv(self) -> list[str]:
         argv = [
@@ -610,19 +639,95 @@ class CodexBackend:
             "--ephemeral",
             "--skip-git-repo-check",
             "--sandbox", "read-only",
-            "-c", 'web_search="disabled"',
         ]
+        for override in CODEX_CONFIG:
+            argv += ["-c", override]
         for feature in CODEX_DISABLED_FEATURES:
             argv += ["--disable", feature]
+        for override in self.config:
+            argv += ["-c", override]
         return argv + ["--model", self.model, "-"]
 
     def run(
         self, prompt: str, *, cwd: Path, env: Mapping[str, str], timeout_s: float
     ) -> ModelReply:
-        return _run_and_parse(
-            self.argv(), lambda out: parse_codex(out, model=self.model, prompt=prompt),
-            stdin=prompt, cwd=cwd, env=env, timeout_s=timeout_s,
-        )
+        """Run codex in `cwd`, the call's own empty directory, with a home of its own.
+
+        Codex reads the user's `AGENTS.md` and skills from `CODEX_HOME` and
+        `HOME` even with `--ignore-user-config`. So the backend makes empty
+        folders `cwd/.home` (for `HOME` and the XDG folders) and
+        `cwd/.codex-home` (for `CODEX_HOME`), and copies in only the user's
+        login, `~/.codex/auth.json`. If codex refreshes the login during the
+        call, the new login is written back afterwards, even if the call
+        failed, unless the user's file changed in the meantime: then that
+        newer login is kept (user decision 2026-11-28). Raise
+        `ModelNotStarted` if there is no login or the folders cannot be made.
+        """
+        home = Path(env.get("HOME") or Path.home())
+        login = home / ".codex" / "auth.json"
+        own_home = cwd / ".home"
+        codex_home = cwd / ".codex-home"
+        try:
+            original = login.read_bytes()
+        except OSError as exc:
+            raise ModelNotStarted(f"codex: cannot read the login at {login}: {exc}") from exc
+        copy = codex_home / "auth.json"
+        try:
+            own_home.mkdir(exist_ok=True)
+            codex_home.mkdir(mode=0o700, exist_ok=True)
+            _write_private(copy, original)
+        except OSError as exc:
+            raise ModelNotStarted(f"codex: cannot make the call's home: {exc}") from exc
+        own_env = {
+            **env,
+            "HOME": str(own_home),
+            "CODEX_HOME": str(codex_home),
+            "XDG_CONFIG_HOME": str(own_home / ".config"),
+            "XDG_DATA_HOME": str(own_home / ".local" / "share"),
+            "XDG_CACHE_HOME": str(own_home / ".cache"),
+            "XDG_STATE_HOME": str(own_home / ".local" / "state"),
+        }
+        try:
+            return _run_and_parse(
+                self.argv(), lambda out: parse_codex(out, model=self.model, prompt=prompt),
+                stdin=prompt, cwd=cwd, env=own_env, timeout_s=timeout_s,
+            )
+        finally:
+            _write_back_login(login, copy, original)
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    """Write `data` to `path`, readable only by the user."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as out:
+        out.write(data)
+
+
+def _write_back_login(login: Path, copy: Path, original: bytes) -> None:
+    """Put a login codex refreshed during the call back in the user's file.
+
+    Do nothing if the copy is unchanged or unreadable, or if the user's file
+    no longer holds `original` (another codex refreshed it; that login is
+    newer). The swap is atomic and done under a lock, so two minilab calls
+    never write at once; a codex outside minilab does not take the lock.
+    """
+    try:
+        refreshed = copy.read_bytes()
+    except OSError:
+        return
+    if refreshed == original or not refreshed.strip():
+        return
+    lock_path = login.parent / _LOGIN_LOCK
+    with open(lock_path, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            if login.read_bytes() != original:
+                return
+            staged = login.with_name(f".auth.json.minilab-{secrets.token_hex(8)}")
+            _write_private(staged, refreshed)
+            os.replace(staged, login)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 # --- Gemini (Antigravity CLI) ---------------------------------------------------------------
