@@ -14,25 +14,36 @@ sandbox.
 import inspect
 import json
 import random
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from fractions import Fraction
 from functools import partial
 from pathlib import Path
 
 import mpmath
+import numpy as np
+import numpy.typing as npt
 import pytest
 from fixtures.pilot import s7 as s7_module
 from fixtures.pilot.s7 import S7Encoding
+from scipy.optimize import minimize  # pyright: ignore[reportMissingTypeStubs, reportUnknownVariableType]
 
 from minilab.certify import ExactCertificate, check_certificate
 from minilab.encoding import sandbox
 from minilab.encoding.api import ExactMargin, Instance, to_fraction
 from minilab.encoding.sandbox import EncodingOutput, Sandboxed, SandboxFailure
+from minilab.falsify import search as search_module
 from minilab.falsify.coverage import CoverageReport
 from minilab.falsify.mechanism import check_mechanism
 from minilab.falsify.reformulate import check_reformulation, reformulate_and_attack
-from minilab.falsify.search import LocalEvaluator, SearchBudget, attack
+from minilab.falsify.search import (
+    Evaluation,
+    LocalEvaluator,
+    SandboxEvaluator,
+    SearchBudget,
+    attack,
+    search,
+)
 from minilab.falsify.stage import CertificationFailed, run_falsifier_stage
 from minilab.ledger import Ledger
 from minilab.models.adapter import Budget, ModelReply, ModelUnavailable, default_backends
@@ -379,6 +390,40 @@ def test_sampling_alone_misses_the_planted_violation() -> None:
     assert Fraction(result.coverage.worst_margin) > 0
 
 
+class CountingEvaluator(LocalEvaluator):
+    """A LocalEvaluator that records the size of every batch it is asked to evaluate."""
+
+    def __init__(self, enc: Planted) -> None:
+        super().__init__(enc)
+        self.batches: list[int] = []
+
+    def evaluate(self, points: Sequence[Instance]) -> list[Evaluation]:
+        self.batches.append(len(points))
+        return super().evaluate(points)
+
+
+def test_local_searches_run_in_step_one_batch_per_round() -> None:
+    # A sandboxed encoding costs one child process per batch, so the local searches
+    # must share batches: one round of every live search per call, not one point.
+    evaluator = CountingEvaluator(Planted())
+    outcome = search(
+        evaluator,
+        SearchBudget(starts=8, local_evaluations=60, boundary_rays=0),
+        random.Random(1),
+    )
+    assert 8 * 30 < outcome.local_evaluations <= 8 * 60
+    # One batch for the starts, then at most one per round of local steps.
+    assert len(evaluator.batches) <= 1 + 60
+    assert max(evaluator.batches[1:]) == 8
+
+
+def test_local_search_is_repeatable() -> None:
+    budget = SearchBudget(starts=8, local_evaluations=60, boundary_rays=0)
+    first = search(LocalEvaluator(Planted()), budget, random.Random(3))
+    second = search(LocalEvaluator(Planted()), budget, random.Random(3))
+    assert [e.point for e in first.evaluations] == [e.point for e in second.evaluations]
+
+
 def test_float_violation_without_certificate_is_not_a_kill() -> None:
     result = attack(FloatLiar, no_search(), random.Random(1), assumptions=1)
     assert not result.killed
@@ -701,3 +746,70 @@ def test_failed_probe_is_not_cached(monkeypatch: pytest.MonkeyPatch) -> None:
         make()
     assert make.failures == ("the encoding timed out after 1s",)
     assert isinstance(make(), ExactMargin)
+
+
+# --- one bad point in a sandbox batch ---
+
+HANGS_AT_7 = toy_source("t - 4 if t != 7 else Fraction(sum(range(10**13)))")
+
+
+def toy_point(t: int) -> Instance:
+    return Instance(values={"t": str(t)}, precision_digits=30)
+
+
+def test_a_point_that_hangs_the_sandbox_fails_only_itself() -> None:
+    # The local runs share one child per round; a hang at one run's point must not
+    # spoil the others' points (and the tracker would cache the spoilt results).
+    evaluator = SandboxEvaluator(HANGS_AT_7, timeout_s=3)
+    first, second, bad = evaluator.evaluate([toy_point(1), toy_point(2), toy_point(7)])
+    assert first.valid and first.margin == -3
+    assert second.valid and second.margin == -2
+    assert not bad.valid and bad.error is not None and "timed out" in bad.error
+
+
+def test_an_encoding_that_cannot_load_is_not_retried_point_by_point(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runs: list[int] = []
+    real = search_module.run_encoding
+
+    def counting(source: str, calls: sandbox.EncodingCalls, timeout_s: float) -> EncodingOutput:
+        runs.append(len(calls))
+        return real(source, calls, timeout_s)
+
+    monkeypatch.setattr(search_module, "run_encoding", counting)
+    broken = FALSE_TOY + "\nraise RuntimeError('broken')\n"
+    results = SandboxEvaluator(broken).evaluate([toy_point(t) for t in range(5)])
+    assert all(not e.valid and e.error and "broken" in e.error for e in results)
+    # The batch, the empty-encoding probe, and this encoding with no calls: no more.
+    assert len(runs) <= 3
+
+
+def test_stepwise_nelder_mead_matches_scipy_without_ties() -> None:
+    def rosen(v: npt.NDArray[np.float64]) -> float:
+        return float(sum(100 * (v[1:] - v[:-1] ** 2) ** 2 + (1 - v[:-1]) ** 2))
+
+    x0 = np.array([-1.2, 1.0, 0.5])
+    simplex = np.vstack([x0] + [x0 + np.eye(3)[i] * 0.1 for i in range(3)])
+    theirs: list[list[float]] = []
+
+    def f(v: npt.NDArray[np.float64]) -> float:
+        theirs.append(v.tolist())
+        return rosen(v)
+
+    minimize(
+        f,
+        x0,
+        method="Nelder-Mead",
+        options={"maxfev": 150, "initial_simplex": simplex, "xatol": 1e-12, "fatol": 1e-15},
+    )
+    ours: list[list[float]] = []
+    gen = search_module._nelder_mead(simplex, 150)  # pyright: ignore[reportPrivateUsage]
+    try:
+        v = next(gen)
+        while True:
+            ours.append(v.tolist())
+            v = gen.send(rosen(v))
+    except StopIteration:
+        pass
+    assert ours == theirs
