@@ -7,9 +7,9 @@
   },
   "codex": {
     "benchmark": true,
-    "probe": "runs/probes/2026-11-24.json",
+    "probe": "runs/probes/2026-11-28.json",
     "status": "isolated",
-    "version": "codex-cli 0.153.4"
+    "version": "codex-cli 0.172.0"
   },
   "gemini": {
     "benchmark": true,
