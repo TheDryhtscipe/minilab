@@ -291,7 +291,10 @@ def call(
     budget; and `ModelUnavailable` if the tool fails (`ModelNotStarted` if it
     failed before it started). Each of these is raised before the call except
     `ModelUnavailable`. Any exception the backend raises after the tool
-    started is charged and raised again. No record is written.
+    started is charged as a failed, estimated call and raised again: input is
+    the larger of the reported count and the prompt estimate; output is the
+    reported count, else an estimate of what the tool printed if it ended the
+    call itself, else the whole output reservation. No record is written.
     """
     family = Family(family)
     role = Role(role)
@@ -349,17 +352,23 @@ def call(
     except BaseException as exc:
         reported_in = exc.tokens_in if isinstance(exc, ModelUnavailable) else None
         reported_out = exc.tokens_out if isinstance(exc, ModelUnavailable) else None
+        printed = exc.output if isinstance(exc, ModelUnavailable) else None
+        if reported_out is not None:
+            tokens_out = reported_out
+        elif printed is not None:
+            tokens_out = min(estimate_tokens(printed), MAX_TOKENS)
+        else:
+            tokens_out = budget.reserve_output_tokens
         try:
             ledger.charge(
                 pair=pair,
                 stage=stage,
                 family=family,
                 tokens_in=max(reported_in or 0, estimate_tokens(prompt)),
-                tokens_out=(
-                    reported_out if reported_out is not None else budget.reserve_output_tokens
-                ),
+                tokens_out=tokens_out,
                 seconds=time.monotonic() - started,
                 estimated=True,
+                failed=True,
                 record_id=record_id,
                 reservation=reservation,
             )

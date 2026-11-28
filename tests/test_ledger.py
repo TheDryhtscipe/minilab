@@ -15,6 +15,7 @@ from typing import cast
 import pytest
 from pydantic import ValidationError
 
+from minilab.cli import format_report
 from minilab.ledger import CorruptLedger, Ledger, cost_report
 from minilab.records import Family, Provenance, Record, RecordStore, Stage, Status, TokenCount
 from minilab.run import (
@@ -84,6 +85,7 @@ def _charge(
     tokens_out: int = 0,
     seconds: float = 0.0,
     estimated: bool = False,
+    failed: bool = False,
 ) -> None:
     ledger.charge(
         pair=pair,
@@ -93,6 +95,7 @@ def _charge(
         tokens_out=tokens_out,
         seconds=seconds,
         estimated=estimated,
+        failed=failed,
         record_id=record_id,
     )
 
@@ -931,3 +934,37 @@ def test_concurrent_settles_of_one_reservation_have_one_winner(store: RecordStor
     outcomes = sorted(results.get(timeout=5) for _ in workers)
     assert outcomes == ["refused"] * 5 + ["released"]
     ledger.entries()
+
+
+# --- Failed calls (minilab-9697fd) ---------------------------------------------------------
+
+
+def test_failed_calls_are_reported_apart_and_still_counted(store: RecordStore) -> None:
+    ledger = _ledger(store)
+    _charge(ledger, record_id=None, tokens_in=100, tokens_out=50)
+    _charge(ledger, record_id=None, tokens_in=7, tokens_out=3, estimated=True, failed=True)
+    ledger.reserve(pair=PAIR, stage=Stage.generator, family=Family.codex, tokens=40,
+                   record_id=None)
+    report = cost_report(store, ledger, RUN)
+    assert report.total_tokens == 200
+    assert report.failed_tokens == 50, "a failed charge and an open reservation are failed"
+    assert "failed calls: 50 tokens" in format_report(report)
+
+
+def test_report_has_no_failed_line_when_nothing_failed(store: RecordStore) -> None:
+    ledger = _ledger(store)
+    _charge(ledger, record_id=None, tokens_in=100, tokens_out=50)
+    report = cost_report(store, ledger, RUN)
+    assert report.failed_tokens == 0
+    assert "failed calls" not in format_report(report)
+
+
+def test_a_charge_logged_before_the_failed_field_loads_as_not_failed(store: RecordStore) -> None:
+    ledger = _ledger(store)
+    _charge(ledger, record_id=None, tokens_in=1, tokens_out=1)
+    path = store.root / "runs" / RUN / "ledger.jsonl"
+    line = json.loads(path.read_text())
+    assert line.pop("failed") is False
+    path.write_text(json.dumps(line) + "\n")
+    [charge] = ledger.charges()
+    assert charge.failed is False

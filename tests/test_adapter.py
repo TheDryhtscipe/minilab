@@ -129,6 +129,16 @@ def store(tmp_path: Path) -> RecordStore:
 
 @pytest.fixture
 def ledger(store: RecordStore) -> Ledger:
+    return _open_ledger(store, budget=100)
+
+
+@pytest.fixture
+def big_ledger(store: RecordStore) -> Ledger:
+    """A ledger whose budget holds a full 32,000-token output reservation."""
+    return _open_ledger(store, budget=100_000)
+
+
+def _open_ledger(store: RecordStore, *, budget: int) -> Ledger:
     save_manifest(
         store.root,
         RunManifest(
@@ -138,7 +148,7 @@ def ledger(store: RecordStore) -> Ledger:
             memory_policy=MemoryPolicy.blind,
             memory_before=None,
             literature_before=None,
-            budget_tokens_per_pair=100,
+            budget_tokens_per_pair=budget,
             families=tuple(Family),
             models=default_models(Family),
             started=datetime(2026, 11, 24, 12, 0, tzinfo=UTC),
@@ -699,6 +709,106 @@ def test_failed_call_with_no_reported_output_is_charged_its_allowance(ledger: Le
              backends={Family.claude: FakeBackend(Family.claude, error=error)})
     [charge] = ledger.charges()
     assert (charge.tokens_in, charge.tokens_out) == (estimate_tokens("prompt"), 77)
+    assert charge.failed
+
+
+def test_failed_call_is_marked_failed_and_a_good_call_is_not(ledger: Ledger) -> None:
+    _call(ledger, FakeBackend(Family.claude))
+    with pytest.raises(ModelUnavailable):
+        _call(ledger, FakeBackend(Family.claude, error=ModelUnavailable("claude: broke")))
+    good, bad = ledger.charges()
+    assert (good.failed, bad.failed) == (False, True)
+
+
+def test_tool_that_ended_on_its_own_is_charged_what_it_printed(big_ledger: Ledger) -> None:
+    # minilab-9697fd: a tool that answers with an error and exits wrote only that answer, so
+    # the charge is an estimate of it, not the whole output reservation.
+    error = ModelUnavailable("codex: exit 1: 400", output="x" * 40)
+    with pytest.raises(ModelUnavailable):
+        call(Family.codex, Role.encode, "prompt", record_id=None, pair=PAIR, ledger=big_ledger,
+             budget=Budget(tokens_per_pair=100_000, reserve_output_tokens=32_000),
+             backends={Family.codex: FakeBackend(Family.codex, error=error)})
+    [charge] = big_ledger.charges()
+    assert (charge.tokens_in, charge.tokens_out) == (estimate_tokens("prompt"), 10)
+    assert charge.estimated and charge.failed
+
+
+def test_reported_output_beats_the_printed_estimate(ledger: Ledger) -> None:
+    error = ModelUnavailable("claude: exit 1", tokens_in=5, tokens_out=3, output="x" * 400)
+    with pytest.raises(ModelUnavailable):
+        _call(ledger, FakeBackend(Family.claude, error=error))
+    [charge] = ledger.charges()
+    assert charge.tokens_out == 3
+
+
+_CODEX_400 = """
+import json, sys
+sys.stdin.read()
+sys.stderr.write("ERROR codex_core: failed to load skill\\n")
+print(json.dumps({"type": "thread.started", "thread_id": "t"}))
+print(json.dumps({"type": "turn.started"}))
+body = json.dumps({"type": "error", "status": 400, "error": {
+    "type": "invalid_request_error", "code": "model_not_found",
+    "message": "The model is not supported when using Codex with a ChatGPT account."}})
+print(json.dumps({"type": "error", "message": body}))
+print(json.dumps({"type": "turn.failed", "error": {"message": body}}))
+sys.exit(1)
+"""
+
+_CODEX_EXIT_0_NO_ANSWER = """
+import json, sys
+sys.stdin.read()
+print(json.dumps({"type": "turn.started"}))
+"""
+
+_CODEX_KILLED = """
+import json, os, signal, sys
+sys.stdin.read()
+print(json.dumps({"type": "turn.started"}), flush=True)
+os.kill(os.getpid(), signal.SIGKILL)
+"""
+
+
+def _codex_charge(ledger: Ledger, tmp_path: Path, name: str, body: str) -> int:
+    backend = CodexBackend(model=ledger.manifest.model_of(Family.codex),
+                           binary=_tool(tmp_path, name, body))
+    with pytest.raises(ModelUnavailable):
+        call(Family.codex, Role.encode, "prompt", record_id=None, pair=PAIR, ledger=ledger,
+             budget=Budget(tokens_per_pair=100_000, reserve_output_tokens=32_000),
+             backends={Family.codex: backend})
+    [charge] = ledger.charges()
+    assert charge.estimated and charge.failed
+    return charge.tokens_out
+
+
+def test_codex_400_is_charged_its_printed_output(big_ledger: Ledger, tmp_path: Path) -> None:
+    # The smoke-itopt-1 failure: Codex answered 400 and exited 1 after a few seconds.
+    tokens_out = _codex_charge(big_ledger, tmp_path, "codex_400", _CODEX_400)
+    assert 0 < tokens_out < 200
+
+
+def test_codex_exit_0_with_no_answer_is_charged_its_printed_output(
+    big_ledger: Ledger, tmp_path: Path
+) -> None:
+    out = json.dumps({"type": "turn.started"}) + "\n"
+    assert _codex_charge(big_ledger, tmp_path, "codex_none", _CODEX_EXIT_0_NO_ANSWER) == (
+        estimate_tokens(out)
+    )
+
+
+def test_tool_killed_by_a_signal_is_charged_its_reservation(
+    big_ledger: Ledger, tmp_path: Path
+) -> None:
+    # Something outside the tool killed it; it may have been writing, so keep the reservation.
+    assert _codex_charge(big_ledger, tmp_path, "codex_killed", _CODEX_KILLED) == 32_000
+
+
+def test_tool_timeout_keeps_no_output(tmp_path: Path) -> None:
+    tool = _tool(tmp_path, "slow", "import time\nprint('partial', flush=True)\ntime.sleep(30)")
+    with pytest.raises(ModelUnavailable, match="timed out") as caught:
+        backends_module._run_and_parse(  # pyright: ignore[reportPrivateUsage]
+            [tool], parse_claude, stdin="", cwd=tmp_path, env=scrubbed_env(), timeout_s=0.5)
+    assert caught.value.output is None
 
 
 def test_failed_call_with_reported_zero_output_is_charged_zero(ledger: Ledger) -> None:
@@ -1447,6 +1557,30 @@ def test_local_backend_timeout(tmp_path: Path) -> None:
     )
     with pytest.raises(ModelUnavailable, match="timed out"):
         backend.run("hi", cwd=tmp_path, env={}, timeout_s=0.1)
+
+
+def test_local_backend_error_answer_keeps_its_body(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="model failed to load")
+
+    backend = LocalBackend(
+        model=DEFAULT_MODELS[Family.local], transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(ModelUnavailable) as caught:
+        backend.run("hi", cwd=tmp_path, env={}, timeout_s=10)
+    assert caught.value.output == "model failed to load"
+
+
+def test_local_backend_timeout_keeps_no_output(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow", request=request)
+
+    backend = LocalBackend(
+        model=DEFAULT_MODELS[Family.local], transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(ModelUnavailable) as caught:
+        backend.run("hi", cwd=tmp_path, env={}, timeout_s=0.1)
+    assert caught.value.output is None
 
 
 # --- Reservations and the pair lock (minilab-294360) --------------------------------------
