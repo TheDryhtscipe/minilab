@@ -21,7 +21,6 @@ from minilab.models.codex_request import (
     CODEX_ALLOWED_NESTED_TOOLS,
     CODEX_ALLOWED_TOOLS,
     audit_codex_request,
-    capture_codex_request,
 )
 from minilab.records import Family
 from minilab.run import DEFAULT_MODELS
@@ -339,6 +338,9 @@ def test_the_real_codex_request_carries_no_user_context() -> None:
     request held ~/.codex/AGENTS.md, the skill catalog, and the collaboration
     tools.
     """
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from codex_sink import capture_codex_request
+
     body = capture_codex_request(model=DEFAULT_MODELS[Family.codex], env=scrubbed_env(),
                                  timeout_s=60)
     assert audit_codex_request(body, home=Path.home()) == []

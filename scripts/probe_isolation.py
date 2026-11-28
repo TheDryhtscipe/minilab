@@ -49,7 +49,11 @@ import httpx
 from pydantic import BaseModel
 
 from minilab.models.adapter import ModelUnavailable, backends_for, isolated_run, scrubbed_env
-from minilab.models.codex_request import audit_codex_request, capture_codex_request
+from minilab.models.codex_request import audit_codex_request
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from codex_sink import capture_codex_request  # noqa: E402
+
 from minilab.records import Family
 from minilab.run import DEFAULT_MODELS
 
