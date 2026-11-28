@@ -23,6 +23,8 @@ from minilab.models.codex_request import (
     audit_codex_request,
     capture_codex_request,
 )
+from minilab.records import Family
+from minilab.run import DEFAULT_MODELS
 
 _REPLY = "\n".join(
     json.dumps(event)
@@ -47,7 +49,7 @@ def _fake_codex(tmp_path: Path, body: str) -> Path:
     return script
 
 
-def _real_home(tmp_path: Path, login: str = '{"tokens": "old"}') -> Path:
+def _real_home(tmp_path: Path, login: str = '{"tokens": {"t": "old"}}') -> Path:
     home = tmp_path / "realhome"
     (home / ".codex").mkdir(parents=True)
     auth = home / ".codex" / "auth.json"
@@ -87,7 +89,7 @@ def test_codex_runs_with_its_own_home_holding_only_the_login(tmp_path: Path) -> 
     assert Path(got["xdg"]).is_relative_to(Path(got["home"]))
     assert got["files"] == ["auth.json"]
     assert got["home_files"] == []
-    assert got["auth"] == '{"tokens": "old"}'
+    assert got["auth"] == '{"tokens": {"t": "old"}}'
 
 
 def test_a_refreshed_login_is_written_back(tmp_path: Path) -> None:
@@ -95,13 +97,13 @@ def test_a_refreshed_login_is_written_back(tmp_path: Path) -> None:
     binary = _fake_codex(
         tmp_path,
         "(pathlib.Path(os.environ['CODEX_HOME']) / 'auth.json')"
-        ".write_text('{\"tokens\": \"new\"}')",
+        ".write_text('{\"tokens\": {\"t\": \"new\"}}')",
     )
     backend = CodexBackend(model="gpt-test", binary=str(binary))
     backend.run("hi", cwd=_call_dir(tmp_path), env={"HOME": str(home),
                 "PATH": os.environ["PATH"]}, timeout_s=30)
     auth = home / ".codex" / "auth.json"
-    assert auth.read_text() == '{"tokens": "new"}'
+    assert auth.read_text() == '{"tokens": {"t": "new"}}'
     assert stat.S_IMODE(auth.stat().st_mode) == 0o600
 
 
@@ -110,14 +112,14 @@ def test_a_refreshed_login_is_written_back_after_a_failed_call(tmp_path: Path) -
     binary = _fake_codex(
         tmp_path,
         "(pathlib.Path(os.environ['CODEX_HOME']) / 'auth.json')"
-        ".write_text('{\"tokens\": \"new\"}')\n"
+        ".write_text('{\"tokens\": {\"t\": \"new\"}}')\n"
         "sys.exit(1)",
     )
     backend = CodexBackend(model="gpt-test", binary=str(binary))
     with pytest.raises(ModelUnavailable):
         backend.run("hi", cwd=_call_dir(tmp_path), env={"HOME": str(home),
                     "PATH": os.environ["PATH"]}, timeout_s=30)
-    assert (home / ".codex" / "auth.json").read_text() == '{"tokens": "new"}'
+    assert (home / ".codex" / "auth.json").read_text() == '{"tokens": {"t": "new"}}'
 
 
 def test_a_login_changed_elsewhere_during_the_call_is_kept(tmp_path: Path) -> None:
@@ -125,14 +127,15 @@ def test_a_login_changed_elsewhere_during_the_call_is_kept(tmp_path: Path) -> No
     real = home / ".codex" / "auth.json"
     binary = _fake_codex(
         tmp_path,
-        f"pathlib.Path({str(real)!r}).write_text('{{\"tokens\": \"other\"}}')\n"
+        f"pathlib.Path({str(real)!r}).write_text('{{\"tokens\": {{\"t\": \"other\"}}}}')\n"
         "(pathlib.Path(os.environ['CODEX_HOME']) / 'auth.json')"
-        ".write_text('{\"tokens\": \"new\"}')",
+        ".write_text('{\"tokens\": {\"t\": \"new\"}}')",
     )
     backend = CodexBackend(model="gpt-test", binary=str(binary))
-    backend.run("hi", cwd=_call_dir(tmp_path), env={"HOME": str(home),
-                "PATH": os.environ["PATH"]}, timeout_s=30)
-    assert real.read_text() == '{"tokens": "other"}'
+    with pytest.warns(UserWarning, match="changed during the call"):
+        backend.run("hi", cwd=_call_dir(tmp_path), env={"HOME": str(home),
+                    "PATH": os.environ["PATH"]}, timeout_s=30)
+    assert real.read_text() == '{"tokens": {"t": "other"}}'
 
 
 def test_an_unchanged_login_is_not_rewritten(tmp_path: Path) -> None:
@@ -164,7 +167,8 @@ def test_codex_argv_turns_off_agents_skills_and_sets_the_effort() -> None:
     argv = CodexBackend(model="gpt-test").argv()
     configs = {argv[i + 1] for i, a in enumerate(argv) if a == "-c"}
     assert {"agents.enabled=false", "skills.include_instructions=false",
-            "skills.bundled.enabled=false", 'model_reasoning_effort="medium"'} <= configs
+            "skills.bundled.enabled=false", 'model_reasoning_effort="medium"',
+            "project_doc_max_bytes=0", "project_root_markers=[]"} <= configs
     disabled = {argv[i + 1] for i, a in enumerate(argv) if a == "--disable"}
     assert {"goals", "memories", "sleep_tool", "shell_tool"} <= disabled
     assert argv[-3:] == ["--model", "gpt-test", "-"]
@@ -174,11 +178,12 @@ def test_codex_argv_turns_off_agents_skills_and_sets_the_effort() -> None:
 
 def _body(*texts: str, tools: list[str] | None = None, nested: list[str] | None = None,
           namespaces: list[str] | None = None) -> JsonValue:
-    description = "".join(f"### `{name}`\nsomething\n" for name in (nested or []))
+    names = nested if nested is not None else sorted(CODEX_ALLOWED_NESTED_TOOLS)
+    description = "".join(f"### `{name}`\nsomething\n" for name in names)
     functions: list[JsonValue] = [
         {"type": "function", "name": name,
          "description": description if name == "exec" else ""}
-        for name in (tools if tools is not None else ["exec", "wait"])
+        for name in (tools if tools is not None else sorted(CODEX_ALLOWED_TOOLS))
     ]
     spaces: list[JsonValue] = [{"type": "namespace", "name": "functions", "tools": functions}]
     for extra in namespaces or []:
@@ -206,6 +211,8 @@ def test_a_clean_request_passes() -> None:
     ("<multi_agent_role>You are /root</multi_agent_role>", "multi_agent"),
     ("see /home/someone/.agents/skills/canvas", "home"),
     ("load /opt/skills/canvas/SKILL.md", "skill file"),
+    ("<INSTRUCTIONS>user rules</INSTRUCTIONS>", "instructions"),
+    ("see ~/.codex/AGENTS.md", "home"),
 ])
 def test_user_context_in_the_request_fails(text: str, needle: str) -> None:
     problems = audit_codex_request(_body(text), home=HOME)
@@ -214,12 +221,14 @@ def test_user_context_in_the_request_fails(text: str, needle: str) -> None:
 
 
 def test_a_tool_outside_the_list_fails() -> None:
-    problems = audit_codex_request(_body(tools=["exec", "exec_command"]), home=HOME)
+    tools = [*sorted(CODEX_ALLOWED_TOOLS), "exec_command"]
+    problems = audit_codex_request(_body(tools=tools), home=HOME)
     assert problems == ["tool not allowed: functions.exec_command"]
 
 
 def test_a_nested_tool_outside_the_list_fails() -> None:
-    problems = audit_codex_request(_body(nested=["apply_patch", "read_file"]), home=HOME)
+    nested = [*sorted(CODEX_ALLOWED_NESTED_TOOLS), "read_file"]
+    problems = audit_codex_request(_body(nested=nested), home=HOME)
     assert problems == ["nested exec tool not allowed: read_file"]
 
 
@@ -242,13 +251,94 @@ def test_a_request_that_is_not_an_object_fails() -> None:
     assert audit_codex_request([], home=HOME) == ["the request is not a JSON object"]
 
 
+def test_a_request_of_another_shape_fails_closed() -> None:
+    assert audit_codex_request({}, home=HOME) == ["the request has no input items"]
+    no_tools: JsonValue = {"input": [{"type": "message", "role": "user", "content": []}]}
+    assert audit_codex_request(no_tools, home=HOME) == [
+        "expected one additional_tools item, found 0"]
+    moved = _body()
+    assert isinstance(moved, dict) and isinstance(moved["input"], list)
+    first = moved["input"][0]
+    assert isinstance(first, dict) and isinstance(first["tools"], list)
+    space = first["tools"][0]
+    assert isinstance(space, dict)
+    space["functions"] = space.pop("tools")
+    problems = audit_codex_request(moved, home=HOME)
+    assert len(problems) == 1 and "expected tools missing" in problems[0]
+
+
+def test_nested_tools_listed_another_way_fail_closed() -> None:
+    problems = audit_codex_request(_body(nested=[]), home=HOME)
+    assert len(problems) == 1 and "expected nested exec tools missing" in problems[0]
+
+
+def test_the_users_own_rules_and_skills_are_found_by_content(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / ".codex").mkdir(parents=True)
+    rule = "Always answer in the house style of the federation, with citations."
+    (home / ".codex" / "AGENTS.md").write_text(f"# Rules\n{rule}\nshort line\n")
+    (home / ".agents" / "skills" / "canvas-drawing").mkdir(parents=True)
+    leaked = _body(f"<new_wrapper>{rule}</new_wrapper>", "use canvas-drawing/SKILL.md")
+    problems = audit_codex_request(leaked, home=home)
+    assert problems == ["user context reached the model: a skill file",
+                        "user context reached the model: a line of ~/.codex/AGENTS.md",
+                        "user context reached the model: the skill canvas-drawing"]
+    assert audit_codex_request(_body("short line"), home=home) == []
+
+
+def test_a_corrupt_refreshed_login_is_not_written_back(tmp_path: Path) -> None:
+    home = _real_home(tmp_path)
+    binary = _fake_codex(
+        tmp_path,
+        "(pathlib.Path(os.environ['CODEX_HOME']) / 'auth.json').write_text('{\"tokens\":\"ne')",
+    )
+    with pytest.warns(UserWarning, match="not a whole login"):
+        CodexBackend(model="gpt-test", binary=str(binary)).run(
+            "hi", cwd=_call_dir(tmp_path), env={"HOME": str(home),
+            "PATH": os.environ["PATH"]}, timeout_s=30)
+    assert (home / ".codex" / "auth.json").read_text() == '{"tokens": {"t": "old"}}'
+
+
+def test_a_failed_write_back_never_replaces_the_result(tmp_path: Path) -> None:
+    home = _real_home(tmp_path)
+    real = home / ".codex" / "auth.json"
+    refresh = ("(pathlib.Path(os.environ['CODEX_HOME']) / 'auth.json')"
+               ".write_text('{\"tokens\": {\"t\": \"new\"}}')\n"
+               f"os.chmod({str(real.parent)!r}, 0o500)\n")
+    good = _fake_codex(tmp_path, refresh)
+    try:
+        with pytest.warns(UserWarning, match="could not write the refreshed login"):
+            reply = CodexBackend(model="gpt-test", binary=str(good)).run(
+                "hi", cwd=_call_dir(tmp_path), env={"HOME": str(home),
+                "PATH": os.environ["PATH"]}, timeout_s=30)
+        assert reply.text == "answer"
+    finally:
+        real.parent.chmod(0o700)
+    bad_dir = tmp_path / "bad"
+    bad_dir.mkdir()
+    bad = _fake_codex(bad_dir, refresh + "print(" + repr(_REPLY.splitlines()[1]) + ")\nsys.exit(1)")
+    try:
+        with pytest.raises(ModelUnavailable) as caught:
+            CodexBackend(model="gpt-test", binary=str(bad)).run(
+                "hi", cwd=_call_dir(bad_dir), env={"HOME": str(home),
+                "PATH": os.environ["PATH"]}, timeout_s=30)
+    finally:
+        real.parent.chmod(0o700)
+    assert caught.value.tokens_in == 20 and caught.value.tokens_out == 9
+    assert any("could not write the refreshed login" in n
+               for n in getattr(caught.value, "__notes__", []))
+
+
 @pytest.mark.live
 @pytest.mark.skipif(shutil.which("codex") is None, reason="codex is not installed")
 def test_the_real_codex_request_carries_no_user_context() -> None:
     """Runs the installed codex against a local sink with the user's real HOME.
 
-    No model is called. Before the fix this request held ~/.codex/AGENTS.md,
-    the skill catalog, and the collaboration tools.
+    No model is called, but codex may refresh the user's login with OpenAI's
+    auth service and write it back, as a real call does. Before the fix this
+    request held ~/.codex/AGENTS.md, the skill catalog, and the collaboration
+    tools.
     """
-    body = capture_codex_request(model="gpt-6.2-astra", env=scrubbed_env(), timeout_s=60)
+    body = capture_codex_request(model=DEFAULT_MODELS[Family.codex], env=scrubbed_env(),
+                                 timeout_s=60)
     assert audit_codex_request(body, home=Path.home()) == []

@@ -22,8 +22,9 @@ holds the secret, and, for Codex, the request check passes. Gemini, whose
 tool agy has tools of its own, passes an attempt only if agy's hook denied at
 least one tool call in it (`ModelReply.tools_denied`). A call that fails (a
 usage limit, a timeout) makes the result `error`, not a pass. The probe
-writes `runs/probes/<date>.json` and updates `src/minilab/models/isolation.json`: a family that passed is
-`isolated`; one that leaked is `normal runs only`; one that errored is
+writes `runs/probes/<date>.json` and updates
+`src/minilab/models/isolation.json`: a family that passed is `isolated`; one
+that leaked is `normal runs only`; one that errored is
 `unverified`. Only `isolated` families may be used in the benchmark. Each
 tool's result carries the time it was probed, and stored replies have the
 user's home directory replaced by `~`.

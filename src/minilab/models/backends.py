@@ -25,7 +25,8 @@ The isolation flags for each tool:
   feature that reaches outside the prompt turned off, including the shell, no
   multi-agent tools or skill catalog, and an empty `HOME` and `CODEX_HOME` per
   call holding only a copy of the login, so the user's `AGENTS.md` and skills
-  never load. What codex then sends is checked by
+  in `~/.codex` and `~/.agents` do not load, nor does a project `AGENTS.md`.
+  A system-wide `/etc/codex` would still load. What codex then sends is checked by
   `minilab.models.codex_request` (bead minilab-811a75).
 - Gemini (Antigravity CLI, `agy --input-format stream-json`): a session-only
   `--settings` object that denies file, URL, command, and MCP actions, keeps
@@ -52,6 +53,7 @@ import selectors
 import signal
 import subprocess
 import time
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Protocol
@@ -538,10 +540,14 @@ CODEX_CONFIG: tuple[str, ...] = (
     "skills.include_instructions=false",
     "skills.bundled.enabled=false",
     'model_reasoning_effort="medium"',
+    "project_doc_max_bytes=0",
+    "project_root_markers=[]",
 )
 """`-c` overrides for every call. They turn off the multi-agent tools and
 prompts and the skill catalog, which no feature flag covers (bead
-minilab-811a75). `--ignore-user-config` leaves the effort at the model's
+minilab-811a75), and a project `AGENTS.md` found by walking up from the
+working directory (as when `TMPDIR` is inside a repository).
+`--ignore-user-config` leaves the effort at the model's
 default, `low`, so the effort is set here (user decision 2026-11-28: medium to
 start)."""
 
@@ -660,24 +666,17 @@ class CodexBackend:
         login, `~/.codex/auth.json`. If codex refreshes the login during the
         call, the new login is written back afterwards, even if the call
         failed, unless the user's file changed in the meantime: then that
-        newer login is kept (user decision 2026-11-28). Raise
-        `ModelNotStarted` if there is no login or the folders cannot be made.
+        newer login is kept (user decision 2026-11-28). A lock file next to
+        the login lets only one minilab codex call run at a time. A
+        write-back problem never replaces the call's result: it is a warning
+        on a reply and a note on an error. Raise `ModelNotStarted` if there is
+        no login or the folders cannot be made.
         """
         home = Path(env.get("HOME") or Path.home())
         login = home / ".codex" / "auth.json"
         own_home = cwd / ".home"
         codex_home = cwd / ".codex-home"
-        try:
-            original = login.read_bytes()
-        except OSError as exc:
-            raise ModelNotStarted(f"codex: cannot read the login at {login}: {exc}") from exc
         copy = codex_home / "auth.json"
-        try:
-            own_home.mkdir(exist_ok=True)
-            codex_home.mkdir(mode=0o700, exist_ok=True)
-            _write_private(copy, original)
-        except OSError as exc:
-            raise ModelNotStarted(f"codex: cannot make the call's home: {exc}") from exc
         own_env = {
             **env,
             "HOME": str(own_home),
@@ -688,46 +687,85 @@ class CodexBackend:
             "XDG_STATE_HOME": str(own_home / ".local" / "state"),
         }
         try:
-            return _run_and_parse(
-                self.argv(), lambda out: parse_codex(out, model=self.model, prompt=prompt),
-                stdin=prompt, cwd=cwd, env=own_env, timeout_s=timeout_s,
-            )
-        finally:
-            _write_back_login(login, copy, original)
+            lock = open(login.parent / _LOGIN_LOCK, "a")
+        except OSError as exc:
+            raise ModelNotStarted(f"codex: cannot lock the login at {login}: {exc}") from exc
+        with lock:
+            # One minilab codex call at a time per login: two calls that refresh
+            # the same rotating token could get the whole login revoked.
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                original = login.read_bytes()
+            except OSError as exc:
+                raise ModelNotStarted(f"codex: cannot read the login at {login}: {exc}") from exc
+            try:
+                own_home.mkdir(exist_ok=True)
+                codex_home.mkdir(mode=0o700, exist_ok=True)
+                _write_private(copy, original)
+            except OSError as exc:
+                raise ModelNotStarted(f"codex: cannot make the call's home: {exc}") from exc
+            try:
+                reply = _run_and_parse(
+                    self.argv(), lambda out: parse_codex(out, model=self.model, prompt=prompt),
+                    stdin=prompt, cwd=cwd, env=own_env, timeout_s=timeout_s,
+                )
+            except BaseException as exc:
+                problem = _write_back_login(login, copy, original)
+                if problem is not None:
+                    exc.add_note(problem)
+                raise
+            problem = _write_back_login(login, copy, original)
+            if problem is not None:
+                warnings.warn(problem, stacklevel=2)
+            return reply
 
 
 def _write_private(path: Path, data: bytes) -> None:
-    """Write `data` to `path`, readable only by the user."""
+    """Write `data` to `path`, readable only by the user, and flush it to disk."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "wb") as out:
         out.write(data)
+        out.flush()
+        os.fsync(out.fileno())
 
 
-def _write_back_login(login: Path, copy: Path, original: bytes) -> None:
+def _is_login(data: bytes) -> bool:
+    """Whether `data` parses as a codex login: a JSON object with a `tokens` object."""
+    try:
+        value: JsonValue = json.loads(data)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    return isinstance(value, dict) and isinstance(value.get("tokens"), dict)
+
+
+def _write_back_login(login: Path, copy: Path, original: bytes) -> str | None:
     """Put a login codex refreshed during the call back in the user's file.
 
-    Do nothing if the copy is unchanged or unreadable, or if the user's file
-    no longer holds `original` (another codex refreshed it; that login is
-    newer). The swap is atomic and done under a lock, so two minilab calls
-    never write at once; a codex outside minilab does not take the lock.
+    The caller holds the login lock. Do nothing if the copy is unchanged or
+    unreadable, if it is not a whole login (a call killed mid-write), or if
+    the user's file no longer holds `original` (a codex outside minilab
+    refreshed it, and that login is newer). The swap is atomic. Return a
+    message for the caller to report when the write-back was refused or failed;
+    it never raises, so the call's own result or error stands.
     """
     try:
         refreshed = copy.read_bytes()
     except OSError:
-        return
-    if refreshed == original or not refreshed.strip():
-        return
-    lock_path = login.parent / _LOGIN_LOCK
-    with open(lock_path, "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            if login.read_bytes() != original:
-                return
-            staged = login.with_name(f".auth.json.minilab-{secrets.token_hex(8)}")
-            _write_private(staged, refreshed)
-            os.replace(staged, login)
-        finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+        return None
+    if refreshed == original:
+        return None
+    if not _is_login(refreshed):
+        return f"codex: the refreshed login in {copy} is not a whole login; kept {login}"
+    staged = login.with_name(f".auth.json.minilab-{secrets.token_hex(8)}")
+    try:
+        if login.read_bytes() != original:
+            return f"codex: {login} changed during the call; kept it, not the call's login"
+        _write_private(staged, refreshed)
+        os.replace(staged, login)
+    except OSError as exc:
+        staged.unlink(missing_ok=True)
+        return f"codex: could not write the refreshed login back to {login}: {exc}"
+    return None
 
 
 # --- Gemini (Antigravity CLI) ---------------------------------------------------------------
